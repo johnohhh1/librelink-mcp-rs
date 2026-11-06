@@ -1,0 +1,159 @@
+//! Caching and failure cooldown in front of any `DataSource`.
+
+use crate::source::{DataSource, Snapshot};
+use chrono::{DateTime, Utc};
+use std::ops::Deref;
+use std::time::{Duration as StdDuration, Instant};
+use tokio::sync::Mutex;
+
+pub(crate) const CACHE_TTL: StdDuration = StdDuration::from_secs(60);
+pub(crate) const FAILURE_COOLDOWN: StdDuration = StdDuration::from_secs(60);
+const READ_TIMEOUT: StdDuration = StdDuration::from_secs(30);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FetchError {
+    pub code: &'static str,
+    pub message: &'static str,
+    pub retry_after_seconds: Option<u64>,
+}
+
+pub(crate) struct Cooldown {
+    /// `None` latches the error until the server restarts.
+    pub until: Option<Instant>,
+    pub error: FetchError,
+}
+
+/// A rejected password cannot fix itself while the server holds the same
+/// credentials, and each retry is another failed login that moves the account
+/// toward an Abbott lockout. Latch it until restart instead of retrying.
+pub(crate) fn latches_until_restart(error: &FetchError) -> bool {
+    error.code == "authentication_failed"
+}
+
+/// Local configuration problems (no credentials yet, bad stored settings)
+/// never reached the network, so they do not start a cooldown; the next call
+/// retries after the user runs the local setup command.
+fn starts_cooldown(error: &FetchError) -> bool {
+    error.code != "configuration_error"
+}
+
+pub(crate) fn cooldown_until(error: &FetchError, now: Instant) -> Option<Instant> {
+    if latches_until_restart(error) {
+        return None;
+    }
+    let seconds = error
+        .retry_after_seconds
+        .unwrap_or(FAILURE_COOLDOWN.as_secs());
+    Some(now + StdDuration::from_secs(seconds))
+}
+
+pub(crate) fn cooldown_active(cooldown: &Cooldown, now: Instant) -> bool {
+    cooldown.until.is_none_or(|until| now < until)
+}
+
+struct CacheEntry {
+    snapshot: Snapshot,
+    retrieved_at_utc: DateTime<Utc>,
+    expires_at: Instant,
+}
+
+struct FetchState {
+    cached: Option<CacheEntry>,
+    cooldown: Option<Cooldown>,
+}
+
+/// A snapshot plus when it was retrieved. A cache hit keeps the original
+/// retrieval time so it cannot make an old reading look current.
+#[derive(Clone, Debug)]
+pub(crate) struct Fetched {
+    pub snapshot: Snapshot,
+    pub retrieved_at_utc: DateTime<Utc>,
+    pub cache_hit: bool,
+}
+
+impl Deref for Fetched {
+    type Target = Snapshot;
+
+    fn deref(&self) -> &Self::Target {
+        &self.snapshot
+    }
+}
+
+pub(crate) struct Fetcher {
+    source: Box<dyn DataSource>,
+    state: Mutex<FetchState>,
+}
+
+impl Fetcher {
+    pub(crate) fn new(source: Box<dyn DataSource>) -> Self {
+        Self {
+            source,
+            state: Mutex::new(FetchState {
+                cached: None,
+                cooldown: None,
+            }),
+        }
+    }
+
+    /// Serves from the cache, refuses during a cooldown, or reads once from
+    /// the source. The lock is held across the read so concurrent tool calls
+    /// cannot issue parallel upstream requests.
+    pub(crate) async fn fetch(&self) -> Result<Fetched, FetchError> {
+        let mut state = self.state.lock().await;
+        let now = Instant::now();
+        if let Some(cached) = state.cached.as_ref().filter(|entry| now < entry.expires_at) {
+            return Ok(Fetched {
+                snapshot: cached.snapshot.clone(),
+                retrieved_at_utc: cached.retrieved_at_utc,
+                cache_hit: true,
+            });
+        }
+        if let Some(cooldown) = state
+            .cooldown
+            .as_ref()
+            .filter(|entry| cooldown_active(entry, now))
+        {
+            let mut error = cooldown.error;
+            error.retry_after_seconds = cooldown
+                .until
+                .map(|until| until.duration_since(now).as_secs().max(1));
+            return Err(error);
+        }
+        let snapshot = match tokio::time::timeout(READ_TIMEOUT, self.source.read()).await {
+            Ok(Ok(snapshot)) => snapshot,
+            Ok(Err(error)) => {
+                if starts_cooldown(&error) {
+                    state.cooldown = Some(Cooldown {
+                        until: cooldown_until(&error, Instant::now()),
+                        error,
+                    });
+                }
+                return Err(error);
+            }
+            Err(_) => {
+                let error = FetchError {
+                    code: "timeout",
+                    message: "LibreLinkUp request timed out; retry later.",
+                    retry_after_seconds: Some(FAILURE_COOLDOWN.as_secs()),
+                };
+                state.cooldown = Some(Cooldown {
+                    until: Some(Instant::now() + FAILURE_COOLDOWN),
+                    error,
+                });
+                return Err(error);
+            }
+        };
+        let retrieved_at_utc = Utc::now();
+        state.cached = Some(CacheEntry {
+            snapshot: snapshot.clone(),
+            retrieved_at_utc,
+            expires_at: Instant::now() + CACHE_TTL,
+        });
+        state.cooldown = None;
+        Ok(Fetched {
+            snapshot,
+            retrieved_at_utc,
+            cache_hit: false,
+        })
+    }
+}

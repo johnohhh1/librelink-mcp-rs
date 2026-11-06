@@ -1,9 +1,10 @@
 use crate::{
-    FetchError, fetch_raw, load_settings, save_settings,
+    fetch::{FetchError, Fetcher},
+    load_settings, save_settings,
+    source::GlucoseSample,
     time::{STALE_AFTER_MINUTES, TimeAssessment, TimeBasis, assess_time, assess_time_at},
 };
 use chrono::{DateTime, Duration, Utc};
-use libre_link_up_api_client::GlucoseItem;
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::wrapper::Parameters,
@@ -13,9 +14,22 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
+/// The MCP server. Tools read only through `fetcher`, so they work with any
+/// `DataSource`.
 #[derive(Clone)]
-pub(crate) struct LibreMcp;
+pub(crate) struct LibreMcp {
+    fetcher: Arc<Fetcher>,
+}
+
+impl LibreMcp {
+    pub(crate) fn new(fetcher: Fetcher) -> Self {
+        Self {
+            fetcher: Arc::new(fetcher),
+        }
+    }
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -107,7 +121,7 @@ struct RateSummary {
     maximum_pair_gap_minutes: u8,
 }
 
-fn observed_rates(items: &[&GlucoseItem], now: DateTime<Utc>) -> RateSummary {
+fn observed_rates(items: &[&GlucoseSample], now: DateTime<Utc>) -> RateSummary {
     let mut points: Vec<_> = items
         .iter()
         .filter_map(|item| {
@@ -138,7 +152,7 @@ fn observed_rates(items: &[&GlucoseItem], now: DateTime<Utc>) -> RateSummary {
     }
 }
 
-fn graph_coverage(items: &[GlucoseItem], hours: i64, now: DateTime<Utc>) -> GraphCoverage {
+fn graph_coverage(items: &[GlucoseSample], hours: i64, now: DateTime<Utc>) -> GraphCoverage {
     let cutoff = now - Duration::hours(hours);
     let assessed: Vec<_> = items
         .iter()
@@ -300,7 +314,7 @@ struct HistoryPoint {
     source: PointSource,
 }
 
-fn history_point(item: &GlucoseItem, source: PointSource, now: DateTime<Utc>) -> HistoryPoint {
+fn history_point(item: &GlucoseSample, source: PointSource, now: DateTime<Utc>) -> HistoryPoint {
     let (glucose_mg_dl, value_quality) = value(item.value_in_mg_per_dl);
     let time = assess_time(Some(&item.timestamp), Some(&item.factory_timestamp), now);
     HistoryPoint {
@@ -317,7 +331,10 @@ fn history_point(item: &GlucoseItem, source: PointSource, now: DateTime<Utc>) ->
 /// The graph lags the live reading by several minutes, so append the current
 /// measurement when the graph does not already contain it. Returns the merged
 /// points and whether the current measurement was appended.
-fn points_with_current(graph: &[GlucoseItem], current: &GlucoseItem) -> (Vec<GlucoseItem>, bool) {
+fn points_with_current(
+    graph: &[GlucoseSample],
+    current: &GlucoseSample,
+) -> (Vec<GlucoseSample>, bool) {
     let usable = current.value_in_mg_per_dl.is_finite()
         && current.value_in_mg_per_dl > 0.0
         && !current.factory_timestamp.trim().is_empty();
@@ -333,10 +350,10 @@ fn points_with_current(graph: &[GlucoseItem], current: &GlucoseItem) -> (Vec<Glu
 }
 
 fn select_graph_window(
-    items: &[GlucoseItem],
+    items: &[GlucoseSample],
     hours: i64,
     now: DateTime<Utc>,
-) -> (Vec<&GlucoseItem>, bool) {
+) -> (Vec<&GlucoseSample>, bool) {
     let assessed: Vec<_> = items
         .iter()
         .map(|item| {
@@ -398,7 +415,7 @@ fn failure_fetch(error: FetchError) -> CallToolResult {
 /// LibreLinkUp graph covers roughly 12 hours and no request of a day or more
 /// can ever be fully covered by it.
 fn summarize_stats(
-    graph: &[GlucoseItem],
+    graph: &[GlucoseSample],
     days: u8,
     target_low: u16,
     target_high: u16,
@@ -471,11 +488,11 @@ impl LibreMcp {
         &self,
         Parameters(_args): Parameters<EmptyArgs>,
     ) -> CallToolResult {
-        let raw = match fetch_raw().await {
+        let raw = match self.fetcher.fetch().await {
             Ok(raw) => raw,
             Err(error) => return failure_fetch(error),
         };
-        let item = &raw.connection.glucose_measurement;
+        let item = &raw.current;
         let (glucose_mg_dl, value_quality) = value(item.value_in_mg_per_dl);
         success(Reading {
             glucose_mg_dl,
@@ -486,7 +503,7 @@ impl LibreMcp {
                 raw.retrieved_at_utc,
                 Utc::now(),
             ),
-            trend: trend(Some(item.trend_arrow)),
+            trend: trend(item.trend_arrow),
             cache_hit: raw.cache_hit,
         })
     }
@@ -502,13 +519,13 @@ impl LibreMcp {
         if invalid_window(u32::from(hours), 720) {
             return failure_code("invalid_input", "hours must be between 1 and 720.");
         }
-        let raw = match fetch_raw().await {
+        let raw = match self.fetcher.fetch().await {
             Ok(raw) => raw,
             Err(error) => return failure_fetch(error),
         };
         let now = Utc::now();
-        let current = &raw.connection.glucose_item;
-        let (points, current_appended) = points_with_current(&raw.graph_data, current);
+        let current = &raw.current;
+        let (points, current_appended) = points_with_current(&raw.graph, current);
         let coverage = graph_coverage(&points, i64::from(hours), now);
         let (items, window_filter_applied) = select_graph_window(&points, i64::from(hours), now);
         let readings: Vec<HistoryPoint> = items
@@ -549,7 +566,7 @@ impl LibreMcp {
         if invalid_window(u32::from(days), 90) {
             return failure_code("invalid_input", "days must be between 1 and 90.");
         }
-        let raw = match fetch_raw().await {
+        let raw = match self.fetcher.fetch().await {
             Ok(raw) => raw,
             Err(error) => return failure_fetch(error),
         };
@@ -557,7 +574,7 @@ impl LibreMcp {
             Ok(settings) => settings,
             Err(message) => return failure(message),
         };
-        let (points, _) = points_with_current(&raw.graph_data, &raw.connection.glucose_item);
+        let (points, _) = points_with_current(&raw.graph, &raw.current);
         match summarize_stats(
             &points,
             days,
@@ -582,12 +599,12 @@ impl LibreMcp {
             Period::Weekly => ("weekly", 7 * 24),
             Period::Monthly => ("monthly", 30 * 24),
         };
-        let raw = match fetch_raw().await {
+        let raw = match self.fetcher.fetch().await {
             Ok(raw) => raw,
             Err(error) => return failure_fetch(error),
         };
         let now = Utc::now();
-        let (points, _) = points_with_current(&raw.graph_data, &raw.connection.glucose_item);
+        let (points, _) = points_with_current(&raw.graph, &raw.current);
         let coverage = graph_coverage(&points, hours, now);
         let (items, window_filter_applied) = select_graph_window(&points, hours, now);
         let rates = observed_rates(&items, now);
@@ -635,7 +652,7 @@ impl LibreMcp {
         description = "Return source-provided sensor identifiers, activation epoch, warmup minutes, and product type code. Unknown details remain null."
     )]
     async fn get_sensor_info(&self, Parameters(_args): Parameters<EmptyArgs>) -> CallToolResult {
-        let raw = match fetch_raw().await {
+        let raw = match self.fetcher.fetch().await {
             Ok(raw) => raw,
             Err(error) => return failure_fetch(error),
         };
@@ -643,15 +660,16 @@ impl LibreMcp {
             .active_sensors
             .iter()
             .map(|active| {
-                let activation_time = sensor_activation_time(active.sensor.a, Utc::now());
+                let activation_time =
+                    sensor_activation_time(active.activation_epoch_seconds, Utc::now());
                 serde_json::json!({
-                    "device_id_masked": masked_identifier(&active.sensor.device_id),
-                    "serial_number_masked": masked_identifier(&active.sensor.sn),
-                    "source_activation_epoch_seconds": activation_time.map(|_| active.sensor.a),
+                    "device_id_masked": masked_identifier(&active.device_id),
+                    "serial_number_masked": masked_identifier(&active.serial_number),
+                    "source_activation_epoch_seconds": activation_time.map(|_| active.activation_epoch_seconds),
                     "activation_time": activation_time,
                     "activation_time_basis": activation_time.map(|_| "source_epoch_seconds_interpreted"),
-                    "warmup_minutes": (active.sensor.w >= 0).then_some(active.sensor.w),
-                    "product_type_code": (active.sensor.pt >= 0).then_some(active.sensor.pt),
+                    "warmup_minutes": (active.warmup_minutes >= 0).then_some(active.warmup_minutes),
+                    "product_type_code": (active.product_type_code >= 0).then_some(active.product_type_code),
                     "device_type": null,
                     "remaining_life": null,
                 })
@@ -709,17 +727,17 @@ impl LibreMcp {
         &self,
         Parameters(_args): Parameters<EmptyArgs>,
     ) -> CallToolResult {
-        let raw = match fetch_raw().await {
+        let raw = match self.fetcher.fetch().await {
             Ok(raw) => raw,
             Err(error) => return failure_fetch(error),
         };
         success(serde_json::json!({
             "connected": true,
-            "graph_points_returned": raw.graph_data.len(),
+            "graph_points_returned": raw.graph.len(),
             "active_sensors_returned": raw.active_sensors.len(),
             "reading_time": assess_time_at(
-                Some(&raw.connection.glucose_measurement.timestamp),
-                Some(&raw.connection.glucose_measurement.factory_timestamp),
+                Some(&raw.current.timestamp),
+                Some(&raw.current.factory_timestamp),
                 raw.retrieved_at_utc,
                 Utc::now(),
             ),
@@ -741,8 +759,8 @@ impl ServerHandler for LibreMcp {
     }
 }
 
-pub(crate) async fn serve() -> Result<(), &'static str> {
-    let service = LibreMcp
+pub(crate) async fn serve(fetcher: Fetcher) -> Result<(), &'static str> {
+    let service = LibreMcp::new(fetcher)
         .serve(stdio())
         .await
         .map_err(|_| "Unable to start MCP stdio server.")?;
@@ -787,7 +805,7 @@ mod tests {
 
     #[test]
     fn server_identifies_itself_and_explains_freshness() {
-        let info = LibreMcp.get_info();
+        let info = fake_server(Ok(empty_snapshot())).0.get_info();
         assert_eq!(info.server_info.name, "librelink-mcp-rs");
         assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
         let instructions = info.instructions.unwrap();
@@ -827,19 +845,12 @@ mod tests {
         assert!(sensor_activation_time(i32::MAX, now).is_none());
     }
 
-    fn synthetic_item(timestamp: &str) -> GlucoseItem {
-        GlucoseItem {
+    fn synthetic_item(timestamp: &str) -> GlucoseSample {
+        GlucoseSample {
             factory_timestamp: timestamp.to_owned(),
             timestamp: timestamp.to_owned(),
-            item_type: 0,
             value_in_mg_per_dl: 110.0,
             trend_arrow: Some(3),
-            trend_message: None,
-            measurement_color: 0,
-            glucose_units: 0,
-            value: 110.0,
-            is_high: false,
-            is_low: false,
         }
     }
 
@@ -1007,7 +1018,7 @@ mod tests {
             .with_timezone(&Utc);
         // A realistic ~12 hour graph at 15 minute cadence, shorter than one day.
         let start = now - Duration::hours(12);
-        let mut graph: Vec<GlucoseItem> = (0..=48)
+        let mut graph: Vec<GlucoseSample> = (0..=48)
             .map(|step| {
                 let at = start + Duration::minutes(15 * step);
                 synthetic_item(&at.to_rfc3339())
@@ -1054,5 +1065,150 @@ mod tests {
         );
         assert_eq!(error.is_error, Some(true));
         assert_eq!(error.content.len(), 1);
+    }
+
+    use crate::source::{DataSource, ReadFuture, SensorRecord, Snapshot};
+    use chrono::SecondsFormat;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A `DataSource` that never touches the network and counts its reads.
+    struct FakeSource {
+        result: Result<Snapshot, FetchError>,
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl DataSource for FakeSource {
+        fn read(&self) -> ReadFuture<'_> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            let result = self.result.clone();
+            Box::pin(async move { result })
+        }
+    }
+
+    fn fake_server(result: Result<Snapshot, FetchError>) -> (LibreMcp, Arc<AtomicUsize>) {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let source = FakeSource {
+            result,
+            reads: Arc::clone(&reads),
+        };
+        (LibreMcp::new(Fetcher::new(Box::new(source))), reads)
+    }
+
+    fn empty_snapshot() -> Snapshot {
+        Snapshot {
+            current: synthetic_item(""),
+            graph: vec![],
+            active_sensors: vec![],
+        }
+    }
+
+    fn minutes_ago(minutes: i64) -> String {
+        (Utc::now() - Duration::minutes(minutes)).to_rfc3339_opts(SecondsFormat::Secs, true)
+    }
+
+    /// Synthetic values: a lagging graph and a newer current reading.
+    fn live_snapshot() -> Snapshot {
+        let mut current = synthetic_item(&minutes_ago(2));
+        current.value_in_mg_per_dl = 142.0;
+        current.trend_arrow = Some(4);
+        Snapshot {
+            current,
+            graph: [30, 25, 20, 15]
+                .into_iter()
+                .map(|minutes| synthetic_item(&minutes_ago(minutes)))
+                .collect(),
+            active_sensors: vec![SensorRecord {
+                device_id: "synthetic-device-0042".to_owned(),
+                serial_number: "SYNTH0001".to_owned(),
+                activation_epoch_seconds: 1_652_400_270,
+                warmup_minutes: 60,
+                product_type_code: 4,
+            }],
+        }
+    }
+
+    fn body(result: &CallToolResult) -> &serde_json::Value {
+        result.structured_content.as_ref().unwrap()
+    }
+
+    #[tokio::test]
+    async fn tools_run_against_a_fake_source_without_the_network() {
+        let (server, reads) = fake_server(Ok(live_snapshot()));
+        let first = server.get_current_glucose(Parameters(EmptyArgs {})).await;
+        assert_eq!(first.is_error, Some(false));
+        assert_eq!(body(&first)["glucose_mg_dl"], 142.0);
+        assert_eq!(body(&first)["trend"], "rising");
+        assert_eq!(body(&first)["freshness"], "recent");
+        assert_eq!(body(&first)["cache_hit"], false);
+
+        // The cache sits in front of the trait: the second call does not read.
+        let sensors = server.get_sensor_info(Parameters(EmptyArgs {})).await;
+        assert_eq!(body(&sensors)["sensor_count"], 1);
+        assert_eq!(
+            body(&sensors)["active_sensors"][0]["serial_number_masked"],
+            "****0001"
+        );
+        assert_eq!(body(&sensors)["cache_hit"], true);
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cooldown_applies_to_any_source() {
+        let throttled = FetchError {
+            code: "rate_limited",
+            message: "Synthetic throttle.",
+            retry_after_seconds: Some(60),
+        };
+        let (server, reads) = fake_server(Err(throttled));
+        for _ in 0..2 {
+            let result = server.validate_connection(Parameters(EmptyArgs {})).await;
+            assert_eq!(result.is_error, Some(true));
+            assert_eq!(body(&result)["error_code"], "rate_limited");
+        }
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn configuration_errors_do_not_start_a_cooldown() {
+        let unconfigured = FetchError {
+            code: "configuration_error",
+            message: "Synthetic missing setup.",
+            retry_after_seconds: None,
+        };
+        let (server, reads) = fake_server(Err(unconfigured));
+        for _ in 0..2 {
+            let result = server.get_current_glucose(Parameters(EmptyArgs {})).await;
+            assert_eq!(body(&result)["error_code"], "configuration_error");
+        }
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn history_appends_the_reading_get_current_glucose_reports() {
+        let (server, _) = fake_server(Ok(live_snapshot()));
+        let current = server.get_current_glucose(Parameters(EmptyArgs {})).await;
+        let history = server
+            .get_glucose_history(Parameters(HistoryArgs { hours: Some(1) }))
+            .await;
+        let current = body(&current);
+        let history = body(&history);
+        assert_eq!(history["current_measurement_appended"], true);
+        let appended: Vec<_> = history["readings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|point| point["source"] == "current_measurement")
+            .collect();
+        assert_eq!(appended.len(), 1);
+        for field in [
+            "glucose_mg_dl",
+            "value_quality",
+            "observed_at_utc",
+            "time_basis",
+            "source_timestamp",
+            "trend",
+        ] {
+            assert_eq!(appended[0][field], current[field], "{field}");
+        }
     }
 }

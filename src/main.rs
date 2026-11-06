@@ -1,32 +1,27 @@
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use keyring::{Entry, Error as KeyringError};
-use libre_link_up_api_client::{
-    ClientConfig, ConnectionIdentifier, LibreLinkUpClient, LibreLinkUpError, ReadRawResponse,
-    Region,
-};
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
-use std::ops::Deref;
-use std::sync::Arc;
-use std::time::{Duration as StdDuration, Instant};
-use tokio::sync::{Mutex, OnceCell};
 use zeroize::{Zeroize, Zeroizing};
 
+mod borrowed_client;
+mod fetch;
 mod mcp;
+mod source;
 mod time;
 
+use borrowed_client::BorrowedClientSource;
+use fetch::Fetcher;
 use time::{TimeAssessment, assess_time_at};
 
 const KEYRING_SERVICE: &str = "org.librelink-mcp-rs";
 const KEYRING_USER: &str = "librelinkup-account";
 const SETTINGS_USER: &str = "local-settings";
-static CLIENT: OnceCell<LibreLinkUpClient> = OnceCell::const_new();
-static FETCH_STATE: Mutex<FetchState> = Mutex::const_new(FetchState {
-    cached: None,
-    cooldown: None,
-});
-const CACHE_TTL: StdDuration = StdDuration::from_secs(60);
-const FAILURE_COOLDOWN: StdDuration = StdDuration::from_secs(60);
+
+/// The production data path: the borrowed crate behind cache and cooldown.
+fn live_fetcher() -> Fetcher {
+    Fetcher::new(Box::new(BorrowedClientSource::new()))
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -85,158 +80,6 @@ struct ConnectivityReport {
     cache_hit: bool,
 }
 
-#[derive(Clone)]
-struct FetchedRaw {
-    response: ReadRawResponse,
-    retrieved_at_utc: DateTime<Utc>,
-    cache_hit: bool,
-}
-
-impl Deref for FetchedRaw {
-    type Target = ReadRawResponse;
-
-    fn deref(&self) -> &Self::Target {
-        &self.response
-    }
-}
-
-struct CacheEntry {
-    response: ReadRawResponse,
-    retrieved_at_utc: DateTime<Utc>,
-    expires_at: Instant,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct FetchError {
-    code: &'static str,
-    message: &'static str,
-    retry_after_seconds: Option<u64>,
-}
-
-struct Cooldown {
-    /// `None` latches the error until the server restarts.
-    until: Option<Instant>,
-    error: FetchError,
-}
-
-/// A rejected password cannot fix itself while the server holds the same
-/// credentials, and each retry is another failed login that moves the account
-/// toward an Abbott lockout. Latch it until restart instead of retrying.
-fn latches_until_restart(error: &FetchError) -> bool {
-    error.code == "authentication_failed"
-}
-
-fn cooldown_until(error: &FetchError, now: Instant) -> Option<Instant> {
-    if latches_until_restart(error) {
-        return None;
-    }
-    let seconds = error
-        .retry_after_seconds
-        .unwrap_or(FAILURE_COOLDOWN.as_secs());
-    Some(now + StdDuration::from_secs(seconds))
-}
-
-fn cooldown_active(cooldown: &Cooldown, now: Instant) -> bool {
-    cooldown.until.is_none_or(|until| now < until)
-}
-
-struct FetchState {
-    cached: Option<CacheEntry>,
-    cooldown: Option<Cooldown>,
-}
-
-fn http_status_from_invalid(message: &str) -> Option<u16> {
-    let suffix = message
-        .split_once("failed - HTTP ")
-        .map(|(_, suffix)| suffix)?;
-    let digits = suffix.get(..3)?;
-    (digits.bytes().all(|byte| byte.is_ascii_digit())
-        && matches!(suffix.as_bytes().get(3), Some(b' ' | b':')))
-    .then(|| digits.parse().ok())
-    .flatten()
-}
-
-fn classify_fetch_error(error: LibreLinkUpError) -> FetchError {
-    let (code, message, retry_after_seconds) = match error {
-        LibreLinkUpError::AccountLocked(seconds) => (
-            "rate_limited",
-            "LibreLinkUp account is temporarily locked; retry later.",
-            Some(u64::try_from(seconds).unwrap_or(60).clamp(60, 900)),
-        ),
-        LibreLinkUpError::InvalidResponse(body)
-            if matches!(http_status_from_invalid(&body), Some(429 | 430)) =>
-        {
-            (
-                "rate_limited",
-                "LibreLinkUp is rate limiting requests; retry later.",
-                Some(60),
-            )
-        }
-        LibreLinkUpError::InvalidResponse(body) if http_status_from_invalid(&body) == Some(401) => {
-            (
-                "session_expired",
-                "LibreLinkUp rejected the current session; retry later.",
-                Some(60),
-            )
-        }
-        LibreLinkUpError::Http(error) if error.is_timeout() => (
-            "timeout",
-            "LibreLinkUp request timed out; retry later.",
-            Some(60),
-        ),
-        LibreLinkUpError::BadCredentials => (
-            "authentication_failed",
-            "LibreLinkUp rejected the account credentials. No further logins will be attempted; run `setup` locally, then restart the server.",
-            None,
-        ),
-        LibreLinkUpError::AdditionalActionRequired(_) => (
-            "account_action_required",
-            "LibreLinkUp requires an action in its app before API access.",
-            Some(60),
-        ),
-        LibreLinkUpError::NoConnections => (
-            "no_connection",
-            "Account authenticated but follows no patients in LibreLinkUp.",
-            Some(60),
-        ),
-        LibreLinkUpError::ConnectionNotFound(_) | LibreLinkUpError::ConnectionFunctionFailed => (
-            "patient_selection_required",
-            "No unique followed person was selected. Run `select-patient` locally.",
-            Some(60),
-        ),
-        _ => (
-            "upstream_unavailable",
-            "LibreLinkUp request failed; retry later.",
-            Some(60),
-        ),
-    };
-    FetchError {
-        code,
-        message,
-        retry_after_seconds,
-    }
-}
-
-fn parse_region(input: &str) -> Option<Region> {
-    match input.trim().to_ascii_lowercase().as_str() {
-        "global" | "" => Some(Region::Global),
-        "ae" => Some(Region::AE),
-        "ap" => Some(Region::AP),
-        "au" => Some(Region::AU),
-        "ca" => Some(Region::CA),
-        "de" => Some(Region::DE),
-        "eu" => Some(Region::EU),
-        "eu2" => Some(Region::EU2),
-        "fr" => Some(Region::FR),
-        "jp" => Some(Region::JP),
-        "us" => Some(Region::US),
-        "la" => Some(Region::LA),
-        "ru" => Some(Region::RU),
-        "cn" => Some(Region::CN),
-        _ => None,
-    }
-}
-
 fn valid_api_version(version: &str) -> bool {
     let parts: Vec<_> = version.split('.').collect();
     parts.len() == 3
@@ -293,12 +136,12 @@ fn setup() -> Result<(), &'static str> {
         return Err("Password is required.");
     }
     let region_input = prompt("Region [global/us/eu/...; default global]: ")?;
-    let region = parse_region(&region_input).ok_or("Unknown region.")?;
+    let region = borrowed_client::canonical_region(&region_input).ok_or("Unknown region.")?;
 
     let credentials = Credentials {
         email,
         password,
-        region: region.as_str().to_owned(),
+        region,
     };
     let serialized = Zeroizing::new(
         serde_json::to_string(&credentials).map_err(|_| "Unable to prepare credentials.")?,
@@ -360,126 +203,12 @@ fn load_credentials() -> Result<Credentials, &'static str> {
     serde_json::from_str(&stored).map_err(|_| "Stored credentials have an unsupported format.")
 }
 
-fn client_error(error: LibreLinkUpError) -> &'static str {
-    match error {
-        LibreLinkUpError::BadCredentials => "LibreLinkUp rejected the account credentials.",
-        LibreLinkUpError::AccountLocked(_) => "LibreLinkUp account is temporarily locked.",
-        LibreLinkUpError::AdditionalActionRequired(_) => {
-            "LibreLinkUp requires an action in its app before API access."
-        }
-        LibreLinkUpError::NoConnections => {
-            "Account authenticated but follows no patients in LibreLinkUp."
-        }
-        LibreLinkUpError::ConnectionNotFound(_) => "The selected patient was not found.",
-        LibreLinkUpError::ConnectionFunctionFailed => {
-            "No unique followed person was selected. Run `select-patient` locally."
-        }
-        _ => "LibreLinkUp request failed; details were withheld to protect account data.",
-    }
-}
-
-fn unique_match<T>(items: &[T], predicate: impl Fn(&T) -> bool) -> Option<&T> {
-    let mut matches = items.iter().filter(|item| predicate(item));
-    let selected = matches.next()?;
-    matches.next().is_none().then_some(selected)
-}
-
-fn build_client() -> Result<LibreLinkUpClient, &'static str> {
-    let credentials = load_credentials()?;
-    let settings = load_settings()?;
-    let region = parse_region(&credentials.region).ok_or("Stored region is invalid.")?;
-    if !valid_api_version(&settings.api_version) {
-        return Err("Stored API version is invalid. Run `set-api-version` locally.");
-    }
-    let api_version = settings.api_version.clone();
-    let selected_name = settings.patient_name.map(|name| name.to_lowercase());
-    let identifier = ConnectionIdentifier::ByFunction(Arc::new(move |connections| {
-        unique_match(connections, |connection| {
-            selected_name.as_ref().is_none_or(|name| {
-                format!("{} {}", connection.first_name, connection.last_name).to_lowercase()
-                    == *name
-            })
-        })
-        .map(|selected| selected.patient_id.clone())
-    }));
-    let config = ClientConfig::new(credentials.email.clone(), credentials.password.clone())
-        .with_connection_identifier(identifier)
-        .with_api_version(api_version)
-        .with_region(region);
-    LibreLinkUpClient::new(config).map_err(client_error)
-}
-
-async fn fetch_raw() -> Result<FetchedRaw, FetchError> {
-    let mut state = FETCH_STATE.lock().await;
-    let now = Instant::now();
-    if let Some(cached) = state.cached.as_ref().filter(|entry| now < entry.expires_at) {
-        return Ok(FetchedRaw {
-            response: cached.response.clone(),
-            retrieved_at_utc: cached.retrieved_at_utc,
-            cache_hit: true,
-        });
-    }
-    if let Some(cooldown) = state
-        .cooldown
-        .as_ref()
-        .filter(|entry| cooldown_active(entry, now))
-    {
-        let mut error = cooldown.error;
-        error.retry_after_seconds = cooldown
-            .until
-            .map(|until| until.duration_since(now).as_secs().max(1));
-        return Err(error);
-    }
-    let client = CLIENT
-        .get_or_try_init(|| async { build_client() })
-        .await
-        .map_err(|message| FetchError {
-            code: "configuration_error",
-            message,
-            retry_after_seconds: None,
-        })?;
-    // read_raw preserves the source timestamp. The client's processed read()
-    // currently replaces an unparseable timestamp with Utc::now().
-    let response = match tokio::time::timeout(StdDuration::from_secs(30), client.read_raw()).await {
-        Ok(Ok(response)) => response,
-        Ok(Err(error)) => {
-            let error = classify_fetch_error(error);
-            state.cooldown = Some(Cooldown {
-                until: cooldown_until(&error, Instant::now()),
-                error,
-            });
-            return Err(error);
-        }
-        Err(_) => {
-            let error = FetchError {
-                code: "timeout",
-                message: "LibreLinkUp request timed out; retry later.",
-                retry_after_seconds: Some(FAILURE_COOLDOWN.as_secs()),
-            };
-            state.cooldown = Some(Cooldown {
-                until: Some(Instant::now() + FAILURE_COOLDOWN),
-                error,
-            });
-            return Err(error);
-        }
-    };
-    let retrieved_at_utc = Utc::now();
-    state.cached = Some(CacheEntry {
-        response: response.clone(),
-        retrieved_at_utc,
-        expires_at: Instant::now() + CACHE_TTL,
-    });
-    state.cooldown = None;
-    Ok(FetchedRaw {
-        response,
-        retrieved_at_utc,
-        cache_hit: false,
-    })
-}
-
 async fn check() -> Result<(), &'static str> {
-    let raw = fetch_raw().await.map_err(|error| error.message)?;
-    let measurement = &raw.connection.glucose_measurement;
+    let raw = live_fetcher()
+        .fetch()
+        .await
+        .map_err(|error| error.message)?;
+    let measurement = &raw.current;
     let time = assess_time_at(
         Some(&measurement.timestamp),
         Some(&measurement.factory_timestamp),
@@ -502,7 +231,7 @@ async fn check() -> Result<(), &'static str> {
             },
             time,
         },
-        graph_points_returned: raw.graph_data.len(),
+        graph_points_returned: raw.graph.len(),
         active_sensors_returned: raw.active_sensors.len(),
         cache_hit: raw.cache_hit,
     };
@@ -576,7 +305,7 @@ async fn run() {
         [_, command] if command == "select-patient" => select_patient(),
         [_, command] if command == "set-api-version" => set_api_version(),
         [_, command] if command == "clear-local-data" => clear_local_data(),
-        [_, command] if command == "serve" => mcp::serve().await,
+        [_, command] if command == "serve" => mcp::serve(live_fetcher()).await,
         _ => Err(
             "Usage: librelink-mcp-rs <setup|select-patient|set-api-version|check|clear-local-data|serve>",
         ),
@@ -587,25 +316,10 @@ async fn run() {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 
-    #[test]
-    fn accepts_only_known_regions() {
-        assert_eq!(parse_region("EU2"), Some(Region::EU2));
-        assert_eq!(parse_region(""), Some(Region::Global));
-        assert_eq!(parse_region("unknown"), None);
-        assert!(valid_api_version("4.16.0"));
-        assert!(!valid_api_version("4.16.0\r\npassword:secret"));
-        assert!(!valid_api_version("latest"));
-        let old_settings: Settings =
-            serde_json::from_str(r#"{"target_low":70,"target_high":180,"patient_name":null}"#)
-                .unwrap();
-        assert_eq!(old_settings.api_version, "4.16.0");
-    }
-
-    #[cfg(target_os = "linux")]
     #[test]
     fn session_bus_fallback_only_fills_a_missing_address() {
         let owned = |_: &str| true;
@@ -622,77 +336,5 @@ mod tests {
             None
         );
         assert_eq!(session_bus_fallback(None, 1000, |_| false), None);
-    }
-
-    #[test]
-    fn patient_selection_requires_one_match() {
-        let names = ["Alex", "Sam", "Sam"];
-        assert_eq!(unique_match(&names, |name| *name == "Alex"), Some(&"Alex"));
-        assert_eq!(unique_match(&names, |name| *name == "Sam"), None);
-        assert_eq!(unique_match(&names, |name| *name == "Pat"), None);
-        assert_eq!(unique_match(&names, |_| true), None);
-    }
-
-    #[test]
-    fn parses_only_status_from_client_error_prefix() {
-        assert_eq!(
-            http_status_from_invalid(
-                "request to '/llu/connections' failed - HTTP 429 Too Many Requests: private body"
-            ),
-            Some(429)
-        );
-        assert_eq!(
-            http_status_from_invalid("Login failed - HTTP 430: private body"),
-            Some(430)
-        );
-        assert_eq!(http_status_from_invalid("private body says HTTP 429"), None);
-        assert_eq!(
-            http_status_from_invalid("Login failed - HTTP xxx: body"),
-            None
-        );
-    }
-
-    #[test]
-    fn lockouts_and_throttling_map_to_safe_errors() {
-        let locked = classify_fetch_error(LibreLinkUpError::AccountLocked(125));
-        assert_eq!(locked.code, "rate_limited");
-        assert_eq!(locked.retry_after_seconds, Some(125));
-        let throttled = classify_fetch_error(LibreLinkUpError::InvalidResponse(
-            "request to '/llu/connections' failed - HTTP 429: synthetic body".to_owned(),
-        ));
-        assert_eq!(throttled.code, "rate_limited");
-        assert!(!throttled.message.contains("synthetic body"));
-    }
-
-    #[test]
-    fn rejected_credentials_latch_until_restart() {
-        let now = Instant::now();
-        let rejected = classify_fetch_error(LibreLinkUpError::BadCredentials);
-        assert_eq!(rejected.code, "authentication_failed");
-        assert_eq!(rejected.retry_after_seconds, None);
-        assert!(latches_until_restart(&rejected));
-        let latched = Cooldown {
-            until: cooldown_until(&rejected, now),
-            error: rejected,
-        };
-        assert!(latched.until.is_none());
-        assert!(cooldown_active(
-            &latched,
-            now + StdDuration::from_secs(86_400)
-        ));
-
-        let throttled = classify_fetch_error(LibreLinkUpError::AccountLocked(120));
-        let temporary = Cooldown {
-            until: cooldown_until(&throttled, now),
-            error: throttled,
-        };
-        assert!(cooldown_active(
-            &temporary,
-            now + StdDuration::from_secs(119)
-        ));
-        assert!(!cooldown_active(
-            &temporary,
-            now + StdDuration::from_secs(121)
-        ));
     }
 }
