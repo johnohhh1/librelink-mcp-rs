@@ -1,7 +1,8 @@
 use crate::{
-    Freshness, STALE_AFTER_MINUTES, classify_freshness, fetch_raw, load_settings, save_settings,
+    fetch_raw, load_settings, save_settings,
+    time::{STALE_AFTER_MINUTES, TimeAssessment, assess_time},
 };
-use chrono::Utc;
+use chrono::{DateTime, Duration, Utc};
 use libre_link_up_api_client::GlucoseItem;
 use rmcp::{
     ServiceExt,
@@ -66,9 +67,8 @@ enum ValueQuality {
 struct Reading {
     glucose_mg_dl: Option<f64>,
     value_quality: ValueQuality,
-    source_timestamp: Option<String>,
-    factory_timestamp: Option<String>,
-    freshness: Freshness,
+    #[serde(flatten)]
+    time: TimeAssessment,
     trend: Option<&'static str>,
 }
 
@@ -95,17 +95,49 @@ fn trend(arrow: Option<i32>) -> Option<&'static str> {
     }
 }
 
-fn history_reading(item: &GlucoseItem) -> Reading {
+fn history_reading(item: &GlucoseItem, now: DateTime<Utc>) -> Reading {
     let (glucose_mg_dl, value_quality) = value(item.value_in_mg_per_dl);
-    let source_timestamp = nonempty(&item.timestamp);
     Reading {
         glucose_mg_dl,
         value_quality,
-        freshness: classify_freshness(source_timestamp.as_deref(), Utc::now()),
-        source_timestamp,
-        factory_timestamp: nonempty(&item.factory_timestamp),
+        time: assess_time(Some(&item.timestamp), Some(&item.factory_timestamp), now),
         trend: trend(item.trend_arrow),
     }
+}
+
+fn select_graph_window(
+    items: &[GlucoseItem],
+    hours: i64,
+    now: DateTime<Utc>,
+) -> (Vec<&GlucoseItem>, bool) {
+    let assessed: Vec<_> = items
+        .iter()
+        .map(|item| {
+            (
+                item,
+                assess_time(Some(&item.timestamp), Some(&item.factory_timestamp), now),
+            )
+        })
+        .collect();
+    let can_filter = !assessed.is_empty()
+        && assessed
+            .iter()
+            .all(|(_, time)| time.observed_at_utc.is_some());
+    if !can_filter {
+        return (items.iter().collect(), false);
+    }
+    let cutoff = now - Duration::hours(hours);
+    (
+        assessed
+            .into_iter()
+            .filter(|(_, time)| {
+                time.observed_at_utc
+                    .is_some_and(|timestamp| timestamp >= cutoff && timestamp <= now)
+            })
+            .map(|(item, _)| item)
+            .collect(),
+        true,
+    )
 }
 
 fn success<T: Serialize>(body: T) -> CallToolResult {
@@ -138,19 +170,20 @@ impl LibreMcp {
         };
         let item = &raw.connection.glucose_measurement;
         let (glucose_mg_dl, value_quality) = value(item.value_in_mg_per_dl);
-        let source_timestamp = nonempty(&item.timestamp);
         success(Reading {
             glucose_mg_dl,
             value_quality,
-            freshness: classify_freshness(source_timestamp.as_deref(), Utc::now()),
-            source_timestamp,
-            factory_timestamp: nonempty(&item.factory_timestamp),
+            time: assess_time(
+                Some(&item.timestamp),
+                Some(&item.factory_timestamp),
+                Utc::now(),
+            ),
             trend: trend(Some(item.trend_arrow)),
         })
     }
 
     #[tool(
-        description = "Return the graph readings supplied by LibreLinkUp. The requested hours are reported, but timezone-free timestamps prevent an exact time-window filter."
+        description = "Return graph readings within requested hours only when each reading has an offset-aware timestamp. Otherwise show the returned graph and mark the window unverified."
     )]
     async fn get_glucose_history(
         &self,
@@ -164,18 +197,29 @@ impl LibreMcp {
             Ok(raw) => raw,
             Err(message) => return failure(message),
         };
-        let readings: Vec<Reading> = raw.graph_data.iter().map(history_reading).collect();
+        let now = Utc::now();
+        let (items, window_filter_applied) =
+            select_graph_window(&raw.graph_data, i64::from(hours), now);
+        let readings: Vec<Reading> = items
+            .into_iter()
+            .map(|item| history_reading(item, now))
+            .collect();
         success(serde_json::json!({
             "requested_hours": hours,
             "window_verified": false,
-            "reason": "The API graph may be shorter than requested and its timestamps have no timezone. All returned graph points are shown.",
+            "window_filter_applied": window_filter_applied,
+            "reason": if window_filter_applied {
+                "Readings were filtered by offset-aware timestamps, but API graph coverage may be shorter than requested."
+            } else {
+                "The API graph may be shorter than requested and its timestamps have no trusted offset. All returned graph points are shown."
+            },
             "total_readings": readings.len(),
             "readings": readings,
         }))
     }
 
     #[tool(
-        description = "Calculate descriptive statistics for the graph points actually returned. Requested-day coverage and true time in range are unavailable when timestamps lack a timezone."
+        description = "Calculate descriptive statistics for returned graph points. Filter requested days only when all timestamps have trusted offsets; coverage and true time in range remain unverified."
     )]
     async fn get_glucose_stats(&self, Parameters(args): Parameters<StatsArgs>) -> CallToolResult {
         let days = args.days.unwrap_or(7);
@@ -190,8 +234,9 @@ impl LibreMcp {
             Ok(settings) => settings,
             Err(message) => return failure(message),
         };
-        let values: Vec<f64> = raw
-            .graph_data
+        let (items, window_filter_applied) =
+            select_graph_window(&raw.graph_data, i64::from(days) * 24, Utc::now());
+        let values: Vec<f64> = items
             .iter()
             .map(|item| item.value_in_mg_per_dl)
             .filter(|value| value.is_finite() && *value > 0.0)
@@ -211,6 +256,7 @@ impl LibreMcp {
         success(serde_json::json!({
             "requested_days": days,
             "window_verified": false,
+            "window_filter_applied": window_filter_applied,
             "sample_count": count,
             "average_glucose_mg_dl": average,
             "standard_deviation_mg_dl": standard_deviation,
@@ -223,7 +269,7 @@ impl LibreMcp {
             "target_range_mg_dl": { "low": settings.target_low, "high": settings.target_high },
             "time_in_range_percent": null,
             "gmi_percent": null,
-            "reason": "These statistics describe returned graph samples only. Time coverage, time-weighted range, and a valid GMI window are unverified.",
+            "reason": "These statistics describe selected graph samples only. Full time coverage, time-weighted range, and a valid GMI window are unverified.",
         }))
     }
 
@@ -231,17 +277,18 @@ impl LibreMcp {
         description = "Summarize observed graph values and trend arrows without inferring meals, diagnoses, or treatment changes."
     )]
     async fn get_glucose_trends(&self, Parameters(args): Parameters<TrendsArgs>) -> CallToolResult {
-        let period = match args.period.unwrap_or(Period::Weekly) {
-            Period::Daily => "daily",
-            Period::Weekly => "weekly",
-            Period::Monthly => "monthly",
+        let (period, hours) = match args.period.unwrap_or(Period::Weekly) {
+            Period::Daily => ("daily", 24),
+            Period::Weekly => ("weekly", 7 * 24),
+            Period::Monthly => ("monthly", 30 * 24),
         };
         let raw = match fetch_raw().await {
             Ok(raw) => raw,
             Err(message) => return failure(message),
         };
-        let values: Vec<f64> = raw
-            .graph_data
+        let (items, window_filter_applied) =
+            select_graph_window(&raw.graph_data, hours, Utc::now());
+        let values: Vec<f64> = items
             .iter()
             .map(|item| item.value_in_mg_per_dl)
             .filter(|value| value.is_finite() && *value > 0.0)
@@ -252,7 +299,7 @@ impl LibreMcp {
         let mut stable = 0;
         let mut rising = 0;
         let mut unknown = 0;
-        for item in &raw.graph_data {
+        for item in &items {
             match trend(item.trend_arrow) {
                 Some("falling_fast" | "falling") => falling += 1,
                 Some("stable") => stable += 1,
@@ -263,6 +310,7 @@ impl LibreMcp {
         success(serde_json::json!({
             "requested_period": period,
             "window_verified": false,
+            "window_filter_applied": window_filter_applied,
             "sample_count": values.len(),
             "observed_min_mg_dl": min,
             "observed_max_mg_dl": max,
@@ -350,9 +398,10 @@ impl LibreMcp {
             "connected": true,
             "graph_points_returned": raw.graph_data.len(),
             "active_sensors_returned": raw.active_sensors.len(),
-            "reading_freshness": classify_freshness(
-                nonempty(&raw.connection.glucose_measurement.timestamp).as_deref(),
-                Utc::now()
+            "reading_time": assess_time(
+                Some(&raw.connection.glucose_measurement.timestamp),
+                Some(&raw.connection.glucose_measurement.factory_timestamp),
+                Utc::now(),
             ),
             "stale_threshold_minutes": STALE_AFTER_MINUTES,
         }))
@@ -410,5 +459,53 @@ mod tests {
         assert_eq!(trend(None), None);
         assert_eq!(trend(Some(42)), None);
         assert_eq!(trend(Some(3)), Some("stable"));
+    }
+
+    fn synthetic_item(timestamp: &str) -> GlucoseItem {
+        GlucoseItem {
+            factory_timestamp: timestamp.to_owned(),
+            timestamp: timestamp.to_owned(),
+            item_type: 0,
+            value_in_mg_per_dl: 110.0,
+            trend_arrow: Some(3),
+            trend_message: None,
+            measurement_color: 0,
+            glucose_units: 0,
+            value: 110.0,
+            is_high: false,
+            is_low: false,
+        }
+    }
+
+    #[test]
+    fn window_filters_offset_aware_graph_at_boundary() {
+        let now = DateTime::parse_from_rfc3339("2026-11-05T20:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let graph = [
+            synthetic_item("2026-11-05T18:59:59Z"),
+            synthetic_item("2026-11-05T19:00:00Z"),
+            synthetic_item("2026-11-05T19:30:00Z"),
+            synthetic_item("2026-11-05T20:00:01Z"),
+        ];
+        let (selected, applied) = select_graph_window(&graph, 1, now);
+        assert!(applied);
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].timestamp, "2026-11-05T19:00:00Z");
+        assert_eq!(selected[1].timestamp, "2026-11-05T19:30:00Z");
+    }
+
+    #[test]
+    fn mixed_offset_graph_is_not_partially_filtered() {
+        let now = DateTime::parse_from_rfc3339("2026-11-05T20:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let graph = [
+            synthetic_item("2026-11-05T18:00:00Z"),
+            synthetic_item("11/05/2026 03:30:00 PM"),
+        ];
+        let (selected, applied) = select_graph_window(&graph, 1, now);
+        assert!(!applied);
+        assert_eq!(selected.len(), graph.len());
     }
 }

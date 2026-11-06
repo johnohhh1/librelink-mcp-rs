@@ -1,6 +1,6 @@
 # Roadmap to a reliable release
 
-The current server proves connectivity and MCP interoperability. It exposes the eight original tool names but is not yet feature complete: `hours`, `days`, and `period` are accepted while the returned graph may cover a shorter, unknown window. The tool responses say so. This document defines the release gates for claiming parity.
+The current server proves connectivity and MCP interoperability. It exposes the eight original tool names but is not yet feature complete: `hours`, `days`, and `period` filter offset-aware graph points, but the returned graph may cover a shorter, unknown window. Offset-free graphs stay unfiltered and the tool responses say so. This document defines the release gates for claiming parity.
 
 ## 1. Establish a trustworthy time and data contract
 

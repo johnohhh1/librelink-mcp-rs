@@ -21,7 +21,7 @@ cargo run -- select-patient  # only if following multiple people
 cargo run -- check
 ```
 
-`setup` prompts locally for the follower account email, hides password input, and saves a single credential record in the OS credential store. The password is never accepted as a command-line or MCP argument. `check` performs an authenticated `read_raw()` call and prints only a small, typed JSON connectivity report. API error bodies and tokens are not printed. If the source timestamp has no timezone, freshness is `unknown`; the report does not call that reading real-time. No treatment recommendations are produced.
+`setup` prompts locally for the follower account email, hides password input, and saves a single credential record in the OS credential store. The password is never accepted as a command-line or MCP argument. `check` performs an authenticated `read_raw()` call and prints only a small, typed JSON connectivity report. API error bodies and tokens are not printed. The report keeps source and factory timestamp text, retrieval time, and an interpreted UTC observation time separate. If source timestamps have no timezone, `observed_at_utc` is absent and freshness is `unknown`; the report does not call that reading real-time. No treatment recommendations are produced.
 
 On headless Linux systems without Secret Service, `setup` fails. That is intentional until another secure store is designed and tested. If you previously used the original server, its `~/.librelink-mcp/config.json` may contain a plaintext password; this prototype does not read or migrate that file.
 
@@ -40,7 +40,7 @@ Run `cargo run -- serve` for a local stdio server. MCP clients must launch the b
 }
 ```
 
-The server exposes the eight original tool names. `configure_credentials` accepts no arguments and directs you to the local setup command. `configure_ranges` persists non-secret bounds in the OS credential store. The reading tools report source timestamps and avoid fabricated sensor details. Historical windows cannot yet be verified or filtered accurately because the API graph timestamps lack timezone offsets; statistics summarize returned samples only. `get_glucose_trends` reports observed values and trend-arrow counts without meal or dawn inference. These are deliberate limits, not full behavioral parity.
+The server exposes the eight original tool names. `configure_credentials` accepts no arguments and directs you to the local setup command. `configure_ranges` persists non-secret bounds in the OS credential store. The reading tools report source timestamps and avoid fabricated sensor details. An offset-aware graph is filtered to requested hours, days, or trend period; a graph with any offset-free or conflicting timestamp remains unfiltered. Every summary states whether filtering applied. `window_verified` remains false because the graph endpoint cannot prove complete coverage of the requested interval. Statistics describe observed samples only; true time in range and GMI remain unavailable. `get_glucose_trends` reports observed values and trend-arrow counts without meal or dawn inference. These are deliberate limits, not full behavioral parity.
 
 The server reuses its authenticated API client across tool calls. Restart it after changing credentials or patient selection with the local CLI. Range changes take effect without a restart.
 

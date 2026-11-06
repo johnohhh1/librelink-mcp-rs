@@ -31,11 +31,11 @@ A local user check confirmed that the pinned crate can connect to a LibreLinkUp 
 
 ## Current parity status
 
-The first `rmcp` stdio server exposes all eight original tool names. `configure_credentials` has no secret input. `get_current_glucose`, `get_sensor_info`, and `validate_connection` use the real graph response. `configure_ranges` persists bounds locally. History returns the graph points actually supplied by the API, with `window_verified: false`; requested hours may exceed the returned graph. Statistics describe those graph samples and leave time-weighted range and GMI unavailable. Trends report observed extrema and arrow counts, leaving clinical-pattern fields unavailable. Full requested-period analytics requires a trusted time basis and a history source with sufficient coverage.
+The first `rmcp` stdio server exposes all eight original tool names. `configure_credentials` has no secret input. `get_current_glucose`, `get_sensor_info`, and `validate_connection` use the real graph response. `configure_ranges` persists bounds locally. The time model keeps source text, factory text, retrieval time, interpreted UTC time, and freshness separate. It classifies offset-free, missing, invalid, conflicting, and future timestamps explicitly. History and analytics filter by the requested window only if every graph point has a trusted UTC timestamp; otherwise they return the graph samples with `window_filter_applied: false`. `window_verified` remains false because the API may return only a short graph. Statistics leave time-weighted range and GMI unavailable. Trends report observed extrema and arrow counts, leaving clinical-pattern fields unavailable. Full requested-period analytics requires a trusted time basis and a history source with sufficient coverage.
 
 ## Test gates
 
-- Synthetic fixtures for stale, missing, timezone-free, and future timestamps; unknown trend arrows; missing sensor metadata; short or sparse history; and invalid ranges.
+- Synthetic fixtures for stale, missing, timezone-free, ambiguous daylight-saving, conflicting, and future timestamps; unknown trend arrows; mixed-offset and boundary-crossing graph windows. Additional short or sparse history, missing sensor metadata, and invalid-range cases remain release gates.
 - MCP tool-list parity test for all eight names and a schema test proving `configure_credentials` has no password field.
 - API adapter tests with synthetic responses and sanitized error mapping. A local manual account check is separate and never recorded as a fixture.
 - CI on Linux, macOS, and Windows: `cargo fmt --check`, clippy with warnings denied, and tests. Add a lockfile when Cargo is available.

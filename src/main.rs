@@ -1,4 +1,4 @@
-use chrono::{DateTime, Duration, Utc};
+use chrono::Utc;
 use keyring::{Entry, Error as KeyringError};
 use libre_link_up_api_client::{
     ClientConfig, ConnectionIdentifier, LibreLinkUpClient, LibreLinkUpError, ReadRawResponse,
@@ -12,11 +12,13 @@ use tokio::sync::{Mutex, OnceCell};
 use zeroize::{Zeroize, Zeroizing};
 
 mod mcp;
+mod time;
+
+use time::{TimeAssessment, assess_time};
 
 const KEYRING_SERVICE: &str = "org.librelink-mcp-rs";
 const KEYRING_USER: &str = "librelinkup-account";
 const SETTINGS_USER: &str = "local-settings";
-const STALE_AFTER_MINUTES: i64 = 15;
 static CLIENT: OnceCell<LibreLinkUpClient> = OnceCell::const_new();
 static API_CALL_LOCK: Mutex<()> = Mutex::const_new(());
 
@@ -52,21 +54,12 @@ impl Drop for Credentials {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum Freshness {
-    Recent,
-    Stale,
-    Unknown,
-    Missing,
-}
-
 #[derive(Serialize)]
 struct ReadingSnapshot {
     glucose_mg_dl: Option<f64>,
     value_quality: &'static str,
-    source_timestamp: Option<String>,
-    freshness: Freshness,
+    #[serde(flatten)]
+    time: TimeAssessment,
 }
 
 #[derive(Serialize)]
@@ -95,26 +88,6 @@ fn parse_region(input: &str) -> Option<Region> {
         "ru" => Some(Region::RU),
         "cn" => Some(Region::CN),
         _ => None,
-    }
-}
-
-fn classify_freshness(timestamp: Option<&str>, now: DateTime<Utc>) -> Freshness {
-    let Some(timestamp) = timestamp.filter(|value| !value.trim().is_empty()) else {
-        return Freshness::Missing;
-    };
-
-    // The observed LibreLinkUp clock string has no timezone. It cannot be used
-    // to assert that a reading is recent or stale without more account context.
-    let Ok(parsed) = DateTime::parse_from_rfc3339(timestamp) else {
-        return Freshness::Unknown;
-    };
-    let age = now.signed_duration_since(parsed.with_timezone(&Utc));
-    if age < Duration::minutes(-2) {
-        Freshness::Unknown
-    } else if age > Duration::minutes(STALE_AFTER_MINUTES) {
-        Freshness::Stale
-    } else {
-        Freshness::Recent
     }
 }
 
@@ -258,8 +231,11 @@ async fn fetch_raw() -> Result<ReadRawResponse, &'static str> {
 async fn check() -> Result<(), &'static str> {
     let raw = fetch_raw().await?;
     let measurement = &raw.connection.glucose_measurement;
-    let timestamp =
-        (!measurement.timestamp.trim().is_empty()).then(|| measurement.timestamp.clone());
+    let time = assess_time(
+        Some(&measurement.timestamp),
+        Some(&measurement.factory_timestamp),
+        Utc::now(),
+    );
     let report = ConnectivityReport {
         status: "connected",
         source: "librelinkup_sharing_api",
@@ -274,8 +250,7 @@ async fn check() -> Result<(), &'static str> {
             } else {
                 "missing"
             },
-            freshness: classify_freshness(timestamp.as_deref(), Utc::now()),
-            source_timestamp: timestamp,
+            time,
         },
         graph_points_returned: raw.graph_data.len(),
         active_sensors_returned: raw.active_sensors.len(),
@@ -305,38 +280,11 @@ async fn main() {
 mod tests {
     use super::*;
 
-    fn now() -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339("2026-11-05T20:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc)
-    }
-
     #[test]
     fn accepts_only_known_regions() {
         assert_eq!(parse_region("EU2"), Some(Region::EU2));
         assert_eq!(parse_region(""), Some(Region::Global));
         assert_eq!(parse_region("unknown"), None);
-    }
-
-    #[test]
-    fn synthetic_timestamps_have_explicit_quality() {
-        assert_eq!(classify_freshness(None, now()), Freshness::Missing);
-        assert_eq!(
-            classify_freshness(Some("11/05/2026 03:58:00 PM"), now()),
-            Freshness::Unknown
-        );
-        assert_eq!(
-            classify_freshness(Some("2026-11-05T19:56:00Z"), now()),
-            Freshness::Recent
-        );
-        assert_eq!(
-            classify_freshness(Some("2026-11-05T19:20:00Z"), now()),
-            Freshness::Stale
-        );
-        assert_eq!(
-            classify_freshness(Some("2026-11-05T20:10:00Z"), now()),
-            Freshness::Unknown
-        );
     }
 
     #[test]
