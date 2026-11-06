@@ -24,7 +24,7 @@ This independent port preserves the **eight MCP tool names** from [Amandeep Khur
 | **Secrets** | OS credential store; no plaintext fallback or MCP password arguments |
 | **Readings** | Source timestamps retained; factory UTC interpretation labeled as inferred |
 | **History** | Graph points, observed span, estimated cadence, and gaps; API completeness remains unverified |
-| **Analytics** | Short windows return `insufficient_data`; GMI and time-weighted time in range unavailable |
+| **Analytics** | Statistics over a graph shorter than requested are labeled `partial`; GMI and time-weighted time in range unavailable |
 
 ## Quick start
 
@@ -70,20 +70,20 @@ The server reuses its authenticated API client. Restart it after changing creden
 | --- | --- |
 | `get_current_glucose` | Latest available reading, source time, and explicit freshness |
 | `get_glucose_history` | Graph readings and whether requested-hour filtering was applied |
-| `get_glucose_stats` | Descriptive statistics only when the graph spans the requested period without detected gaps |
+| `get_glucose_stats` | Descriptive statistics over the returned graph, labeled `partial` when it covers less than the requested days |
 | `get_glucose_trends` | Partial-period status, extrema, source arrows, and descriptive adjacent-point rates |
 | `get_sensor_info` | Source identifiers, interpreted activation epoch, warmup minutes, and product type code |
 | `configure_credentials` | Local setup instructions; accepts **no credentials** |
 | `configure_ranges` | Validates and saves local target bounds in mg/dL |
 | `validate_connection` | Connection and data-availability status without glucose values or secrets |
 
-Tool replies contain MCP `structuredContent` plus a JSON text block for clients that only display text. Errors set `isError: true` and use safe codes including `invalid_input`, `insufficient_data`, `rate_limited`, `timeout`, `session_expired`, and `upstream_unavailable`. Rate-limit replies include `retry_after_seconds`. Upstream response bodies and tokens are never included in error messages.
+Tool replies contain MCP `structuredContent` plus a JSON text block for clients that only display text. Errors set `isError: true` and use safe codes including `invalid_input`, `insufficient_data`, `rate_limited`, `timeout`, `session_expired`, `authentication_failed`, and `upstream_unavailable`. After `authentication_failed`, the server makes no further login attempts until it is restarted, so a wrong password cannot drive the account into an Abbott lockout. Rate-limit replies include `retry_after_seconds`. Upstream response bodies and tokens are never included in error messages.
 
 ## Data quality
 
 The API can return timestamps without timezone offsets. When both clock strings parse, their gap is quarter-hour aligned and within ±14 hours, and the factory clock is not in the future, the server interprets `FactoryTimestamp` as UTC and labels `time_basis: factory_utc_inferred`. This follows the [Rust client's UTC interpretation](https://github.com/ItsXrgon/libre-link-up-api-client/blob/main/src/utils.rs) and [public paired-clock examples](https://github.com/NightscoutFoundation/xDrip/discussions/2118), but the API does not attach an offset. A missing, inconsistent, or future factory time keeps freshness `unknown`. Retrieval time does **not** turn a reading into a real-time reading.
 
-When every graph point has a usable offset-aware or inferred UTC time, history, stats, and trends filter to the requested window. Coverage reports the first and last observations, span, estimated cadence and expected point count, actual count, and detected gaps. These estimates come from returned intervals. Statistics return `insufficient_data` when the graph does not span the requested period. Trends can return a labeled partial summary. `window_verified` remains false: the API cannot prove complete coverage. Sample percentages are not time-weighted time in range; GMI and clinical-pattern fields remain unavailable. See the [architecture and parity notes](docs/architecture.md) and [release roadmap](docs/roadmap.md).
+When every graph point has a usable offset-aware or inferred UTC time, history, stats, and trends filter to the requested window. Coverage reports the first and last observations, span, estimated cadence and expected point count, actual count, and detected gaps. These estimates come from returned intervals. Because the LibreLinkUp graph covers about 12 hours, statistics and trends for a requested day or longer return `period_status: partial` with the observed span in `coverage`; they describe the returned graph, not the requested days. Statistics return `insufficient_data` only when no valid values were returned. `window_verified` remains false: the API cannot prove complete coverage. Sample percentages are not time-weighted time in range; GMI and clinical-pattern fields remain unavailable. See the [architecture and parity notes](docs/architecture.md) and [release roadmap](docs/roadmap.md).
 
 ## Privacy and local data
 

@@ -114,8 +114,30 @@ pub(crate) struct FetchError {
 }
 
 struct Cooldown {
-    until: Instant,
+    /// `None` latches the error until the server restarts.
+    until: Option<Instant>,
     error: FetchError,
+}
+
+/// A rejected password cannot fix itself while the server holds the same
+/// credentials, and each retry is another failed login that moves the account
+/// toward an Abbott lockout. Latch it until restart instead of retrying.
+fn latches_until_restart(error: &FetchError) -> bool {
+    error.code == "authentication_failed"
+}
+
+fn cooldown_until(error: &FetchError, now: Instant) -> Option<Instant> {
+    if latches_until_restart(error) {
+        return None;
+    }
+    let seconds = error
+        .retry_after_seconds
+        .unwrap_or(FAILURE_COOLDOWN.as_secs());
+    Some(now + StdDuration::from_secs(seconds))
+}
+
+fn cooldown_active(cooldown: &Cooldown, now: Instant) -> bool {
+    cooldown.until.is_none_or(|until| now < until)
 }
 
 struct FetchState {
@@ -164,8 +186,8 @@ fn classify_fetch_error(error: LibreLinkUpError) -> FetchError {
         ),
         LibreLinkUpError::BadCredentials => (
             "authentication_failed",
-            "LibreLinkUp rejected the account credentials.",
-            Some(60),
+            "LibreLinkUp rejected the account credentials. No further logins will be attempted; run `setup` locally, then restart the server.",
+            None,
         ),
         LibreLinkUpError::AdditionalActionRequired(_) => (
             "account_action_required",
@@ -393,9 +415,15 @@ async fn fetch_raw() -> Result<FetchedRaw, FetchError> {
             cache_hit: true,
         });
     }
-    if let Some(cooldown) = state.cooldown.as_ref().filter(|entry| now < entry.until) {
+    if let Some(cooldown) = state
+        .cooldown
+        .as_ref()
+        .filter(|entry| cooldown_active(entry, now))
+    {
         let mut error = cooldown.error;
-        error.retry_after_seconds = Some(cooldown.until.duration_since(now).as_secs().max(1));
+        error.retry_after_seconds = cooldown
+            .until
+            .map(|until| until.duration_since(now).as_secs().max(1));
         return Err(error);
     }
     let client = CLIENT
@@ -412,11 +440,8 @@ async fn fetch_raw() -> Result<FetchedRaw, FetchError> {
         Ok(Ok(response)) => response,
         Ok(Err(error)) => {
             let error = classify_fetch_error(error);
-            let seconds = error
-                .retry_after_seconds
-                .unwrap_or(FAILURE_COOLDOWN.as_secs());
             state.cooldown = Some(Cooldown {
-                until: Instant::now() + StdDuration::from_secs(seconds),
+                until: cooldown_until(&error, Instant::now()),
                 error,
             });
             return Err(error);
@@ -428,7 +453,7 @@ async fn fetch_raw() -> Result<FetchedRaw, FetchError> {
                 retry_after_seconds: Some(FAILURE_COOLDOWN.as_secs()),
             };
             state.cooldown = Some(Cooldown {
-                until: Instant::now() + FAILURE_COOLDOWN,
+                until: Some(Instant::now() + FAILURE_COOLDOWN),
                 error,
             });
             return Err(error);
@@ -558,5 +583,37 @@ mod tests {
         ));
         assert_eq!(throttled.code, "rate_limited");
         assert!(!throttled.message.contains("synthetic body"));
+    }
+
+    #[test]
+    fn rejected_credentials_latch_until_restart() {
+        let now = Instant::now();
+        let rejected = classify_fetch_error(LibreLinkUpError::BadCredentials);
+        assert_eq!(rejected.code, "authentication_failed");
+        assert_eq!(rejected.retry_after_seconds, None);
+        assert!(latches_until_restart(&rejected));
+        let latched = Cooldown {
+            until: cooldown_until(&rejected, now),
+            error: rejected,
+        };
+        assert!(latched.until.is_none());
+        assert!(cooldown_active(
+            &latched,
+            now + StdDuration::from_secs(86_400)
+        ));
+
+        let throttled = classify_fetch_error(LibreLinkUpError::AccountLocked(120));
+        let temporary = Cooldown {
+            until: cooldown_until(&throttled, now),
+            error: throttled,
+        };
+        assert!(cooldown_active(
+            &temporary,
+            now + StdDuration::from_secs(119)
+        ));
+        assert!(!cooldown_active(
+            &temporary,
+            now + StdDuration::from_secs(121)
+        ));
     }
 }

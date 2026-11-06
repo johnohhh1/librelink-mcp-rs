@@ -340,11 +340,68 @@ fn failure_fetch(error: FetchError) -> CallToolResult {
     }))
 }
 
-fn insufficient_coverage(coverage: GraphCoverage) -> CallToolResult {
-    CallToolResult::structured_error(serde_json::json!({
-        "error_code": "insufficient_data",
-        "message": "The returned graph does not support the requested time window.",
+/// Descriptive statistics over the returned graph. A graph shorter than the
+/// requested window still yields statistics, labeled `partial`, because the
+/// LibreLinkUp graph covers roughly 12 hours and no request of a day or more
+/// can ever be fully covered by it.
+fn summarize_stats(
+    graph: &[GlucoseItem],
+    days: u8,
+    target_low: u16,
+    target_high: u16,
+    now: DateTime<Utc>,
+) -> Result<serde_json::Value, CallToolResult> {
+    let hours = i64::from(days) * 24;
+    let coverage = graph_coverage(graph, hours, now);
+    let (items, window_filter_applied) = select_graph_window(graph, hours, now);
+    let values: Vec<f64> = items
+        .iter()
+        .map(|item| item.value_in_mg_per_dl)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .collect();
+    if values.is_empty() {
+        return Err(failure_code(
+            "insufficient_data",
+            "No valid historical glucose values were returned.",
+        ));
+    }
+    let count = values.len();
+    let average = values.iter().sum::<f64>() / count as f64;
+    let variance = values.iter().map(|v| (v - average).powi(2)).sum::<f64>() / count as f64;
+    let standard_deviation = variance.sqrt();
+    let low = f64::from(target_low);
+    let high = f64::from(target_high);
+    let below = values.iter().filter(|v| **v < low).count();
+    let above = values.iter().filter(|v| **v > high).count();
+    let in_range = count - below - above;
+    let period_status = if coverage.period_span_sufficient {
+        "sample_summary"
+    } else {
+        "partial"
+    };
+    Ok(serde_json::json!({
+        "requested_days": days,
+        "period_status": period_status,
+        "window_verified": false,
+        "window_filter_applied": window_filter_applied,
         "coverage": coverage,
+        "sample_count": count,
+        "average_glucose_mg_dl": average,
+        "standard_deviation_mg_dl": standard_deviation,
+        "coefficient_of_variation_percent": standard_deviation / average * 100.0,
+        "sample_percentages": {
+            "below_range": below as f64 / count as f64 * 100.0,
+            "in_range": in_range as f64 / count as f64 * 100.0,
+            "above_range": above as f64 / count as f64 * 100.0,
+        },
+        "target_range_mg_dl": { "low": target_low, "high": target_high },
+        "time_in_range_percent": null,
+        "gmi_percent": null,
+        "reason": if period_status == "partial" {
+            "These statistics describe only the returned graph, which covers less than the requested period; see coverage for the observed span. They are not a summary of the requested days. Time-weighted range and GMI are unavailable."
+        } else {
+            "These statistics describe selected graph samples only. Time-weighted range and a valid GMI window are unverified."
+        },
     }))
 }
 
@@ -421,7 +478,7 @@ impl LibreMcp {
     }
 
     #[tool(
-        description = "Calculate descriptive statistics for graph points. Filter requested days only when each timestamp has an offset-aware or validated inferred UTC time; coverage remains unverified."
+        description = "Calculate descriptive statistics for graph points. The LibreLinkUp graph covers about 12 hours, so longer requests return statistics labeled partial with the observed span in coverage."
     )]
     async fn get_glucose_stats(&self, Parameters(args): Parameters<StatsArgs>) -> CallToolResult {
         let days = args.days.unwrap_or(7);
@@ -436,53 +493,19 @@ impl LibreMcp {
             Ok(settings) => settings,
             Err(message) => return failure(message),
         };
-        let now = Utc::now();
-        let coverage = graph_coverage(&raw.graph_data, i64::from(days) * 24, now);
-        if !coverage.period_span_sufficient {
-            return insufficient_coverage(coverage);
+        match summarize_stats(
+            &raw.graph_data,
+            days,
+            settings.target_low,
+            settings.target_high,
+            Utc::now(),
+        ) {
+            Ok(mut body) => {
+                body["cache_hit"] = serde_json::Value::Bool(raw.cache_hit);
+                success(body)
+            }
+            Err(error) => error,
         }
-        let (items, window_filter_applied) =
-            select_graph_window(&raw.graph_data, i64::from(days) * 24, now);
-        let values: Vec<f64> = items
-            .iter()
-            .map(|item| item.value_in_mg_per_dl)
-            .filter(|value| value.is_finite() && *value > 0.0)
-            .collect();
-        if values.is_empty() {
-            return failure_code(
-                "insufficient_data",
-                "No valid historical glucose values were returned.",
-            );
-        }
-        let count = values.len();
-        let average = values.iter().sum::<f64>() / count as f64;
-        let variance = values.iter().map(|v| (v - average).powi(2)).sum::<f64>() / count as f64;
-        let standard_deviation = variance.sqrt();
-        let low = f64::from(settings.target_low);
-        let high = f64::from(settings.target_high);
-        let below = values.iter().filter(|v| **v < low).count();
-        let above = values.iter().filter(|v| **v > high).count();
-        let in_range = count - below - above;
-        success(serde_json::json!({
-            "requested_days": days,
-            "window_verified": false,
-            "window_filter_applied": window_filter_applied,
-            "cache_hit": raw.cache_hit,
-            "coverage": coverage,
-            "sample_count": count,
-            "average_glucose_mg_dl": average,
-            "standard_deviation_mg_dl": standard_deviation,
-            "coefficient_of_variation_percent": standard_deviation / average * 100.0,
-            "sample_percentages": {
-                "below_range": below as f64 / count as f64 * 100.0,
-                "in_range": in_range as f64 / count as f64 * 100.0,
-                "above_range": above as f64 / count as f64 * 100.0,
-            },
-            "target_range_mg_dl": { "low": settings.target_low, "high": settings.target_high },
-            "time_in_range_percent": null,
-            "gmi_percent": null,
-            "reason": "These statistics describe selected graph samples only. Full time coverage, time-weighted range, and a valid GMI window are unverified.",
-        }))
     }
 
     #[tool(
@@ -825,6 +848,45 @@ mod tests {
         assert_eq!(rates.minimum_mg_dl_per_minute, Some(-1.0));
         assert_eq!(rates.maximum_mg_dl_per_minute, Some(1.0));
         assert_eq!(rates.average_mg_dl_per_minute, Some(0.0));
+    }
+
+    #[test]
+    fn short_graph_yields_partial_stats_instead_of_an_error() {
+        let now = DateTime::parse_from_rfc3339("2026-11-05T20:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        // A realistic ~12 hour graph at 15 minute cadence, shorter than one day.
+        let start = now - Duration::hours(12);
+        let mut graph: Vec<GlucoseItem> = (0..=48)
+            .map(|step| {
+                let at = start + Duration::minutes(15 * step);
+                synthetic_item(&at.to_rfc3339())
+            })
+            .collect();
+        graph[0].value_in_mg_per_dl = 60.0;
+        graph[1].value_in_mg_per_dl = 200.0;
+
+        let body = summarize_stats(&graph, 1, 70, 180, now).expect("partial stats");
+        assert_eq!(body["period_status"], "partial");
+        assert_eq!(body["sample_count"], 49);
+        assert_eq!(body["coverage"]["period_span_sufficient"], false);
+        assert_eq!(body["gmi_percent"], serde_json::Value::Null);
+        let in_range = body["sample_percentages"]["in_range"].as_f64().unwrap();
+        assert!((in_range - 47.0 / 49.0 * 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stats_with_no_valid_values_is_insufficient_data() {
+        let now = DateTime::parse_from_rfc3339("2026-11-05T20:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut graph = [synthetic_item("2026-11-05T19:45:00Z")];
+        graph[0].value_in_mg_per_dl = 0.0;
+        let error = summarize_stats(&graph, 1, 70, 180, now).unwrap_err();
+        assert_eq!(
+            error.structured_content.as_ref().unwrap()["error_code"],
+            "insufficient_data"
+        );
     }
 
     #[test]

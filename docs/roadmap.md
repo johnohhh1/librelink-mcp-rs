@@ -1,6 +1,6 @@
 # Roadmap to a reliable release
 
-The current server proves connectivity and MCP interoperability. It exposes the eight original tool names but is not yet feature complete. `hours`, `days`, and `period` filter graph points with offset-aware or conservatively inferred UTC times. A short graph yields coverage diagnostics or `insufficient_data`; no API completeness claim is made. This document defines the remaining release gates for claiming parity.
+The current server proves connectivity and MCP interoperability. It exposes the eight original tool names but is not yet feature complete. `hours`, `days`, and `period` filter graph points with offset-aware or conservatively inferred UTC times. A short graph yields coverage diagnostics and statistics labeled `partial`; no API completeness claim is made. This document defines the remaining release gates for claiming parity.
 
 ## 1. Establish a trustworthy time and data contract
 
