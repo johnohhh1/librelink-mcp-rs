@@ -18,12 +18,15 @@ mod store;
 mod time;
 
 use fetch::Fetcher;
-use llu_client::LiveSource;
+use llu_client::{LiveSource, PatientSelection};
 use time::{TimeAssessment, assess_time_at};
 
 const KEYRING_SERVICE: &str = "org.librelink-mcp-rs";
 const KEYRING_USER: &str = "librelinkup-account";
 const SETTINGS_USER: &str = "local-settings";
+/// The followed person's patient ID, chosen with `select-patient`. Kept in
+/// the credential store, never in settings, and never printed.
+const PATIENT_USER: &str = "selected-patient";
 
 /// The production data path: the owned LibreLinkUp client behind the cache,
 /// cooldown, and latches.
@@ -44,6 +47,9 @@ struct Credentials {
 struct Settings {
     target_low: u16,
     target_high: u16,
+    /// A full name stored before 1.0. Converted to a stored patient ID on
+    /// first use, then removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     patient_name: Option<String>,
     #[serde(default = "default_api_version")]
     api_version: String,
@@ -106,6 +112,41 @@ fn settings_entry() -> Result<Entry, &'static str> {
     Entry::new(KEYRING_SERVICE, SETTINGS_USER).map_err(|_| "OS credential store is unavailable.")
 }
 
+fn patient_entry() -> Result<Entry, &'static str> {
+    Entry::new(KEYRING_SERVICE, PATIENT_USER).map_err(|_| "OS credential store is unavailable.")
+}
+
+/// The stored selection: a patient ID, else a legacy name, else nothing.
+fn load_patient_selection() -> Result<PatientSelection, &'static str> {
+    match patient_entry()?.get_password() {
+        Ok(id) if !id.trim().is_empty() => return Ok(PatientSelection::Id(id.trim().to_owned())),
+        Ok(_) | Err(KeyringError::NoEntry) => {}
+        Err(_) => return Err("Unable to read the patient selection from the OS credential store."),
+    }
+    Ok(match load_settings()?.patient_name {
+        Some(name) if !name.trim().is_empty() => PatientSelection::LegacyName(name),
+        _ => PatientSelection::Unset,
+    })
+}
+
+/// Stores the chosen patient ID and removes any legacy name.
+fn save_selected_patient(id: &str) -> Result<(), &'static str> {
+    patient_entry()?
+        .set_password(id)
+        .map_err(|_| "Unable to save the patient selection in the OS credential store.")?;
+    let mut settings = load_settings()?;
+    if settings.patient_name.take().is_some() {
+        save_settings(&settings)?;
+    }
+    Ok(())
+}
+
+/// Converts a legacy name selection once it resolved to exactly one ID. Best
+/// effort: on failure the name stays and conversion is tried on next start.
+fn save_legacy_selection(id: &str) {
+    let _ = save_selected_patient(id);
+}
+
 fn load_settings() -> Result<Settings, &'static str> {
     match settings_entry()?.get_password() {
         Ok(value) => serde_json::from_str(&value).map_err(|_| "Stored settings are invalid."),
@@ -163,12 +204,44 @@ fn setup() -> Result<(), &'static str> {
     Ok(())
 }
 
-fn select_patient() -> Result<(), &'static str> {
-    let name = prompt("Followed person's full name (blank to clear selection): ")?;
-    let mut settings = load_settings()?;
-    settings.patient_name = (!name.is_empty()).then_some(name);
-    save_settings(&settings)?;
-    println!("Patient selection saved locally. Run `check` to verify it.");
+/// Parses a menu answer: `Some(index)` for 1 through `count`.
+fn choice_index(answer: &str, count: usize) -> Option<usize> {
+    let number: usize = answer.trim().parse().ok()?;
+    (1..=count).contains(&number).then(|| number - 1)
+}
+
+async fn select_patient() -> Result<(), Cow<'static, str>> {
+    use std::io::IsTerminal;
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Err("Run `select-patient` in an interactive terminal.".into());
+    }
+    let client = llu_client::build_selection_client()?;
+    let choices = client
+        .connection_choices()
+        .await
+        .map_err(|error| error.message)?;
+    if choices.is_empty() {
+        return Err("This account follows no one in LibreLinkUp.".into());
+    }
+    println!("People this account follows:");
+    for (index, choice) in choices.iter().enumerate() {
+        let name = if choice.name.is_empty() {
+            "(no name)"
+        } else {
+            &choice.name
+        };
+        println!("  {}. {name}", index + 1);
+    }
+    let answer = prompt("Number to follow (blank to cancel): ")?;
+    if answer.is_empty() {
+        println!("Nothing changed.");
+        return Ok(());
+    }
+    let index = choice_index(&answer, choices.len()).ok_or("Enter one of the listed numbers.")?;
+    save_selected_patient(&choices[index].patient_id)?;
+    println!(
+        "Selection saved in the OS credential store. Restart the MCP server and any collector to use it."
+    );
     Ok(())
 }
 
@@ -220,6 +293,7 @@ fn clear_local_data(db: Option<PathBuf>) -> Result<(), &'static str> {
     ensure_not_in_use(db.as_deref())?;
     delete_entry_if_present(keyring_entry()?)?;
     delete_entry_if_present(settings_entry()?)?;
+    delete_entry_if_present(patient_entry()?)?;
     if let Some(db) = &db {
         store::delete_database_files(db)?;
     }
@@ -347,7 +421,7 @@ async fn run() {
     let result: Result<(), Cow<'static, str>> = match args.as_slice() {
         [_, command] if command == "setup" => setup().map_err(Cow::from),
         [_, command] if command == "check" => check().await,
-        [_, command] if command == "select-patient" => select_patient().map_err(Cow::from),
+        [_, command] if command == "select-patient" => select_patient().await,
         [_, command] if command == "set-api-version" => set_api_version().map_err(Cow::from),
         [_, command, rest @ ..] if command == "clear-local-data" => parse_db_option(rest)
             .and_then(clear_local_data)
@@ -403,6 +477,27 @@ mod tests {
         assert!(ensure_not_in_use(None).is_ok());
         // A path that does not exist is not locked.
         assert!(ensure_not_in_use(Some(&dir.path().join("missing.sqlite3"))).is_ok());
+    }
+
+    #[test]
+    fn a_legacy_name_setting_still_loads_and_is_dropped_once_cleared() {
+        let legacy = r#"{"target_low":70,"target_high":180,"patient_name":"Sam Synthetic","api_version":"4.16.0"}"#;
+        let mut settings: Settings = serde_json::from_str(legacy).unwrap();
+        assert_eq!(settings.patient_name.as_deref(), Some("Sam Synthetic"));
+        settings.patient_name = None;
+        let saved = serde_json::to_string(&settings).unwrap();
+        assert!(!saved.contains("patient_name"), "{saved}");
+        let fresh = serde_json::to_string(&Settings::default()).unwrap();
+        assert!(!fresh.contains("patient"), "{fresh}");
+    }
+
+    #[test]
+    fn menu_answers_must_name_a_listed_number() {
+        assert_eq!(choice_index("1", 2), Some(0));
+        assert_eq!(choice_index(" 2 ", 2), Some(1));
+        for answer in ["0", "3", "-1", "two", "1.0", ""] {
+            assert_eq!(choice_index(answer, 2), None, "{answer}");
+        }
     }
 
     #[test]

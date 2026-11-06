@@ -11,7 +11,7 @@
 use crate::fetch::FetchError;
 use crate::region::region_base_url;
 use crate::source::{DataSource, GlucoseSample, ReadFuture, SensorRecord, Snapshot};
-use crate::{load_credentials, load_settings, valid_api_version};
+use crate::{load_credentials, load_patient_selection, load_settings, valid_api_version};
 use chrono::Utc;
 use reqwest::header::{
     ACCEPT, ACCEPT_LANGUAGE, AUTHORIZATION, CACHE_CONTROL, CONNECTION, CONTENT_TYPE, HeaderMap,
@@ -57,13 +57,35 @@ pub(crate) fn unique_match<T>(items: &[T], predicate: impl Fn(&T) -> bool) -> Op
     matches.next().is_none().then_some(selected)
 }
 
+/// Which followed person to read.
+pub(crate) enum PatientSelection {
+    /// Nothing chosen: use the only connection, or ask the user to choose.
+    Unset,
+    /// The patient ID chosen with `select-patient`.
+    Id(String),
+    /// A full name stored before 1.0. Converted to an ID on first use.
+    LegacyName(String),
+}
+
+/// Called once with the ID a legacy name resolved to, so it can be stored.
+pub(crate) type SaveSelection = Box<dyn Fn(&str) + Send + Sync>;
+
+/// One person the account follows, for `select-patient`.
+pub(crate) struct ConnectionChoice {
+    pub patient_id: String,
+    pub name: String,
+}
+
 /// Everything the client needs. No `Clone` or `Debug`: the password exists
 /// once, in zeroizing storage.
 pub(crate) struct LluConfig {
     pub email: String,
     pub password: Zeroizing<String>,
     pub api_version: String,
-    pub patient_name: Option<String>,
+    pub selection: PatientSelection,
+    /// Stores the ID a legacy name resolved to; `None` in tests and for
+    /// `select-patient` itself.
+    pub save_selection: Option<SaveSelection>,
     pub base_url: String,
 }
 
@@ -97,7 +119,8 @@ pub(crate) struct LluClient {
     http: Client,
     email: String,
     password: Zeroizing<String>,
-    patient_name: Option<String>,
+    selection: PatientSelection,
+    save_selection: Option<SaveSelection>,
     redirect_rewrite: UrlRewrite,
     session: Mutex<Session>,
 }
@@ -155,7 +178,12 @@ const NO_CONNECTION: FetchError = error(
 );
 const SELECTION_REQUIRED: FetchError = error(
     "patient_selection_required",
-    "No unique followed person was selected. Run `select-patient` locally.",
+    "This account follows more than one person and none is selected. Run `select-patient` locally.",
+);
+/// The stored choice is gone. Never fall back to someone else.
+const SELECTION_CHANGED: FetchError = final_error(
+    "patient_selection_changed",
+    "The person chosen with `select-patient` is no longer among this account's connections, so no data was read. Run `select-patient` locally, then restart the server.",
 );
 
 fn rate_limited(seconds: Option<u64>) -> FetchError {
@@ -335,6 +363,14 @@ struct ConnectionSummary {
     last_name: String,
 }
 
+impl ConnectionSummary {
+    fn name(&self) -> String {
+        format!("{} {}", self.first_name.trim(), self.last_name.trim())
+            .trim()
+            .to_owned()
+    }
+}
+
 #[derive(Deserialize)]
 struct GraphEnvelope {
     data: GraphData,
@@ -461,7 +497,13 @@ impl LluClient {
             http,
             email: config.email,
             password: config.password,
-            patient_name: config.patient_name.map(|name| name.to_lowercase()),
+            selection: match config.selection {
+                PatientSelection::LegacyName(name) => {
+                    PatientSelection::LegacyName(name.to_lowercase())
+                }
+                other => other,
+            },
+            save_selection: config.save_selection,
             redirect_rewrite: Box::new(str::to_owned),
             session: Mutex::new(Session {
                 base_url: config.base_url,
@@ -606,18 +648,53 @@ impl LluClient {
         if connections.data.is_empty() {
             return Err(NO_CONNECTION);
         }
-        let selected = unique_match(&connections.data, |connection| {
-            self.patient_name.as_ref().is_none_or(|name| {
-                format!("{} {}", connection.first_name, connection.last_name).to_lowercase()
-                    == *name
+        let selected = match &self.selection {
+            PatientSelection::Id(id) => connections
+                .data
+                .iter()
+                .find(|connection| connection.patient_id == *id)
+                .ok_or(SELECTION_CHANGED)?,
+            PatientSelection::Unset => {
+                unique_match(&connections.data, |_| true).ok_or(SELECTION_REQUIRED)?
+            }
+            PatientSelection::LegacyName(name) => unique_match(&connections.data, |connection| {
+                connection.name().to_lowercase() == *name
             })
-        })
-        .ok_or(SELECTION_REQUIRED)?;
+            .ok_or(SELECTION_REQUIRED)?,
+        };
         if !valid_patient_id(&selected.patient_id) {
             return Err(UNAVAILABLE);
         }
+        if let (PatientSelection::LegacyName(_), Some(save)) =
+            (&self.selection, &self.save_selection)
+        {
+            save(&selected.patient_id);
+        }
         session.patient_id = Some(selected.patient_id.clone());
         Ok(selected.patient_id.clone())
+    }
+
+    /// The people this account follows, for `select-patient`. Logs in if
+    /// needed. Connections with an unusable ID are left out.
+    pub(crate) async fn connection_choices(&self) -> Result<Vec<ConnectionChoice>, FetchError> {
+        let mut session = self.session.lock().await;
+        if session.needs_login(Utc::now().timestamp()) {
+            self.login(&mut session).await?;
+        }
+        let mut relogged = false;
+        let body = self
+            .get(&mut session, CONNECTIONS_PATH, &mut relogged)
+            .await?;
+        let connections: ConnectionsEnvelope = parse(&body)?;
+        Ok(connections
+            .data
+            .iter()
+            .filter(|connection| valid_patient_id(&connection.patient_id))
+            .map(|connection| ConnectionChoice {
+                patient_id: connection.patient_id.clone(),
+                name: connection.name(),
+            })
+            .collect())
     }
 
     async fn read_snapshot(&self) -> Result<Snapshot, FetchError> {
@@ -654,6 +731,21 @@ impl DataSource for LluClient {
 /// settings. The password moves into the client's zeroizing storage; no
 /// other copy is kept.
 fn build_live_client() -> Result<LluClient, &'static str> {
+    build_client(
+        load_patient_selection()?,
+        Some(Box::new(crate::save_legacy_selection)),
+    )
+}
+
+/// The client `select-patient` uses to list connections.
+pub(crate) fn build_selection_client() -> Result<LluClient, &'static str> {
+    build_client(PatientSelection::Unset, None)
+}
+
+fn build_client(
+    selection: PatientSelection,
+    save_selection: Option<SaveSelection>,
+) -> Result<LluClient, &'static str> {
     let mut credentials = load_credentials()?;
     let settings = load_settings()?;
     let base_url = region_base_url(&credentials.region).ok_or("Stored region is invalid.")?;
@@ -667,7 +759,8 @@ fn build_live_client() -> Result<LluClient, &'static str> {
         email: std::mem::take(&mut credentials.email),
         password: Zeroizing::new(std::mem::take(&mut credentials.password)),
         api_version: settings.api_version,
-        patient_name: settings.patient_name,
+        selection,
+        save_selection,
         base_url: base_url.to_owned(),
     })
 }
@@ -728,7 +821,8 @@ mod tests {
             email: EMAIL.to_owned(),
             password: Zeroizing::new(PASSWORD.to_owned()),
             api_version: "4.16.0".to_owned(),
-            patient_name: None,
+            selection: PatientSelection::Unset,
+            save_selection: None,
             base_url: base_url.to_owned(),
         }
     }
@@ -1179,8 +1273,167 @@ mod tests {
         assert_eq!(error.code, "patient_selection_required");
 
         let mut named = config(&server.uri());
-        named.patient_name = Some("PAT synthetic".to_owned());
+        named.selection = PatientSelection::LegacyName("PAT synthetic".to_owned());
         LluClient::new(named).unwrap().read().await.unwrap();
+    }
+
+    /// Two followed people; only the second one's graph is served.
+    async fn two_people(server: &MockServer) {
+        mount(server, "POST", LOGIN_PATH, login_ok(in_one_hour())).await;
+        mount(
+            server,
+            "GET",
+            CONNECTIONS_PATH,
+            connections(&[
+                ("synthetic-patient-0001", "Sam", "Synthetic"),
+                ("synthetic-patient-0002", "Pat", "Synthetic"),
+            ]),
+        )
+        .await;
+        mount(
+            server,
+            "GET",
+            "/llu/connections/synthetic-patient-0002/graph",
+            graph_ok(),
+        )
+        .await;
+    }
+
+    async fn graph_requests(server: &MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|request| request.url.path().to_owned())
+            .filter(|path| path.ends_with("/graph"))
+            .collect()
+    }
+
+    fn selecting(server: &MockServer, selection: PatientSelection) -> LluClient {
+        let mut config = config(&server.uri());
+        config.selection = selection;
+        LluClient::new(config).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_stored_id_selects_that_person_among_several() {
+        let server = MockServer::start().await;
+        two_people(&server).await;
+        let client = selecting(
+            &server,
+            PatientSelection::Id("synthetic-patient-0002".to_owned()),
+        );
+        let snapshot = client.read().await.unwrap();
+        assert_eq!(snapshot.patient_id, "synthetic-patient-0002");
+        assert_eq!(
+            graph_requests(&server).await,
+            ["/llu/connections/synthetic-patient-0002/graph"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stored_id_that_is_gone_never_switches_to_someone_else() {
+        let server = MockServer::start().await;
+        two_people(&server).await;
+        let client = selecting(
+            &server,
+            PatientSelection::Id("synthetic-patient-0009".to_owned()),
+        );
+        let error = client.read().await.unwrap_err();
+        assert_eq!(error.code, "patient_selection_changed");
+        assert_eq!(error.retry_after_seconds, None);
+        assert!(crate::fetch::latches_until_restart(&error));
+        assert!(graph_requests(&server).await.is_empty());
+
+        // Even with a single connection left, it is not used.
+        let single = MockServer::start().await;
+        mount_session(&single, in_one_hour()).await;
+        let error = selecting(
+            &single,
+            PatientSelection::Id("synthetic-patient-0009".to_owned()),
+        )
+        .read()
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "patient_selection_changed");
+        assert!(graph_requests(&single).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn with_nothing_stored_only_a_single_connection_is_used() {
+        let single = MockServer::start().await;
+        mount_session(&single, in_one_hour()).await;
+        mount(&single, "GET", GRAPH_PATH, graph_ok()).await;
+        let snapshot = client(&single).read().await.unwrap();
+        assert_eq!(snapshot.patient_id, PATIENT_ID);
+
+        let several = MockServer::start().await;
+        two_people(&several).await;
+        let error = client(&several).read().await.unwrap_err();
+        assert_eq!(error.code, "patient_selection_required");
+        assert!(graph_requests(&several).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_legacy_name_is_converted_to_an_id_once() {
+        let server = MockServer::start().await;
+        two_people(&server).await;
+        let saved = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let mut config = config(&server.uri());
+        config.selection = PatientSelection::LegacyName("PAT synthetic".to_owned());
+        let record = Arc::clone(&saved);
+        config.save_selection = Some(Box::new(move |id| {
+            record.lock().unwrap().push(id.to_owned());
+        }));
+        let client = LluClient::new(config).unwrap();
+        client.read().await.unwrap();
+        client.read().await.unwrap();
+        assert_eq!(*saved.lock().unwrap(), ["synthetic-patient-0002"]);
+
+        // A name that matches no one, or several, is not converted.
+        let saved = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        for name in ["Nobody Synthetic", "synthetic"] {
+            let mut config = self::config(&server.uri());
+            config.selection = PatientSelection::LegacyName(name.to_owned());
+            let record = Arc::clone(&saved);
+            config.save_selection = Some(Box::new(move |id| {
+                record.lock().unwrap().push(id.to_owned());
+            }));
+            let error = LluClient::new(config).unwrap().read().await.unwrap_err();
+            assert_eq!(error.code, "patient_selection_required", "{name}");
+        }
+        assert!(saved.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn connection_choices_list_names_and_skip_unusable_ids() {
+        let server = MockServer::start().await;
+        mount(&server, "POST", LOGIN_PATH, login_ok(in_one_hour())).await;
+        mount(
+            &server,
+            "GET",
+            CONNECTIONS_PATH,
+            connections(&[
+                ("synthetic-patient-0001", " Sam ", "Synthetic"),
+                ("../not/a/path", "Bad", "Id"),
+                ("synthetic-patient-0002", "", ""),
+            ]),
+        )
+        .await;
+        let choices = client(&server).connection_choices().await.unwrap();
+        let listed: Vec<(&str, &str)> = choices
+            .iter()
+            .map(|choice| (choice.patient_id.as_str(), choice.name.as_str()))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                ("synthetic-patient-0001", "Sam Synthetic"),
+                ("synthetic-patient-0002", "")
+            ]
+        );
+        assert!(graph_requests(&server).await.is_empty());
     }
 
     /// Runs one read where login answers with `response`.

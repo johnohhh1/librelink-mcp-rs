@@ -37,7 +37,7 @@ Exit statuses:
 | 0 | Stopped by Ctrl+C or SIGTERM. |
 | 1 | Could not open or lock the database, another collector is running, or a database write failed. |
 | 2 | Invalid command-line options. |
-| 78 | A problem a retry cannot fix: `authentication_failed` (run `setup`), `client_version_rejected` (run `set-api-version`), or `request_rejected` (please report a bug). The message says which. Fix the cause, then start `collect` again. |
+| 78 | A problem a retry cannot fix: `authentication_failed` (run `setup`), `client_version_rejected` (run `set-api-version`), `patient_selection_changed` (run `select-patient`), or `request_rejected` (please report a bug). The message says which. Fix the cause, then start `collect` again. |
 
 ## How serve chooses its data
 

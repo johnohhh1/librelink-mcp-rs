@@ -37,7 +37,7 @@ cargo run -- setup
 cargo run -- check
 ```
 
-`setup` prompts locally for the follower account email, a hidden password, and a region. It accepts `global` (the default), `us`, `eu`, `eu2`, `ae`, `ap`, `au`, `ca`, `de`, `fr`, `jp`, `la`, `ru`, and `cn`. If the account follows multiple people, run `cargo run -- select-patient` and enter the followed person's full name before `check`. An ambiguous account is rejected instead of silently choosing the first connection.
+`setup` prompts locally for the follower account email, a hidden password, and a region. It accepts `global` (the default), `us`, `eu`, `eu2`, `ae`, `ap`, `au`, `ca`, `de`, `fr`, `jp`, `la`, `ru`, and `cn`. If the account follows more than one person, run `cargo run -- select-patient` in a terminal and pick the person by number before `check`. The choice is stored as the connection's patient ID in the OS credential store and is never printed. With no choice stored, an account with several connections is rejected (`patient_selection_required`) instead of silently choosing one. If the chosen person later disappears from the account, reads stop with `patient_selection_changed` and never switch to someone else. A full-name selection saved by an earlier version is converted to the ID the first time it matches exactly one connection.
 
 `check` logs in, reads the followed person's graph, and prints a small connectivity report. Since v0.2 the server uses its own LibreLinkUp client instead of the `libre_link_up_api_client` crate; [ADR 0001](docs/adr/0001-owned-api-client.md) explains why. The owned client sends the same request headers as the crate did. It was checked against one live US follower account on 2026-11-05; other accounts, regions, and sensors still need validation.
 

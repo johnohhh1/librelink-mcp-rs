@@ -37,7 +37,10 @@ pub(crate) struct Cooldown {
 pub(crate) fn latches_until_restart(error: &FetchError) -> bool {
     matches!(
         error.code,
-        "authentication_failed" | "client_version_rejected" | "request_rejected"
+        "authentication_failed"
+            | "client_version_rejected"
+            | "request_rejected"
+            | "patient_selection_changed"
     )
 }
 

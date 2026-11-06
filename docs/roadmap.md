@@ -94,7 +94,7 @@ Steps:
 
 ## v1.0: release
 
-- Replace name-based patient selection with a local, stable-ID chooser that refuses ambiguous or changed connections without exposing patient IDs.
+- Replace name-based patient selection with a local, stable-ID chooser that refuses ambiguous or changed connections without exposing patient IDs. **Done** (step 1): `select-patient` stores the chosen ID in the OS credential store; `patient_selection_required` and `patient_selection_changed` never pick someone silently.
 - MCP tool annotations and typed output schemas for all eight tools. A current-reading resource. Cap or paginate large history responses.
 - Error paths, panics, traces, and debug output audited for passwords, tokens, account identifiers, and readings. Telemetry stays off.
 - Dependency advisory and license gate in CI.
