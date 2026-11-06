@@ -1,7 +1,7 @@
 # ADR 0002: Local store and collector
 
 - **Status:** accepted
-- **Date:** 2026-11-05
+- **Date:** 2026-11-05 (implementation details settled the same day)
 - **Milestone:** v0.3 (see [roadmap](../roadmap.md#v03-opt-in-collect-command-and-sqlite))
 
 ## Context
@@ -18,6 +18,8 @@ The LibreLinkUp graph endpoint takes no date range and covers about 12 hours, so
 ### Source selection
 
 - `serve` reads from the store when the collector heartbeat is fresh (less than 3 minutes old), and from the live API otherwise.
+- The collector writes the heartbeat on every loop iteration and at least every 30 seconds, including while it waits out a cooldown. So `serve` keeps using the store while a collector is alive, even during a long rate-limit cooldown, and never starts a second conversation with Abbott at that moment. Stored readings simply age into `stale` freshness, which is honest.
+- The heartbeat is used only for source selection, not to enforce a single collector.
 - Every data tool reply includes `data_source: "local_store" | "live_api"`.
 - While a collector runs, only one process talks to Abbott.
 
@@ -30,13 +32,13 @@ The LibreLinkUp graph endpoint takes no date range and covers about 12 hours, so
 
 - The data directory comes from the `directories` crate's `ProjectDirs`. A `--db <path>` option overrides it.
 - On Unix, the directory is created `0700` and the file `0600`.
-- `clear-local-data` deletes the database and its `-wal` and `-shm` files.
+- `clear-local-data` deletes the database and its `-wal`, `-shm`, and `.lock` files.
 
 ### Tables
 
 ```sql
 readings(
-  patient_key       TEXT,     -- SHA-256 hex of the patient ID
+  patient_key       TEXT,     -- salted SHA-256 hex of the patient ID
   factory_timestamp TEXT,
   source_timestamp  TEXT,
   observed_at_utc   INTEGER NULL,
@@ -60,25 +62,30 @@ collector_state(
   pid,
   version
 )  -- a single row
+
+meta(
+  key   TEXT PRIMARY KEY,
+  value BLOB
+)  -- holds the per-database salt
 ```
 
-`patient_key` is the SHA-256 hex of the patient ID. The raw ID is never stored.
+`patient_key` is the lowercase hex SHA-256 of `salt || patient_id`. The salt is 32 random bytes generated when the database is created and stored in `meta`. Keys therefore cannot be linked across databases. The raw ID is never stored. CSV import (v0.4) reuses the same database salt.
 
 ### Retention
 
 - The default is 90 days, configurable with `--retention-days` from 1 to 3650.
-- Readings and polls are pruned once a day.
+- Readings and polls are pruned once a day. Readings are pruned by `COALESCE(observed_at_utc, first_seen_utc)`, so rows without a usable UTC time still age out.
 
 ### Poll loop
 
 - The interval has a 60-second floor, enforced in code and not configurable lower, plus 0–5 seconds of random jitter.
 - Errors use the `Fetcher`'s cooldown and `retry_after`.
-- A latched error (`authentication_failed`, `client_version_rejected`, `request_rejected`) makes `collect` exit with a non-zero status and the error's message.
-- The systemd unit example uses `Restart=on-failure`, `RestartSec=300`, and a start limit so it cannot loop.
+- A latched error (`authentication_failed`, `client_version_rejected`, `request_rejected`) makes `collect` print the error's message and exit with status 78 (`EX_CONFIG`).
+- The systemd unit example uses `RestartPreventExitStatus=78`, so a latched error is never restarted into another failed login. Other failures use `Restart=on-failure`, `RestartSec=300`, `StartLimitBurst=3`, and `StartLimitIntervalSec=3600`.
 
 ### Single instance
 
-`collect` refuses to start when the heartbeat is less than 2 minutes old, with a clear message. `--force` overrides this.
+`collect` takes an exclusive advisory lock on `<db>.lock` with `std::fs::File::try_lock`, which is stable since Rust 1.89, the project's MSRV. If another process holds the lock, `collect` refuses to start with a clear message. There is no `--force`: the OS releases the lock when the holding process exits or dies, so a stale lock cannot happen. The `fs4` crate is the fallback if the standard API turns out to be unavailable on a supported platform.
 
 ### Shutdown
 
@@ -86,13 +93,13 @@ On Ctrl+C or SIGTERM, `collect` finishes the current write and then exits with s
 
 ### Privacy
 
-- The database holds no credentials, tokens, or raw patient IDs, only values and timestamps.
+- The database holds no credentials, tokens, or raw patient IDs, only values, timestamps, and a salted patient key. The salted key is a pseudonym for local deduplication, not anonymization.
 - It stays local; nothing is uploaded.
 
 ### Plan
 
 1. **Store module:** schema, migrations, permissions, inserts with deduplication, polls, heartbeat, retention, and deletion. Tested with synthetic data only.
-2. **`collect` command:** poll loop, jitter, cooldown, latched-error exit, the single-instance check, shutdown, and the systemd user unit example.
+2. **`collect` command:** poll loop, jitter, cooldown, heartbeat, latched-error exit status 78, the lock file, shutdown, and the systemd user unit example.
 3. **`serve` source selection and tool reads:** the `data_source` field and store-backed history, stats, and trends, followed by a live check by the PM.
 
 ## Consequences
@@ -101,13 +108,3 @@ On Ctrl+C or SIGTERM, `collect` finishes the current write and then exits with s
 - `serve` gains a second data path and must label every reply with its source.
 - New dependencies: `rusqlite` (bundled SQLite, which adds C compilation to the build) and `directories`. Their MSRV must stay within Rust 1.89.
 - A database file now holds personal glucose values on the user's machine. Its permissions, deletion, and retention are part of the privacy boundary.
-
-## Open questions
-
-These do not change the decisions above. They are points to settle during implementation.
-
-1. **Heartbeat during long cooldowns.** A rate-limit cooldown can last up to 900 seconds. If the heartbeat is written only after a poll, it goes stale during a long cooldown, `serve` switches to the live API, and two processes talk to Abbott while it is throttling. Writing the heartbeat on every loop iteration, including while waiting out a cooldown, would avoid this.
-2. **systemd restarts after a latched error.** With `Restart=on-failure`, an exit caused by `authentication_failed` is restarted after 300 seconds and attempts another login, up to the start limit. That is several failed logins toward an Abbott lockout. A distinct exit status for latched errors, together with `RestartPreventExitStatus=`, would stop restarts in that case only.
-3. **Single-instance race.** A heartbeat check cannot stop two collectors that start within the same moment. An advisory lock on a file beside the database would close that gap.
-4. **Pruning rows without a UTC time.** `observed_at_utc` can be null. Retention needs a rule for those rows; `first_seen_utc` is one candidate.
-5. **`patient_key` is linkable.** An unsalted SHA-256 of a patient ID is stable across installations. That is acceptable for local deduplication, but it should not be described as anonymization.
