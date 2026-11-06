@@ -69,7 +69,7 @@ The server reuses its authenticated API client. Restart it after changing creden
 | Tool | What it currently returns |
 | --- | --- |
 | `get_current_glucose` | Latest available reading, source time, and explicit freshness |
-| `get_glucose_history` | Graph readings plus the current measurement, each labeled with its source; coverage and whether filtering applied |
+| `get_glucose_history` | Readings in the requested hours (up to 2160 from the local store), each labeled with its source, oldest first and paged by `limit` and `before`; coverage over the whole window |
 | `get_glucose_stats` | Descriptive statistics over the returned graph, labeled `partial` when it covers less than the requested days |
 | `get_glucose_trends` | Partial-period status, extrema, source arrows, and descriptive adjacent-point rates |
 | `get_sensor_info` | Masked serial and device ID (last four characters), interpreted activation epoch, warmup minutes, and product type code |

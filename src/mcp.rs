@@ -14,12 +14,18 @@ use chrono::{DateTime, Duration, Utc};
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, Implementation, ServerCapabilities, ServerConfig},
+    model::{
+        CallToolResult, ErrorData, Implementation, ListResourcesResult, PaginatedRequestParams,
+        ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
+        ResourceContents, ServerCapabilities, ServerConfig,
+    },
+    service::{RequestContext, RoleServer},
     tool, tool_handler, tool_router,
     transport::stdio,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -161,9 +167,19 @@ struct EmptyArgs {}
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct HistoryArgs {
-    /// Requested hours, from 1 through 720. The API may return a shorter graph.
+    /// Requested hours, from 1 through 2160 (90 days). The live API returns
+    /// about 12 hours; longer windows need the local collector.
     hours: Option<u16>,
+    /// Most readings to return, from 1 through 5000. Default 500.
+    limit: Option<u32>,
+    /// RFC 3339 time. Return only readings at or before it: pass the previous
+    /// reply's `next_before` to get the next, older page.
+    before: Option<String>,
 }
+
+const MAX_HISTORY_HOURS: u32 = 2160;
+const DEFAULT_HISTORY_LIMIT: u32 = 500;
+const MAX_HISTORY_LIMIT: u32 = 5000;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -193,14 +209,15 @@ struct RangesArgs {
     target_high: u16,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 enum ValueQuality {
     Observed,
     Missing,
 }
 
-#[derive(Serialize)]
+/// The `get_current_glucose` reply, also served as `glucose://current`.
+#[derive(Serialize, JsonSchema)]
 struct Reading {
     glucose_mg_dl: Option<f64>,
     value_quality: ValueQuality,
@@ -211,7 +228,7 @@ struct Reading {
     data_source: &'static str,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 struct GraphGap {
     from_utc: DateTime<Utc>,
     to_utc: DateTime<Utc>,
@@ -221,7 +238,7 @@ struct GraphGap {
     cause: Option<&'static str>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 struct GraphCoverage {
     source: &'static str,
     requested_hours: i64,
@@ -239,7 +256,7 @@ struct GraphCoverage {
     reason: &'static str,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 struct RateSummary {
     pair_count: usize,
     minimum_mg_dl_per_minute: Option<f64>,
@@ -473,25 +490,233 @@ from the local collector's database). `local_store` data is only as fresh as the
 successful poll; check freshness and coverage before calling a reading current. \
 get_glucose_stats reports sample statistics and time-weighted figures separately; \
 `time_in_range_percent` is time-weighted (70-180 mg/dL). `gmi_percent` is an estimate, and null \
-with `gmi_unavailable_reason` unless the window is at least 14 days with at least 70% coverage.";
+with `gmi_unavailable_reason` unless the window is at least 14 days with at least 70% coverage. \
+get_glucose_history returns at most `limit` readings (default 500), oldest first; when `truncated` \
+is true, call it again with `before` set to `next_before` for older readings. Coverage always \
+describes the whole window. The resource glucose://current holds the same reply as \
+get_current_glucose.";
 
 /// The tool form of one sensor, from either data source.
-fn sensor_json(sensor: &SensorSummary, now: DateTime<Utc>) -> serde_json::Value {
+#[derive(Serialize, JsonSchema)]
+struct SensorReply {
+    device_id_masked: Option<String>,
+    serial_number_masked: Option<String>,
+    source_activation_epoch_seconds: Option<i32>,
+    activation_time: Option<DateTime<Utc>>,
+    activation_time_basis: Option<&'static str>,
+    warmup_minutes: Option<i32>,
+    product_type_code: Option<i32>,
+    /// Not provided by the source.
+    device_type: (),
+    /// Not provided by the source.
+    remaining_life: (),
+}
+
+fn sensor_json(sensor: &SensorSummary, now: DateTime<Utc>) -> SensorReply {
     let epoch = sensor
         .activation_epoch_seconds
         .filter(|epoch| sensor_activation_time(*epoch, now).is_some());
     let activation_time = epoch.and_then(|epoch| sensor_activation_time(epoch, now));
-    serde_json::json!({
-        "device_id_masked": sensor.device_id_masked,
-        "serial_number_masked": sensor.serial_number_masked,
-        "source_activation_epoch_seconds": epoch,
-        "activation_time": activation_time,
-        "activation_time_basis": activation_time.map(|_| "source_epoch_seconds_interpreted"),
-        "warmup_minutes": sensor.warmup_minutes,
-        "product_type_code": sensor.product_type_code,
-        "device_type": null,
-        "remaining_life": null,
-    })
+    SensorReply {
+        device_id_masked: sensor.device_id_masked.clone(),
+        serial_number_masked: sensor.serial_number_masked.clone(),
+        source_activation_epoch_seconds: epoch,
+        activation_time,
+        activation_time_basis: activation_time.map(|_| "source_epoch_seconds_interpreted"),
+        warmup_minutes: sensor.warmup_minutes,
+        product_type_code: sensor.product_type_code,
+        device_type: (),
+        remaining_life: (),
+    }
+}
+
+#[derive(Serialize, JsonSchema)]
+struct SensorsReply {
+    sensor_count: usize,
+    active_sensors: Vec<SensorReply>,
+    cache_hit: bool,
+    data_source: &'static str,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct HistoryReply {
+    requested_hours: u16,
+    window_verified: bool,
+    window_filter_applied: bool,
+    cache_hit: bool,
+    retrieved_at_utc: Option<DateTime<Utc>>,
+    current_measurement_appended: bool,
+    /// Computed over the whole window, whatever page this is.
+    coverage: GraphCoverage,
+    reason: &'static str,
+    /// Readings in this reply.
+    total_readings: usize,
+    /// Readings in the whole window.
+    readings_in_window: usize,
+    limit: u32,
+    before: Option<DateTime<Utc>>,
+    /// Older readings in the window were left out of this page.
+    truncated: bool,
+    /// Pass as `before` for the next, older page. Null on the last page.
+    next_before: Option<DateTime<Utc>>,
+    /// Oldest first.
+    readings: Vec<HistoryPoint>,
+    data_source: &'static str,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct SamplePercentages {
+    below_range: f64,
+    in_range: f64,
+    above_range: f64,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct TargetRange {
+    low: u16,
+    high: u16,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct TimeWeightedReply {
+    status: &'static str,
+    window_start_utc: DateTime<Utc>,
+    window_end_utc: DateTime<Utc>,
+    max_minutes_per_reading: i64,
+    covered_minutes: f64,
+    coverage_percent: f64,
+    readings_used: usize,
+    readings_without_utc: usize,
+    summary: Option<metrics::Summary>,
+    consensus_reference: &'static str,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct StatsReply {
+    requested_days: u8,
+    period_status: &'static str,
+    window_verified: bool,
+    window_filter_applied: bool,
+    coverage: GraphCoverage,
+    sample_count: usize,
+    average_glucose_mg_dl: f64,
+    standard_deviation_mg_dl: f64,
+    coefficient_of_variation_percent: f64,
+    sample_percentages: SamplePercentages,
+    target_range_mg_dl: TargetRange,
+    reason: &'static str,
+    time_weighted: TimeWeightedReply,
+    time_in_range_percent: Option<f64>,
+    gmi_percent: Option<f64>,
+    gmi_unavailable_reason: Option<metrics::GmiUnavailable>,
+    gmi_method: &'static str,
+    cache_hit: bool,
+    data_source: &'static str,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct TrendCounts {
+    falling: usize,
+    stable: usize,
+    rising: usize,
+    unknown: usize,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct TrendsReply {
+    requested_period: &'static str,
+    window_verified: bool,
+    window_filter_applied: bool,
+    coverage: GraphCoverage,
+    period_status: &'static str,
+    sample_count: usize,
+    observed_min_mg_dl: Option<f64>,
+    observed_max_mg_dl: Option<f64>,
+    trend_arrow_counts: TrendCounts,
+    adjacent_point_rates: RateSummary,
+    /// Not inferred: the data has no meal or sleep context.
+    dawn_phenomenon: (),
+    /// Not inferred: the data has no meal or sleep context.
+    meal_response_average: (),
+    /// Not inferred: the data has no meal or sleep context.
+    overnight_stability: (),
+    reason: &'static str,
+    cache_hit: bool,
+    data_source: &'static str,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct CredentialsReply {
+    credential_input_supported: bool,
+    setup_command: &'static str,
+    message: &'static str,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct RangesReply {
+    saved: bool,
+    target_low: u16,
+    target_high: u16,
+    unit: &'static str,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct LiveStatus {
+    connected: bool,
+    graph_points_returned: usize,
+    active_sensors_returned: usize,
+    reading_time: TimeAssessment,
+    cache_hit: bool,
+    stale_threshold_minutes: i64,
+    data_source: &'static str,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct LocalStatus {
+    collector_running: bool,
+    collector_heartbeat_age_seconds: i64,
+    last_poll_outcome: Option<String>,
+    last_poll_at_utc: Option<DateTime<Utc>>,
+    stored_reading_count: i64,
+    reading_time: TimeAssessment,
+    upstream_contacted: bool,
+    cache_hit: bool,
+    stale_threshold_minutes: i64,
+    data_source: &'static str,
+}
+
+/// `validate_connection` reports differently for each data source.
+#[derive(Serialize, JsonSchema)]
+#[serde(untagged)]
+enum ValidateReply {
+    Live(LiveStatus),
+    Local(LocalStatus),
+}
+
+/// The body of every error reply (`isError: true`).
+#[derive(Serialize, JsonSchema)]
+struct ToolError {
+    error_code: &'static str,
+    message: Cow<'static, str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_after_seconds: Option<u64>,
+}
+
+/// What a tool's `structuredContent` can be: its reply or an error.
+#[derive(Serialize, JsonSchema)]
+#[serde(untagged)]
+#[allow(dead_code)] // Used only for its schema.
+enum ToolOutput<T> {
+    Reply(T),
+    Error(ToolError),
+}
+
+/// The published output schema for a tool replying with `T`. MCP requires
+/// an object root; both alternatives are objects.
+fn output_schema<T: JsonSchema + 'static>() -> Arc<rmcp::model::JsonObject> {
+    let mut schema = (*rmcp::handler::server::tool::schema_for_output::<ToolOutput<T>>()).clone();
+    schema.insert("type".to_owned(), "object".into());
+    Arc::new(schema)
 }
 
 fn value(value: f64) -> (Option<f64>, ValueQuality) {
@@ -513,7 +738,7 @@ fn trend(arrow: Option<i32>) -> Option<&'static str> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 enum PointSource {
     Graph,
@@ -524,7 +749,7 @@ enum PointSource {
 
 /// One historical sample. Freshness is deliberately absent: it describes how
 /// current the latest reading is, and every past sample would read as stale.
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 struct HistoryPoint {
     glucose_mg_dl: Option<f64>,
     value_quality: ValueQuality,
@@ -607,29 +832,53 @@ fn success<T: Serialize>(body: T) -> CallToolResult {
     }
 }
 
-fn failure(message: &str) -> CallToolResult {
+fn failure(message: &'static str) -> CallToolResult {
     failure_code("request_failed", message)
 }
 
-fn failure_code(code: &str, message: &str) -> CallToolResult {
-    CallToolResult::structured_error(serde_json::json!({
-        "error_code": code,
-        "message": message,
-    }))
+fn error_result(error: ToolError) -> CallToolResult {
+    match serde_json::to_value(error) {
+        Ok(value) => CallToolResult::structured_error(value),
+        Err(_) => CallToolResult::structured_error(serde_json::json!({
+            "error_code": "request_failed",
+            "message": "Unable to encode tool error.",
+        })),
+    }
+}
+
+fn failure_code(code: &'static str, message: &'static str) -> CallToolResult {
+    error_result(ToolError {
+        error_code: code,
+        message: Cow::Borrowed(message),
+        retry_after_seconds: None,
+    })
 }
 
 fn failure_fetch(error: FetchError) -> CallToolResult {
-    CallToolResult::structured_error(serde_json::json!({
-        "error_code": error.code,
-        "message": error.message,
-        "retry_after_seconds": error.retry_after_seconds,
-    }))
+    error_result(ToolError {
+        error_code: error.code,
+        message: error.message,
+        retry_after_seconds: error.retry_after_seconds,
+    })
 }
 
 /// Descriptive statistics over the returned graph. A graph shorter than the
 /// requested window still yields statistics, labeled `partial`, because the
 /// LibreLinkUp graph covers roughly 12 hours and no request of a day or more
 /// can ever be fully covered by it.
+fn live_stats(
+    graph: &[GlucoseSample],
+    days: u8,
+    target_low: u16,
+    target_high: u16,
+    now: DateTime<Utc>,
+) -> Result<StatsReply, CallToolResult> {
+    let coverage = graph_coverage(graph, i64::from(days) * 24, now);
+    summarize_stats_with(graph, days, (target_low, target_high), now, coverage)
+}
+
+/// Tests read replies as JSON.
+#[cfg(test)]
 fn summarize_stats(
     graph: &[GlucoseSample],
     days: u8,
@@ -637,8 +886,8 @@ fn summarize_stats(
     target_high: u16,
     now: DateTime<Utc>,
 ) -> Result<serde_json::Value, CallToolResult> {
-    let coverage = graph_coverage(graph, i64::from(days) * 24, now);
-    summarize_stats_with(graph, days, (target_low, target_high), now, coverage)
+    live_stats(graph, days, target_low, target_high, now)
+        .map(|reply| serde_json::to_value(reply).unwrap())
 }
 
 fn summarize_stats_with(
@@ -647,7 +896,7 @@ fn summarize_stats_with(
     (target_low, target_high): (u16, u16),
     now: DateTime<Utc>,
     coverage: GraphCoverage,
-) -> Result<serde_json::Value, CallToolResult> {
+) -> Result<StatsReply, CallToolResult> {
     let hours = i64::from(days) * 24;
     let (items, window_filter_applied) = select_graph_window(graph, hours, now);
     let values: Vec<f64> = items
@@ -675,33 +924,46 @@ fn summarize_stats_with(
     } else {
         "partial"
     };
-    let mut body = serde_json::json!({
-        "requested_days": days,
-        "period_status": period_status,
-        "window_verified": false,
-        "window_filter_applied": window_filter_applied,
-        "coverage": coverage,
-        "sample_count": count,
-        "average_glucose_mg_dl": average,
-        "standard_deviation_mg_dl": standard_deviation,
-        "coefficient_of_variation_percent": standard_deviation / average * 100.0,
-        "sample_percentages": {
-            "below_range": below as f64 / count as f64 * 100.0,
-            "in_range": in_range as f64 / count as f64 * 100.0,
-            "above_range": above as f64 / count as f64 * 100.0,
+    let weighted = time_weighted_stats(graph, hours, (low, high), now);
+    Ok(StatsReply {
+        requested_days: days,
+        period_status,
+        window_verified: false,
+        window_filter_applied,
+        coverage,
+        sample_count: count,
+        average_glucose_mg_dl: average,
+        standard_deviation_mg_dl: standard_deviation,
+        coefficient_of_variation_percent: standard_deviation / average * 100.0,
+        sample_percentages: SamplePercentages {
+            below_range: below as f64 / count as f64 * 100.0,
+            in_range: in_range as f64 / count as f64 * 100.0,
+            above_range: above as f64 / count as f64 * 100.0,
         },
-        "target_range_mg_dl": { "low": target_low, "high": target_high },
-        "reason": if period_status == "partial" {
+        target_range_mg_dl: TargetRange {
+            low: target_low,
+            high: target_high,
+        },
+        reason: if period_status == "partial" {
             "The sample statistics describe only the returned graph, which covers less than the requested period; see coverage for the observed span. They are not a summary of the requested days. time_weighted reports how much of the requested window the readings cover."
         } else {
             "The sample statistics count each selected graph sample once. time_weighted weights each reading by the time it covers."
         },
-    });
-    let weighted = time_weighted_stats(graph, hours, (low, high), now);
-    if let (Some(body), Some(extra)) = (body.as_object_mut(), weighted.as_object()) {
-        body.extend(extra.clone());
-    }
-    Ok(body)
+        time_in_range_percent: weighted.time_in_range_percent,
+        gmi_percent: weighted.gmi_percent,
+        gmi_unavailable_reason: weighted.gmi_unavailable_reason,
+        gmi_method: GMI_METHOD,
+        time_weighted: weighted.reply,
+        cache_hit: false,
+        data_source: LIVE_API,
+    })
+}
+
+struct WeightedStats {
+    reply: TimeWeightedReply,
+    time_in_range_percent: Option<f64>,
+    gmi_percent: Option<f64>,
+    gmi_unavailable_reason: Option<metrics::GmiUnavailable>,
 }
 
 const GMI_METHOD: &str = "An estimate: 3.31 + 0.02392 × time-weighted mean glucose (mg/dL), \
@@ -717,7 +979,7 @@ fn time_weighted_stats(
     hours: i64,
     target: (f64, f64),
     now: DateTime<Utc>,
-) -> serde_json::Value {
+) -> WeightedStats {
     let samples: Vec<metrics::Sample> = graph
         .iter()
         .map(|item| metrics::Sample {
@@ -730,35 +992,50 @@ fn time_weighted_stats(
         Gmi::Estimate(value) => (Some(value), None),
         Gmi::Unavailable(reason) => (None, Some(reason)),
     };
-    serde_json::json!({
-        "time_weighted": {
-            "status": if weighted.summary.is_some() { "ok" } else { "insufficient_data" },
-            "window_start_utc": weighted.from,
-            "window_end_utc": weighted.to,
-            "max_minutes_per_reading": metrics::MAX_SAMPLE_MINUTES,
-            "covered_minutes": weighted.covered_seconds as f64 / 60.0,
-            "coverage_percent": weighted.coverage_percent,
-            "readings_used": weighted.samples_used,
-            "readings_without_utc": weighted.samples_without_utc,
-            "summary": weighted.summary,
-            "consensus_reference": metrics::CONSENSUS_REFERENCE,
+    WeightedStats {
+        reply: TimeWeightedReply {
+            status: if weighted.summary.is_some() {
+                "ok"
+            } else {
+                "insufficient_data"
+            },
+            window_start_utc: weighted.from,
+            window_end_utc: weighted.to,
+            max_minutes_per_reading: metrics::MAX_SAMPLE_MINUTES,
+            covered_minutes: weighted.covered_seconds as f64 / 60.0,
+            coverage_percent: weighted.coverage_percent,
+            readings_used: weighted.samples_used,
+            readings_without_utc: weighted.samples_without_utc,
+            summary: weighted.summary,
+            consensus_reference: metrics::CONSENSUS_REFERENCE,
         },
-        "time_in_range_percent": weighted
+        time_in_range_percent: weighted
             .summary
             .map(|summary| summary.consensus_bands_percent.target),
-        "gmi_percent": gmi_percent,
-        "gmi_unavailable_reason": gmi_unavailable_reason,
-        "gmi_method": GMI_METHOD,
-    })
+        gmi_percent,
+        gmi_unavailable_reason,
+    }
 }
 
+/// Tests read replies as JSON.
+#[cfg(test)]
 fn summarize_trends(
-    period: &str,
+    period: &'static str,
     hours: i64,
     points: &[GlucoseSample],
     coverage: GraphCoverage,
     now: DateTime<Utc>,
 ) -> serde_json::Value {
+    serde_json::to_value(trends_reply(period, hours, points, coverage, now)).unwrap()
+}
+
+fn trends_reply(
+    period: &'static str,
+    hours: i64,
+    points: &[GlucoseSample],
+    coverage: GraphCoverage,
+    now: DateTime<Utc>,
+) -> TrendsReply {
     let (items, window_filter_applied) = select_graph_window(points, hours, now);
     let rates = observed_rates(&items, now);
     let values: Vec<f64> = items
@@ -780,24 +1057,139 @@ fn summarize_trends(
             _ => unknown += 1,
         }
     }
-    serde_json::json!({
-        "requested_period": period,
-        "window_verified": false,
-        "window_filter_applied": window_filter_applied,
-        "coverage": coverage,
-        "period_status": if coverage.period_span_sufficient { "sample_summary" } else { "partial" },
-        "sample_count": values.len(),
-        "observed_min_mg_dl": min,
-        "observed_max_mg_dl": max,
-        "trend_arrow_counts": {
-            "falling": falling, "stable": stable, "rising": rising, "unknown": unknown
+    let period_status = if coverage.period_span_sufficient {
+        "sample_summary"
+    } else {
+        "partial"
+    };
+    TrendsReply {
+        requested_period: period,
+        window_verified: false,
+        window_filter_applied,
+        coverage,
+        period_status,
+        sample_count: values.len(),
+        observed_min_mg_dl: min,
+        observed_max_mg_dl: max,
+        trend_arrow_counts: TrendCounts {
+            falling,
+            stable,
+            rising,
+            unknown,
         },
-        "adjacent_point_rates": rates,
-        "dawn_phenomenon": null,
-        "meal_response_average": null,
-        "overnight_stability": null,
-        "reason": "Rates are descriptive changes between returned graph points, not source trend arrows or treatment guidance. The graph does not contain meal and sleep context.",
-    })
+        adjacent_point_rates: rates,
+        dawn_phenomenon: (),
+        meal_response_average: (),
+        overnight_stability: (),
+        reason: "Rates are descriptive changes between returned graph points, not source trend arrows or treatment guidance. The graph does not contain meal and sleep context.",
+        cache_hit: false,
+        data_source: LIVE_API,
+    }
+}
+
+/// One page of history: the newest `limit` readings at or before `before`,
+/// oldest first. Readings sharing the page's oldest second are never split
+/// across pages. Readings without a UTC time (live graphs only) cannot be
+/// placed, so they are paged by position and `before` does not apply.
+struct Page {
+    readings: Vec<HistoryPoint>,
+    truncated: bool,
+    next_before: Option<DateTime<Utc>>,
+}
+
+fn page(
+    mut points: Vec<HistoryPoint>,
+    limit: usize,
+    before: Option<DateTime<Utc>>,
+    placeable: bool,
+) -> Page {
+    if !placeable {
+        let truncated = points.len() > limit;
+        let start = points.len().saturating_sub(limit);
+        return Page {
+            readings: points.split_off(start),
+            truncated,
+            next_before: None,
+        };
+    }
+    points.sort_by_key(|point| point.observed_at_utc);
+    if let Some(before) = before {
+        points.retain(|point| point.observed_at_utc.is_some_and(|at| at <= before));
+    }
+    if points.len() <= limit {
+        return Page {
+            readings: points,
+            truncated: false,
+            next_before: None,
+        };
+    }
+    let mut start = points.len() - limit;
+    let boundary = points[start].observed_at_utc;
+    if points[start - 1].observed_at_utc == boundary {
+        // The cut falls inside one second: leave that second for the next
+        // page, unless it is the whole page.
+        let after_group = points[start..]
+            .iter()
+            .position(|point| point.observed_at_utc != boundary)
+            .map(|offset| start + offset);
+        match after_group {
+            Some(after) => {
+                return Page {
+                    readings: points.split_off(after),
+                    truncated: true,
+                    next_before: boundary,
+                };
+            }
+            None => {
+                start = points
+                    .iter()
+                    .position(|point| point.observed_at_utc == boundary)
+                    .unwrap_or(start);
+            }
+        }
+    }
+    let next_before = (start > 0)
+        .then(|| {
+            points[start]
+                .observed_at_utc
+                .map(|at| at - Duration::seconds(1))
+        })
+        .flatten();
+    Page {
+        readings: points.split_off(start),
+        truncated: start > 0,
+        next_before,
+    }
+}
+
+/// Validated history paging arguments.
+struct Paging {
+    limit: u32,
+    before: Option<DateTime<Utc>>,
+}
+
+fn paging(args: &HistoryArgs) -> Result<Paging, CallToolResult> {
+    let limit = args.limit.unwrap_or(DEFAULT_HISTORY_LIMIT);
+    if invalid_window(limit, MAX_HISTORY_LIMIT) {
+        return Err(failure_code(
+            "invalid_input",
+            "limit must be between 1 and 5000.",
+        ));
+    }
+    let before = match &args.before {
+        None => None,
+        Some(text) => Some(
+            DateTime::parse_from_rfc3339(text)
+                .map_err(|_| {
+                    failure_code(
+                        "invalid_input",
+                        "before must be an RFC 3339 time, such as 2026-11-05T20:00:00Z.",
+                    )
+                })?
+                .with_timezone(&Utc),
+        ),
+    };
+    Ok(Paging { limit, before })
 }
 
 fn invalid_window(value: u32, max: u32) -> bool {
@@ -857,7 +1249,7 @@ async fn local_current(local: &LocalStore) -> CallToolResult {
     success(reading)
 }
 
-async fn local_history(local: &LocalStore, hours: u16) -> CallToolResult {
+async fn local_history(local: &LocalStore, hours: u16, paging: Paging) -> CallToolResult {
     let now = Utc::now();
     let hours_i64 = i64::from(hours);
     let (readings, polls) = match local.window(hours_i64, now).await {
@@ -875,21 +1267,28 @@ async fn local_history(local: &LocalStore, hours: u16) -> CallToolResult {
         .iter()
         .map(|reading| history_point(&reading.sample, point_source(reading.origin), now))
         .collect();
-    success(serde_json::json!({
-        "requested_hours": hours,
-        "window_verified": false,
-        "window_filter_applied": true,
-        "cache_hit": false,
-        "retrieved_at_utc": readings.iter().map(|reading| reading.first_seen_utc).max(),
-        "current_measurement_appended": readings
+    let readings_in_window = points.len();
+    let page = page(points, paging.limit as usize, paging.before, true);
+    success(HistoryReply {
+        requested_hours: hours,
+        window_verified: false,
+        window_filter_applied: true,
+        cache_hit: false,
+        retrieved_at_utc: readings.iter().map(|reading| reading.first_seen_utc).max(),
+        current_measurement_appended: readings
             .iter()
             .any(|reading| reading.origin == Origin::CurrentMeasurement),
-        "coverage": coverage,
-        "reason": "Readings come from the local collector's store, filtered by their UTC timestamps. Coverage and gaps show where the store has no data.",
-        "total_readings": points.len(),
-        "readings": points,
-        "data_source": LOCAL_STORE,
-    }))
+        coverage,
+        reason: "Readings come from the local collector's store, filtered by their UTC timestamps. Coverage and gaps show where the store has no data.",
+        total_readings: page.readings.len(),
+        readings_in_window,
+        limit: paging.limit,
+        before: paging.before,
+        truncated: page.truncated,
+        next_before: page.next_before,
+        readings: page.readings,
+        data_source: LOCAL_STORE,
+    })
 }
 
 async fn local_stats(local: &LocalStore, days: u8, range: (u16, u16)) -> CallToolResult {
@@ -904,21 +1303,20 @@ async fn local_stats(local: &LocalStore, days: u8, range: (u16, u16)) -> CallToo
     classify_gaps(&mut coverage, &polls);
     match summarize_stats_with(&points, days, range, now, coverage) {
         Ok(mut body) => {
-            body["reason"] = if body["period_status"] == "partial" {
+            body.reason = if body.period_status == "partial" {
                 "The sample statistics describe only the stored readings, which cover less than the requested period; see coverage for the observed span and gaps. time_weighted reports how much of the requested window the readings cover."
             } else {
                 "The sample statistics count each stored reading once. time_weighted weights each reading by the time it covers."
-            }
-            .into();
-            body["cache_hit"] = false.into();
-            body["data_source"] = LOCAL_STORE.into();
+            };
+            body.cache_hit = false;
+            body.data_source = LOCAL_STORE;
             success(body)
         }
         Err(error) => error,
     }
 }
 
-async fn local_trends(local: &LocalStore, period: &str, hours: i64) -> CallToolResult {
+async fn local_trends(local: &LocalStore, period: &'static str, hours: i64) -> CallToolResult {
     let now = Utc::now();
     let (readings, polls) = match local.window(hours, now).await {
         Ok(window) => window,
@@ -927,10 +1325,10 @@ async fn local_trends(local: &LocalStore, period: &str, hours: i64) -> CallToolR
     let points = samples(&readings);
     let mut coverage = coverage_with(&points, hours, now, local_coverage(&readings, now));
     classify_gaps(&mut coverage, &polls);
-    let mut body = summarize_trends(period, hours, &points, coverage, now);
-    body["reason"] = "Rates are descriptive changes between stored points, not source trend arrows or treatment guidance. The data does not contain meal and sleep context.".into();
-    body["cache_hit"] = false.into();
-    body["data_source"] = LOCAL_STORE.into();
+    let mut body = trends_reply(period, hours, &points, coverage, now);
+    body.reason = "Rates are descriptive changes between stored points, not source trend arrows or treatment guidance. The data does not contain meal and sleep context.";
+    body.cache_hit = false;
+    body.data_source = LOCAL_STORE;
     success(body)
 }
 
@@ -944,12 +1342,12 @@ async fn local_sensors(local: &LocalStore) -> CallToolResult {
         .iter()
         .map(|sensor| sensor_json(sensor, now))
         .collect();
-    success(serde_json::json!({
-        "sensor_count": sensors.len(),
-        "active_sensors": sensors,
-        "cache_hit": false,
-        "data_source": LOCAL_STORE,
-    }))
+    success(SensorsReply {
+        sensor_count: sensors.len(),
+        active_sensors: sensors,
+        cache_hit: false,
+        data_source: LOCAL_STORE,
+    })
 }
 
 async fn local_validate(local: &LocalStore) -> CallToolResult {
@@ -971,32 +1369,26 @@ async fn local_validate(local: &LocalStore) -> CallToolResult {
         Some(reading) => assess_sample_at(&reading.sample, reading.first_seen_utc, now),
         None => assess_time_at(None, None, local.status.heartbeat.at, now),
     };
-    success(serde_json::json!({
-        "collector_running": true,
-        "collector_heartbeat_age_seconds": now
+    success(ValidateReply::Local(LocalStatus {
+        collector_running: true,
+        collector_heartbeat_age_seconds: now
             .signed_duration_since(local.status.heartbeat.at)
             .num_seconds()
             .max(0),
-        "last_poll_outcome": last_poll.as_ref().map(|poll| poll.outcome.as_str()),
-        "last_poll_at_utc": last_poll.as_ref().map(|poll| poll.at),
-        "stored_reading_count": stored,
-        "reading_time": reading_time,
-        "upstream_contacted": false,
-        "cache_hit": false,
-        "stale_threshold_minutes": STALE_AFTER_MINUTES,
-        "data_source": LOCAL_STORE,
+        last_poll_outcome: last_poll.as_ref().map(|poll| poll.outcome.clone()),
+        last_poll_at_utc: last_poll.as_ref().map(|poll| poll.at),
+        stored_reading_count: stored,
+        reading_time,
+        upstream_contacted: false,
+        cache_hit: false,
+        stale_threshold_minutes: STALE_AFTER_MINUTES,
+        data_source: LOCAL_STORE,
     }))
 }
 
-#[tool_router]
 impl LibreMcp {
-    #[tool(
-        description = "Get the latest available glucose reading with its source timestamp and freshness. An unknown or stale reading is not real-time data."
-    )]
-    async fn get_current_glucose(
-        &self,
-        Parameters(_args): Parameters<EmptyArgs>,
-    ) -> CallToolResult {
+    /// The current reading, from the same source selection as every tool.
+    async fn current_glucose(&self) -> CallToolResult {
         if let DataPath::Local(local) = self.data_path().await {
             return local_current(&local).await;
         }
@@ -1020,20 +1412,41 @@ impl LibreMcp {
             data_source: LIVE_API,
         })
     }
+}
+
+#[tool_router]
+impl LibreMcp {
+    #[tool(
+        description = "Get the latest available glucose reading with its source timestamp and freshness. An unknown or stale reading is not real-time data. Also available as the resource glucose://current.",
+        output_schema = output_schema::<Reading>(),
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
+    )]
+    async fn get_current_glucose(
+        &self,
+        Parameters(_args): Parameters<EmptyArgs>,
+    ) -> CallToolResult {
+        self.current_glucose().await
+    }
 
     #[tool(
-        description = "Return glucose readings within the requested hours: the graph plus the current measurement, which the graph lags by several minutes. Each point carries its time and source; freshness applies only to get_current_glucose."
+        description = "Return glucose readings within the requested hours (up to 2160 from the local collector; about 12 from the live API), oldest first. Pages of at most `limit` readings: pass `next_before` back as `before` for older ones. Coverage always describes the whole window. Each point carries its time and source; freshness applies only to get_current_glucose.",
+        output_schema = output_schema::<HistoryReply>(),
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
     )]
     async fn get_glucose_history(
         &self,
         Parameters(args): Parameters<HistoryArgs>,
     ) -> CallToolResult {
         let hours = args.hours.unwrap_or(24);
-        if invalid_window(u32::from(hours), 720) {
-            return failure_code("invalid_input", "hours must be between 1 and 720.");
+        if invalid_window(u32::from(hours), MAX_HISTORY_HOURS) {
+            return failure_code("invalid_input", "hours must be between 1 and 2160.");
         }
+        let paging = match paging(&args) {
+            Ok(paging) => paging,
+            Err(error) => return error,
+        };
         if let DataPath::Local(local) = self.data_path().await {
-            return local_history(&local, hours).await;
+            return local_history(&local, hours, paging).await;
         }
         let raw = match self.fetcher.fetch().await {
             Ok(raw) => raw,
@@ -1056,27 +1469,40 @@ impl LibreMcp {
                 history_point(item, source, now)
             })
             .collect();
-        success(serde_json::json!({
-            "requested_hours": hours,
-            "window_verified": false,
-            "window_filter_applied": window_filter_applied,
-            "cache_hit": raw.cache_hit,
-            "retrieved_at_utc": raw.retrieved_at_utc,
-            "current_measurement_appended": current_appended,
-            "coverage": coverage,
-            "reason": if window_filter_applied {
+        let readings_in_window = readings.len();
+        let page = page(
+            readings,
+            paging.limit as usize,
+            paging.before,
+            window_filter_applied,
+        );
+        success(HistoryReply {
+            requested_hours: hours,
+            window_verified: false,
+            window_filter_applied,
+            cache_hit: raw.cache_hit,
+            retrieved_at_utc: Some(raw.retrieved_at_utc),
+            current_measurement_appended: current_appended,
+            coverage,
+            reason: if window_filter_applied {
                 "Readings were filtered by offset-aware or inferred factory UTC timestamps, but API graph coverage may be shorter than requested."
             } else {
-                "The API graph may be shorter than requested and some timestamps lack a usable time basis. All returned graph points are shown."
+                "The API graph may be shorter than requested and some timestamps lack a usable time basis. All returned graph points are shown, paged by position."
             },
-            "total_readings": readings.len(),
-            "readings": readings,
-            "data_source": LIVE_API,
-        }))
+            total_readings: page.readings.len(),
+            readings_in_window,
+            limit: paging.limit,
+            before: paging.before,
+            truncated: page.truncated,
+            next_before: page.next_before,
+            readings: page.readings,
+            data_source: LIVE_API,
+        })
     }
-
     #[tool(
-        description = "Calculate descriptive statistics: sample statistics, plus time-weighted coverage, consensus bands, and time in range. GMI is an estimate, given only for 14 or more days with at least 70% coverage. The LibreLinkUp graph covers about 12 hours, so longer live requests are labeled partial."
+        description = "Calculate descriptive statistics: sample statistics, plus time-weighted coverage, consensus bands, and time in range. GMI is an estimate, given only for 14 or more days with at least 70% coverage. The LibreLinkUp graph covers about 12 hours, so longer live requests are labeled partial.",
+        output_schema = output_schema::<StatsReply>(),
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
     )]
     async fn get_glucose_stats(&self, Parameters(args): Parameters<StatsArgs>) -> CallToolResult {
         let days = args.days.unwrap_or(7);
@@ -1096,10 +1522,9 @@ impl LibreMcp {
         };
         let (target_low, target_high) = range;
         let (points, _) = points_with_current(&raw.graph, &raw.current);
-        match summarize_stats(&points, days, target_low, target_high, Utc::now()) {
+        match live_stats(&points, days, target_low, target_high, Utc::now()) {
             Ok(mut body) => {
-                body["cache_hit"] = serde_json::Value::Bool(raw.cache_hit);
-                body["data_source"] = LIVE_API.into();
+                body.cache_hit = raw.cache_hit;
                 success(body)
             }
             Err(error) => error,
@@ -1107,7 +1532,9 @@ impl LibreMcp {
     }
 
     #[tool(
-        description = "Summarize observed graph values and adjacent-point rates. Partial periods are labeled; no meal, diagnosis, or treatment inference is made."
+        description = "Summarize observed graph values and adjacent-point rates. Partial periods are labeled; no meal, diagnosis, or treatment inference is made.",
+        output_schema = output_schema::<TrendsReply>(),
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
     )]
     async fn get_glucose_trends(&self, Parameters(args): Parameters<TrendsArgs>) -> CallToolResult {
         let (period, hours) = match args.period.unwrap_or(Period::Weekly) {
@@ -1125,14 +1552,15 @@ impl LibreMcp {
         let now = Utc::now();
         let (points, _) = points_with_current(&raw.graph, &raw.current);
         let coverage = graph_coverage(&points, hours, now);
-        let mut body = summarize_trends(period, hours, &points, coverage, now);
-        body["cache_hit"] = serde_json::Value::Bool(raw.cache_hit);
-        body["data_source"] = LIVE_API.into();
+        let mut body = trends_reply(period, hours, &points, coverage, now);
+        body.cache_hit = raw.cache_hit;
         success(body)
     }
 
     #[tool(
-        description = "Return source-provided sensor identifiers, activation epoch, warmup minutes, and product type code. Unknown details remain null."
+        description = "Return masked sensor identifiers, activation epoch, warmup minutes, and product type code. Unknown details remain null.",
+        output_schema = output_schema::<SensorsReply>(),
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
     )]
     async fn get_sensor_info(&self, Parameters(_args): Parameters<EmptyArgs>) -> CallToolResult {
         if let DataPath::Local(local) = self.data_path().await {
@@ -1148,27 +1576,36 @@ impl LibreMcp {
             .iter()
             .map(|active| sensor_json(&SensorSummary::from_record(active, now), now))
             .collect();
-        success(serde_json::json!({
-            "sensor_count": sensors.len(),
-            "active_sensors": sensors,
-            "cache_hit": raw.cache_hit,
-            "data_source": LIVE_API,
-        }))
+        success(SensorsReply {
+            sensor_count: sensors.len(),
+            active_sensors: sensors,
+            cache_hit: raw.cache_hit,
+            data_source: LIVE_API,
+        })
     }
 
     #[tool(
-        description = "Explain how to set LibreLinkUp credentials in the local terminal. This tool accepts no passwords, tokens, or other secrets."
+        description = "Explain how to set LibreLinkUp credentials in the local terminal. This tool accepts no passwords, tokens, or other secrets.",
+        output_schema = output_schema::<CredentialsReply>(),
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     fn configure_credentials(&self, Parameters(_args): Parameters<EmptyArgs>) -> CallToolResult {
-        success(serde_json::json!({
-            "credential_input_supported": false,
-            "setup_command": "librelink-mcp-rs setup",
-            "message": "Run `cargo run -- setup` in the project directory, or `librelink-mcp-rs setup` if installed. Credentials cannot be entered through MCP."
-        }))
+        success(CredentialsReply {
+            credential_input_supported: false,
+            setup_command: "librelink-mcp-rs setup",
+            message: "Run `librelink-mcp-rs setup` in a local terminal (or `cargo run -- setup` in the project directory). Credentials cannot be entered through MCP.",
+        })
     }
 
     #[tool(
-        description = "Set local target range bounds in mg/dL for descriptive sample summaries."
+        description = "Set local target range bounds in mg/dL for descriptive sample summaries.",
+        output_schema = output_schema::<RangesReply>(),
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     fn configure_ranges(&self, Parameters(args): Parameters<RangesArgs>) -> CallToolResult {
         if args.target_low == 0 || args.target_low >= args.target_high || args.target_high > 1000 {
@@ -1186,16 +1623,18 @@ impl LibreMcp {
         if let Err(message) = save_settings(&settings) {
             return failure(message);
         }
-        success(serde_json::json!({
-            "saved": true,
-            "target_low": args.target_low,
-            "target_high": args.target_high,
-            "unit": "mg/dL",
-        }))
+        success(RangesReply {
+            saved: true,
+            target_low: args.target_low,
+            target_high: args.target_high,
+            unit: "mg/dL",
+        })
     }
 
     #[tool(
-        description = "Test LibreLinkUp access and report source-data availability without exposing credentials or glucose values."
+        description = "Test LibreLinkUp access and report source-data availability without exposing credentials or glucose values.",
+        output_schema = output_schema::<ValidateReply>(),
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
     )]
     async fn validate_connection(
         &self,
@@ -1208,32 +1647,82 @@ impl LibreMcp {
             Ok(raw) => raw,
             Err(error) => return failure_fetch(error),
         };
-        success(serde_json::json!({
-            "connected": true,
-            "graph_points_returned": raw.graph.len(),
-            "active_sensors_returned": raw.active_sensors.len(),
-            "reading_time": assess_time_at(
+        success(ValidateReply::Live(LiveStatus {
+            connected: true,
+            graph_points_returned: raw.graph.len(),
+            active_sensors_returned: raw.active_sensors.len(),
+            reading_time: assess_time_at(
                 Some(&raw.current.timestamp),
                 Some(&raw.current.factory_timestamp),
                 raw.retrieved_at_utc,
                 Utc::now(),
             ),
-            "cache_hit": raw.cache_hit,
-            "stale_threshold_minutes": STALE_AFTER_MINUTES,
-            "data_source": LIVE_API,
+            cache_hit: raw.cache_hit,
+            stale_threshold_minutes: STALE_AFTER_MINUTES,
+            data_source: LIVE_API,
         }))
+    }
+}
+
+/// The current reading as a resource: the same body, and the same source
+/// selection, as `get_current_glucose`.
+const CURRENT_RESOURCE_URI: &str = "glucose://current";
+
+impl LibreMcp {
+    async fn read_current_resource(&self) -> ReadResourceResult {
+        let result = self.current_glucose().await;
+        let body = result
+            .structured_content
+            .unwrap_or(serde_json::Value::Null)
+            .to_string();
+        ReadResourceResult::new(vec![
+            ResourceContents::text(body, CURRENT_RESOURCE_URI).with_mime_type("application/json"),
+        ])
     }
 }
 
 #[tool_handler]
 impl ServerHandler for LibreMcp {
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        Ok(ListResourcesResult::with_all_items(vec![
+            Resource::new(CURRENT_RESOURCE_URI, "current_glucose")
+                .with_description(
+                    "The latest glucose reading, the same as get_current_glucose. Check freshness before calling it current.",
+                )
+                .with_mime_type("application/json"),
+        ]))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        if request.uri != CURRENT_RESOURCE_URI {
+            return Err(ErrorData::resource_not_found(
+                "Unknown resource; the only one is glucose://current.",
+                None,
+            ));
+        }
+        Ok(self.read_current_resource().await.into())
+    }
+
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(
-                Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
-                    .with_title("LibreLinkUp MCP (Rust)"),
-            )
-            .with_instructions(SERVER_INSTRUCTIONS)
+        ServerConfig::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .build(),
+        )
+        .with_server_info(
+            Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+                .with_title("LibreLinkUp MCP (Rust)"),
+        )
+        .with_instructions(SERVER_INSTRUCTIONS)
     }
 }
 
@@ -1693,7 +2182,11 @@ mod tests {
         let results = [
             server.get_current_glucose(Parameters(EmptyArgs {})).await,
             server
-                .get_glucose_history(Parameters(HistoryArgs { hours: Some(24) }))
+                .get_glucose_history(Parameters(HistoryArgs {
+                    hours: Some(24),
+                    limit: None,
+                    before: None,
+                }))
                 .await,
             server
                 .get_glucose_stats(Parameters(StatsArgs { days: Some(1) }))
@@ -1770,7 +2263,11 @@ mod tests {
         let (server, _) = fake_server(Ok(live_snapshot()));
         let current = server.get_current_glucose(Parameters(EmptyArgs {})).await;
         let history = server
-            .get_glucose_history(Parameters(HistoryArgs { hours: Some(1) }))
+            .get_glucose_history(Parameters(HistoryArgs {
+                hours: Some(1),
+                limit: None,
+                before: None,
+            }))
             .await;
         let current = body(&current);
         let history = body(&history);
@@ -1891,7 +2388,11 @@ mod tests {
         vec![
             server.get_current_glucose(Parameters(EmptyArgs {})).await,
             server
-                .get_glucose_history(Parameters(HistoryArgs { hours: Some(24) }))
+                .get_glucose_history(Parameters(HistoryArgs {
+                    hours: Some(24),
+                    limit: None,
+                    before: None,
+                }))
                 .await,
             server
                 .get_glucose_stats(Parameters(StatsArgs { days: Some(1) }))
@@ -2010,7 +2511,11 @@ mod tests {
         let fixture = local_fixture(&every_15_minutes(30), None, Some(10));
         let (server, _) = store_server(&fixture.db);
         let reply = server
-            .get_glucose_history(Parameters(HistoryArgs { hours: Some(24) }))
+            .get_glucose_history(Parameters(HistoryArgs {
+                hours: Some(24),
+                limit: None,
+                before: None,
+            }))
             .await;
         let reply = body(&reply);
         assert_eq!(reply["data_source"], "local_store");
@@ -2119,7 +2624,11 @@ mod tests {
         assert_eq!(stats["time_in_range_percent"], 100.0);
 
         let history = server
-            .get_glucose_history(Parameters(HistoryArgs { hours: Some(24) }))
+            .get_glucose_history(Parameters(HistoryArgs {
+                hours: Some(24),
+                limit: None,
+                before: None,
+            }))
             .await;
         let history = body(&history);
         assert_eq!(history["total_readings"], 96);
@@ -2259,7 +2768,11 @@ mod tests {
             assert_eq!(body(&current)["glucose_mg_dl"], 110.0, "{order}");
 
             let history = server
-                .get_glucose_history(Parameters(HistoryArgs { hours: Some(1) }))
+                .get_glucose_history(Parameters(HistoryArgs {
+                    hours: Some(1),
+                    limit: None,
+                    before: None,
+                }))
                 .await;
             let history = body(&history);
             assert_eq!(history["total_readings"], 4, "{order}");
@@ -2330,7 +2843,11 @@ mod tests {
         });
         let (server, _) = store_server(&fixture.db);
         let reply = server
-            .get_glucose_history(Parameters(HistoryArgs { hours: Some(14) }))
+            .get_glucose_history(Parameters(HistoryArgs {
+                hours: Some(14),
+                limit: None,
+                before: None,
+            }))
             .await;
         let gaps: Vec<(f64, String)> = body(&reply)["coverage"]["interior_gaps"]
             .as_array()
@@ -2441,6 +2958,312 @@ mod tests {
         assert_eq!(trends["period_status"], "sample_summary");
     }
 
+    const DATA_TOOLS: [&str; 6] = [
+        "get_current_glucose",
+        "get_glucose_history",
+        "get_glucose_stats",
+        "get_glucose_trends",
+        "get_sensor_info",
+        "validate_connection",
+    ];
+
+    /// Checks `result`'s structured content against the tool's published
+    /// output schema.
+    fn assert_matches_schema(tool: &str, result: &CallToolResult) {
+        let router = LibreMcp::tool_router();
+        let schema = router
+            .get(tool)
+            .and_then(|tool| tool.output_schema.clone())
+            .unwrap_or_else(|| panic!("{tool} has no output schema"));
+        let schema = serde_json::Value::Object((*schema).clone());
+        assert_eq!(schema["type"], "object", "{tool}");
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        let content = body(result);
+        let errors: Vec<String> = validator
+            .iter_errors(content)
+            .map(|error| format!("{} at {}", error, error.instance_path()))
+            .collect();
+        assert!(errors.is_empty(), "{tool}: {errors:?}\n{content}");
+    }
+
+    #[test]
+    fn every_tool_has_annotations_and_an_output_schema() {
+        let tools = LibreMcp::tool_router().list_all();
+        assert_eq!(tools.len(), 8);
+        for tool in &tools {
+            assert!(tool.output_schema.is_some(), "{}", tool.name);
+            let hints = tool.annotations.as_ref().unwrap();
+            let name = tool.name.as_ref();
+            match name {
+                "configure_ranges" => {
+                    assert_eq!(hints.read_only_hint, Some(false));
+                    assert_eq!(hints.destructive_hint, Some(false));
+                    assert_eq!(hints.idempotent_hint, Some(true));
+                    assert_eq!(hints.open_world_hint, Some(false));
+                }
+                "configure_credentials" => {
+                    assert_eq!(hints.read_only_hint, Some(true));
+                    assert_eq!(hints.open_world_hint, Some(false));
+                }
+                data => {
+                    assert!(DATA_TOOLS.contains(&data), "{data}");
+                    assert_eq!(hints.read_only_hint, Some(true), "{data}");
+                    assert_eq!(hints.idempotent_hint, Some(true), "{data}");
+                    assert_eq!(hints.open_world_hint, Some(true), "{data}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn every_reply_matches_its_published_schema() {
+        let check = |results: Vec<CallToolResult>, expect_error: bool| {
+            for (tool, result) in DATA_TOOLS.iter().zip(&results) {
+                assert_eq!(result.is_error, Some(expect_error), "{tool}: {result:?}");
+                assert_matches_schema(tool, result);
+            }
+        };
+
+        // Live path, success and error.
+        let (mut live, _) = fake_server(Ok(live_snapshot()));
+        live.fixed_ranges = Some((70, 180));
+        check(all_data_tools(&live).await, false);
+        let (mut failing, _) = fake_server(Err(FetchError {
+            code: "rate_limited",
+            message: Cow::Borrowed("Synthetic throttle."),
+            retry_after_seconds: Some(120),
+        }));
+        failing.fixed_ranges = Some((70, 180));
+        check(all_data_tools(&failing).await, true);
+
+        // Store path, success and error.
+        let fixture = local_fixture(&every_15_minutes(30), Some(2), Some(10));
+        let (server, _) = store_server(&fixture.db);
+        check(all_data_tools(&server).await, false);
+        fixture.with_store(|store| {
+            store
+                .connection()
+                .execute_batch("DROP TABLE readings; DROP TABLE polls; DROP TABLE sensors;")
+                .unwrap()
+        });
+        let results = all_data_tools(&server).await;
+        // validate_connection fails too: it counts readings.
+        for (tool, result) in DATA_TOOLS.iter().zip(&results) {
+            assert_eq!(
+                body(result)["error_code"],
+                "local_store_unavailable",
+                "{tool}"
+            );
+        }
+        check(results, true);
+
+        // Invalid input and the local-only tools.
+        let invalid = [
+            (
+                "get_glucose_history",
+                live.get_glucose_history(Parameters(HistoryArgs {
+                    hours: Some(0),
+                    limit: None,
+                    before: None,
+                }))
+                .await,
+            ),
+            (
+                "get_glucose_history",
+                live.get_glucose_history(Parameters(HistoryArgs {
+                    hours: None,
+                    limit: Some(5001),
+                    before: None,
+                }))
+                .await,
+            ),
+            (
+                "get_glucose_history",
+                live.get_glucose_history(Parameters(HistoryArgs {
+                    hours: None,
+                    limit: None,
+                    before: Some("yesterday".to_owned()),
+                }))
+                .await,
+            ),
+            (
+                "get_glucose_stats",
+                live.get_glucose_stats(Parameters(StatsArgs { days: Some(0) }))
+                    .await,
+            ),
+            (
+                "configure_ranges",
+                live.configure_ranges(Parameters(RangesArgs {
+                    target_low: 0,
+                    target_high: 0,
+                })),
+            ),
+        ];
+        for (tool, result) in &invalid {
+            assert_eq!(body(result)["error_code"], "invalid_input", "{tool}");
+            assert_matches_schema(tool, result);
+        }
+        let credentials = live.configure_credentials(Parameters(EmptyArgs {}));
+        assert_eq!(credentials.is_error, Some(false));
+        assert_matches_schema("configure_credentials", &credentials);
+        // Saving ranges needs the OS keyring; check the reply shape directly.
+        let saved = success(RangesReply {
+            saved: true,
+            target_low: 70,
+            target_high: 180,
+            unit: "mg/dL",
+        });
+        assert_matches_schema("configure_ranges", &saved);
+    }
+
+    fn point_at(at: Option<DateTime<Utc>>) -> HistoryPoint {
+        HistoryPoint {
+            glucose_mg_dl: Some(110.0),
+            value_quality: ValueQuality::Observed,
+            observed_at_utc: at,
+            time_basis: TimeBasis::OffsetKnown,
+            source_timestamp: None,
+            trend: None,
+            source: PointSource::Graph,
+        }
+    }
+
+    #[test]
+    fn pages_never_split_one_second() {
+        let t = |seconds: i64| DateTime::from_timestamp(1_800_000_000 + seconds, 0);
+        let times = |page: &Page| -> Vec<Option<DateTime<Utc>>> {
+            page.readings
+                .iter()
+                .map(|point| point.observed_at_utc)
+                .collect()
+        };
+        let points = || {
+            vec![
+                point_at(t(0)),
+                point_at(t(60)),
+                point_at(t(60)),
+                point_at(t(120)),
+            ]
+        };
+
+        // A limit of 2 would cut the pair at 60 s: it waits for the next page.
+        let first = page(points(), 2, None, true);
+        assert_eq!(times(&first), [t(120)]);
+        assert!(first.truncated);
+        assert_eq!(first.next_before, t(60));
+        let second = page(points(), 2, first.next_before, true);
+        assert_eq!(times(&second), [t(60), t(60)]);
+        assert_eq!(second.next_before, t(59));
+        let last = page(points(), 2, second.next_before, true);
+        assert_eq!(times(&last), [t(0)]);
+        assert!(!last.truncated);
+        assert_eq!(last.next_before, None);
+
+        // A second larger than the limit is returned whole.
+        let whole = page(points(), 1, t(60), true);
+        assert_eq!(times(&whole), [t(60), t(60)]);
+        assert_eq!(whole.next_before, t(59));
+
+        // Unplaceable readings are paged by position only.
+        let unplaced = page(
+            vec![point_at(None), point_at(None), point_at(None)],
+            2,
+            t(0),
+            false,
+        );
+        assert_eq!(unplaced.readings.len(), 2);
+        assert!(unplaced.truncated);
+        assert_eq!(unplaced.next_before, None);
+    }
+
+    #[tokio::test]
+    async fn paging_walks_a_90_day_store_window_without_overlap_or_gaps() {
+        let minutes = every_15_minutes(90 * 24);
+        let fixture = local_fixture(&minutes, None, Some(10));
+        let (server, _) = store_server(&fixture.db);
+        let mut before: Option<String> = None;
+        let mut seen: Vec<String> = Vec::new();
+        let mut coverage: Option<serde_json::Value> = None;
+        let mut pages = 0;
+        loop {
+            let reply = server
+                .get_glucose_history(Parameters(HistoryArgs {
+                    hours: Some(2160),
+                    limit: Some(1000),
+                    before: before.clone(),
+                }))
+                .await;
+            let reply = body(&reply).clone();
+            pages += 1;
+            assert_eq!(reply["readings_in_window"], minutes.len());
+            // Coverage describes the whole window on every page. The edge
+            // gaps are measured from the real clock, so they are left out.
+            let mut this = reply["coverage"].clone();
+            for clock_relative in ["start_gap_minutes", "end_gap_minutes"] {
+                this.as_object_mut().unwrap().remove(clock_relative);
+            }
+            match &coverage {
+                None => coverage = Some(this),
+                Some(first) => assert_eq!(&this, first),
+            }
+            let page: Vec<String> = reply["readings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|point| point["observed_at_utc"].as_str().unwrap().to_owned())
+                .collect();
+            assert!(
+                page.windows(2).all(|pair| pair[0] < pair[1]),
+                "oldest first"
+            );
+            if let Some(newest_older) = seen.first() {
+                assert!(page.last().unwrap() < newest_older, "pages overlap");
+            }
+            seen.splice(0..0, page);
+            if reply["truncated"] == false {
+                assert_eq!(reply["next_before"], serde_json::Value::Null);
+                break;
+            }
+            before = Some(reply["next_before"].as_str().unwrap().to_owned());
+        }
+        assert_eq!(pages, 9);
+        let mut expected: Vec<String> = minutes
+            .iter()
+            .map(|m| {
+                DateTime::parse_from_rfc3339(&fixture.ago(*m))
+                    .unwrap()
+                    .with_timezone(&Utc)
+                    .to_rfc3339_opts(SecondsFormat::Secs, true)
+            })
+            .collect();
+        expected.sort();
+        assert_eq!(seen, expected);
+    }
+
+    #[tokio::test]
+    async fn the_current_resource_is_the_current_glucose_reply() {
+        let fixture = local_fixture(&[20, 5], Some(2), Some(10));
+        let (server, reads) = store_server(&fixture.db);
+        let tool = server.get_current_glucose(Parameters(EmptyArgs {})).await;
+        let resource = server.read_current_resource().await;
+        let ResourceContents::TextResourceContents {
+            uri,
+            mime_type,
+            text,
+            ..
+        } = &resource.contents[0]
+        else {
+            panic!("expected text contents");
+        };
+        assert_eq!(uri, CURRENT_RESOURCE_URI);
+        assert_eq!(mime_type.as_deref(), Some("application/json"));
+        let from_resource: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(&from_resource, body(&tool));
+        assert_eq!(from_resource["data_source"], "local_store");
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+        assert!(server.get_info().capabilities.resources.is_some());
+    }
+
     #[tokio::test]
     async fn store_gaps_are_labeled_by_what_the_collector_saw() {
         let minutes: Vec<i64> = every_15_minutes(10)
@@ -2457,7 +3280,11 @@ mod tests {
         });
         let (server, _) = store_server(&fixture.db);
         let reply = server
-            .get_glucose_history(Parameters(HistoryArgs { hours: Some(10) }))
+            .get_glucose_history(Parameters(HistoryArgs {
+                hours: Some(10),
+                limit: None,
+                before: None,
+            }))
             .await;
         let gaps = &body(&reply)["coverage"]["interior_gaps"];
         let causes: Vec<_> = gaps
@@ -2494,7 +3321,11 @@ mod tests {
         });
         let (server, _) = store_server(&fixture.db);
         let reply = server
-            .get_glucose_history(Parameters(HistoryArgs { hours: Some(10) }))
+            .get_glucose_history(Parameters(HistoryArgs {
+                hours: Some(10),
+                limit: None,
+                before: None,
+            }))
             .await;
         let causes: Vec<_> = body(&reply)["coverage"]["interior_gaps"]
             .as_array()
@@ -2508,7 +3339,11 @@ mod tests {
         let unpolled = local_fixture(&minutes, None, Some(10));
         let (server, _) = store_server(&unpolled.db);
         let reply = server
-            .get_glucose_history(Parameters(HistoryArgs { hours: Some(10) }))
+            .get_glucose_history(Parameters(HistoryArgs {
+                hours: Some(10),
+                limit: None,
+                before: None,
+            }))
             .await;
         let causes: Vec<_> = body(&reply)["coverage"]["interior_gaps"]
             .as_array()

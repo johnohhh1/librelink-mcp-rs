@@ -54,7 +54,7 @@ pub(crate) fn band(mg_dl: f64) -> Band {
 }
 
 /// Percent of covered time in each consensus band.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, schemars::JsonSchema)]
 pub(crate) struct BandPercentages {
     pub very_low: f64,
     pub low: f64,
@@ -64,7 +64,7 @@ pub(crate) struct BandPercentages {
 }
 
 /// Figures that need covered time. Percentages are of covered time.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, schemars::JsonSchema)]
 pub(crate) struct Summary {
     pub average_glucose_mg_dl: f64,
     /// Duration-weighted population SD.
@@ -75,7 +75,7 @@ pub(crate) struct Summary {
     pub target_range_percent: f64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum GmiUnavailable {
     WindowTooShort,

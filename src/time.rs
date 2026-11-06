@@ -7,7 +7,7 @@ const FUTURE_TOLERANCE_MINUTES: i64 = 2;
 const TIMESTAMP_CONFLICT_MINUTES: i64 = 2;
 const NAIVE_API_FORMAT: &str = "%m/%d/%Y %I:%M:%S %p";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Freshness {
     Recent,
@@ -16,7 +16,7 @@ pub(crate) enum Freshness {
     Missing,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TimeBasis {
     OffsetKnown,
@@ -65,7 +65,7 @@ pub(crate) struct StoredTime {
     pub time_basis: TimeBasis,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, schemars::JsonSchema)]
 pub(crate) struct TimeAssessment {
     pub source_timestamp: Option<String>,
     pub factory_timestamp: Option<String>,
