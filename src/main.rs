@@ -394,7 +394,32 @@ fn ensure_session_bus() {
 #[cfg(not(target_os = "linux"))]
 fn ensure_session_bus() {}
 
+/// Printed instead of a panic's payload and location, which could hold
+/// local data.
+const PANIC_MESSAGE: &str = "librelink-mcp-rs stopped because of an internal error. \
+Set LIBRELINK_MCP_DEBUG=1 to print details; they may include local data, so do not share them unreviewed.";
+
+/// Whether panic details are shown: only with `LIBRELINK_MCP_DEBUG=1`.
+fn panic_details_enabled(setting: Option<std::ffi::OsString>) -> bool {
+    setting.is_some_and(|value| value == "1")
+}
+
+/// What the quiet hook writes: the fixed message, never the payload or
+/// location.
+fn report_panic(out: &mut dyn Write) {
+    let _ = writeln!(out, "{PANIC_MESSAGE}");
+}
+
+/// Replaces the default panic output unless `LIBRELINK_MCP_DEBUG=1`.
+fn install_panic_hook() {
+    if panic_details_enabled(std::env::var_os("LIBRELINK_MCP_DEBUG")) {
+        return;
+    }
+    std::panic::set_hook(Box::new(|_| report_panic(&mut io::stderr())));
+}
+
 fn main() {
+    install_panic_hook();
     ensure_session_bus();
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -489,6 +514,22 @@ mod tests {
         assert!(!saved.contains("patient_name"), "{saved}");
         let fresh = serde_json::to_string(&Settings::default()).unwrap();
         assert!(!fresh.contains("patient"), "{fresh}");
+    }
+
+    #[test]
+    fn the_quiet_panic_hook_prints_only_a_fixed_message() {
+        assert!(!panic_details_enabled(None));
+        for value in ["", "0", "true", "yes"] {
+            assert!(!panic_details_enabled(Some(value.into())), "{value}");
+        }
+        assert!(panic_details_enabled(Some("1".into())));
+        let mut out = Vec::new();
+        report_panic(&mut out);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("{PANIC_MESSAGE}\n")
+        );
+        assert!(!PANIC_MESSAGE.contains("{}"));
     }
 
     #[test]

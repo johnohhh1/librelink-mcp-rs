@@ -40,6 +40,23 @@ pub(crate) fn region_base_url(region: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The only network destinations are LibreLinkUp's own API hosts.
+    #[test]
+    fn every_region_is_a_librelinkup_https_host() {
+        for region in [
+            "global", "ae", "ap", "au", "ca", "de", "eu", "eu2", "fr", "jp", "us", "la", "ru", "cn",
+        ] {
+            let url = region_base_url(region).unwrap();
+            let host = url.strip_prefix("https://").unwrap();
+            assert!(
+                host.ends_with(".libreview.io")
+                    || host == "api.libreview.ru"
+                    || host == "api-cn.myfreestyle.cn",
+                "{region}: {url}"
+            );
+        }
+    }
     use crate::{Settings, valid_api_version};
 
     #[test]

@@ -1650,6 +1650,93 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn no_error_carries_credentials_or_response_contents() {
+        let marker = "LEAKMARKER";
+        let login_failures = [
+            json_reply(200, json!({ "status": 2, "error": { "message": marker } })),
+            json_reply(200, json!({ "status": 4, "data": { "step": marker } })),
+            json_reply(
+                200,
+                json!({ "status": 2, "data": { "lockout": { "failures": 9, "remaining": 300, "note": marker } } }),
+            ),
+            json_reply(429, json!({ "message": marker })),
+            json_reply(500, json!({ "message": marker })),
+            ResponseTemplate::new(200).set_body_string(marker),
+        ];
+        let graph_failures = [
+            json_reply(401, json!({ "message": marker })),
+            json_reply(
+                403,
+                json!({ "status": 920, "data": { "minimumVersion": marker } }),
+            ),
+            json_reply(
+                400,
+                json!({ "message": "AccountIdMismatch", "detail": marker }),
+            ),
+            json_reply(430, json!({ "message": marker })),
+            json_reply(502, json!({ "message": marker })),
+            ResponseTemplate::new(200).set_body_string(format!("<html>{marker}</html>")),
+            json_reply(
+                200,
+                json!({ "status": 0, "data": { "unexpected": marker } }),
+            ),
+        ];
+        let check = |error: &FetchError| {
+            let text = format!("{error:?} {}", error.message);
+            for forbidden in [marker, "leak-user@example.invalid", "leak-password"] {
+                assert!(!text.contains(forbidden), "{forbidden} in {text}");
+            }
+        };
+        let leaky_config = |server: &MockServer| {
+            let mut config = config(&server.uri());
+            config.email = "leak-user@example.invalid".to_owned();
+            config.password = Zeroizing::new("leak-password".to_owned());
+            config
+        };
+        for response in login_failures {
+            let server = MockServer::start().await;
+            mount(&server, "POST", LOGIN_PATH, response).await;
+            let error = LluClient::new(leaky_config(&server))
+                .unwrap()
+                .read()
+                .await
+                .unwrap_err();
+            check(&error);
+        }
+        for response in graph_failures {
+            let server = MockServer::start().await;
+            mount_session(&server, in_one_hour()).await;
+            mount(&server, "GET", GRAPH_PATH, response).await;
+            let error = LluClient::new(leaky_config(&server))
+                .unwrap()
+                .read()
+                .await
+                .unwrap_err();
+            check(&error);
+        }
+        // Several connections named with markers: the error names no one.
+        let server = MockServer::start().await;
+        mount(&server, "POST", LOGIN_PATH, login_ok(in_one_hour())).await;
+        mount(
+            &server,
+            "GET",
+            CONNECTIONS_PATH,
+            connections(&[
+                ("synthetic-patient-0001", marker, marker),
+                ("synthetic-patient-0002", marker, marker),
+            ]),
+        )
+        .await;
+        let error = LluClient::new(leaky_config(&server))
+            .unwrap()
+            .read()
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "patient_selection_required");
+        check(&error);
+    }
+
     #[test]
     fn unfixable_rejections_latch_until_restart() {
         use crate::fetch::{Cooldown, cooldown_active, cooldown_until, latches_until_restart};

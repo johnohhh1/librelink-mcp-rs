@@ -30,3 +30,9 @@ tokio = { version = "1", features = ["test-util"] }
 tempfile = "3.27.0"
 wiremock = "0.6.5"
 jsonschema = { version = "0.60.2", default-features = false }
+
+[profile.release]
+# A panic stops the process at once; no unwinding through partly written
+# state. The panic hook prints a fixed message.
+panic = "abort"
+strip = "symbols"
