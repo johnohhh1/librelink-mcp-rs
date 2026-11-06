@@ -10,7 +10,10 @@
 use crate::fetch::FetchError;
 use crate::source::{DataSource, GlucoseSample, ReadFuture, SensorRecord, Snapshot};
 use chrono::Utc;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::header::{
+    ACCEPT, ACCEPT_LANGUAGE, AUTHORIZATION, CACHE_CONTROL, CONNECTION, CONTENT_TYPE, HeaderMap,
+    HeaderValue, USER_AGENT,
+};
 use reqwest::{Client, StatusCode, redirect};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -19,7 +22,10 @@ use zeroize::Zeroizing;
 
 const LOGIN_PATH: &str = "/llu/auth/login";
 const CONNECTIONS_PATH: &str = "/llu/connections";
-const PRODUCT: &str = "llu.android";
+// Headers match the borrowed crate exactly so the v0.2 switch-over is a pure
+// swap. Changing the product header is a separate, later experiment.
+const PRODUCT: &str = "llu.ios";
+const USER_AGENT_STRING: &str = "Mozilla/5.0 (iPhone; CPU OS 17_4.1 like Mac OS X) AppleWebKit/536.26 (KHTML, like Gecko) Version/17.4.1 Mobile/10A5355d Safari/8536.25";
 
 /// Production base URL for a stored region, matching the borrowed client.
 pub(crate) fn region_base_url(region: &str) -> Option<&'static str> {
@@ -42,12 +48,8 @@ pub(crate) fn region_base_url(region: &str) -> Option<&'static str> {
     })
 }
 
-fn redirect_base_url(region: &str) -> String {
-    format!("https://api-{region}.libreview.io")
-}
-
-/// A login redirect region is used in a host name, so accept only short
-/// lowercase alphanumerics.
+/// First gate for a login redirect region: short lowercase alphanumerics.
+/// The region must also be in `region_base_url`'s table.
 fn valid_redirect_region(region: &str) -> bool {
     (2..=4).contains(&region.len())
         && region
@@ -102,14 +104,16 @@ impl Session {
     }
 }
 
-type RegionResolver = Box<dyn Fn(&str) -> String + Send + Sync>;
+/// Maps a resolved production base URL to the URL actually used.
+/// Identity in production; tests substitute a mock server.
+type UrlRewrite = Box<dyn Fn(&'static str) -> String + Send + Sync>;
 
 pub(crate) struct LluClient {
     http: Client,
     email: String,
     password: Zeroizing<String>,
     patient_name: Option<String>,
-    redirect_base: RegionResolver,
+    redirect_rewrite: UrlRewrite,
     session: Mutex<Session>,
 }
 
@@ -299,14 +303,24 @@ fn account_id_hash(user_id: &str) -> String {
 impl LluClient {
     pub(crate) fn new(config: LluConfig) -> Result<Self, &'static str> {
         let mut headers = HeaderMap::new();
+        headers.insert(USER_AGENT, HeaderValue::from_static(USER_AGENT_STRING));
+        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+        headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+        headers.insert(CONNECTION, HeaderValue::from_static("Keep-Alive"));
+        headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US"));
         headers.insert("product", HeaderValue::from_static(PRODUCT));
         headers.insert(
             "version",
             HeaderValue::from_str(&config.api_version).map_err(|_| "Invalid API version.")?,
         );
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/json;charset=UTF-8"),
+        );
         let http = Client::builder()
             .default_headers(headers)
+            // Sends `accept-encoding: gzip` and decodes it, as the crate does.
+            .gzip(true)
             // Region changes come only from the login body, never HTTP 3xx.
             .redirect(redirect::Policy::none())
             .build()
@@ -316,7 +330,7 @@ impl LluClient {
             email: config.email,
             password: config.password,
             patient_name: config.patient_name.map(|name| name.to_lowercase()),
-            redirect_base: Box::new(redirect_base_url),
+            redirect_rewrite: Box::new(str::to_owned),
             session: Mutex::new(Session {
                 base_url: config.base_url,
                 token: None,
@@ -326,13 +340,13 @@ impl LluClient {
         })
     }
 
-    /// Tests point login redirects at a second mock server.
+    /// Tests point a resolved redirect URL at a second mock server.
     #[cfg(test)]
-    fn with_redirect_base(
+    fn with_redirect_rewrite(
         mut self,
-        resolve: impl Fn(&str) -> String + Send + Sync + 'static,
+        rewrite: impl Fn(&'static str) -> String + Send + Sync + 'static,
     ) -> Self {
-        self.redirect_base = Box::new(resolve);
+        self.redirect_rewrite = Box::new(rewrite);
         self
     }
 
@@ -372,7 +386,8 @@ impl LluClient {
                 if attempt > 0 || !valid_redirect_region(region) {
                     return Err(UNAVAILABLE);
                 }
-                base_url = (self.redirect_base)(region);
+                let resolved = region_base_url(region).ok_or(UNAVAILABLE)?;
+                base_url = (self.redirect_rewrite)(resolved);
                 continue;
             }
             let (Some(user), Some(ticket)) = (data.user, data.auth_ticket) else {
@@ -677,9 +692,9 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path(LOGIN_PATH))
-            .and(header("product", "llu.android"))
+            .and(header("product", "llu.ios"))
             .and(header("version", "4.16.0"))
-            .and(header("content-type", "application/json"))
+            .and(header("content-type", "application/json;charset=UTF-8"))
             .respond_with(login_ok(in_one_hour()))
             .mount(&server)
             .await;
@@ -692,9 +707,9 @@ mod tests {
         ] {
             Mock::given(method("GET"))
                 .and(path(route))
-                .and(header("product", "llu.android"))
+                .and(header("product", "llu.ios"))
                 .and(header("version", "4.16.0"))
-                .and(header("content-type", "application/json"))
+                .and(header("content-type", "application/json;charset=UTF-8"))
                 .and(header("authorization", "Bearer synthetic-token"))
                 .and(header("account-id", USER_ID_SHA256))
                 .respond_with(response)
@@ -721,8 +736,8 @@ mod tests {
         mount_session(&regional, in_one_hour()).await;
         mount(&regional, "GET", GRAPH_PATH, graph_ok()).await;
         let regional_uri = regional.uri();
-        let client = client(&first).with_redirect_base(move |region| {
-            assert_eq!(region, "eu");
+        let client = client(&first).with_redirect_rewrite(move |resolved| {
+            assert_eq!(resolved, "https://api-eu.libreview.io");
             regional_uri.clone()
         });
 
@@ -741,7 +756,7 @@ mod tests {
         mount(&first, "POST", LOGIN_PATH, redirect_to("eu")).await;
         mount(&regional, "POST", LOGIN_PATH, redirect_to("us")).await;
         let regional_uri = regional.uri();
-        let client = client(&first).with_redirect_base(move |_| regional_uri.clone());
+        let client = client(&first).with_redirect_rewrite(move |_| regional_uri.clone());
 
         let error = client.read().await.unwrap_err();
         assert_eq!(error.code, "upstream_unavailable");
@@ -755,7 +770,7 @@ mod tests {
         mount(&server, "POST", LOGIN_PATH, redirect_to("evil.example/")).await;
         let resolved = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&resolved);
-        let client = client(&server).with_redirect_base(move |_| {
+        let client = client(&server).with_redirect_rewrite(move |_| {
             flag.store(true, Ordering::SeqCst);
             String::new()
         });
@@ -770,6 +785,87 @@ mod tests {
         assert!(!valid_redirect_region("EU"));
         assert!(!valid_redirect_region("e"));
         assert!(!valid_redirect_region("abcde"));
+    }
+
+    #[tokio::test]
+    async fn requests_send_the_borrowed_crate_product_and_user_agent() {
+        let server = MockServer::start().await;
+        let expected = [
+            ("product", "llu.ios"),
+            ("accept", "application/json"),
+            ("accept-encoding", "gzip"),
+            ("cache-control", "no-cache"),
+            ("accept-language", "en-US"),
+        ];
+        let mut login = Mock::given(method("POST")).and(path(LOGIN_PATH));
+        for (name, value) in expected {
+            login = login.and(header(name, value));
+        }
+        login
+            .respond_with(login_ok(in_one_hour()))
+            .mount(&server)
+            .await;
+        for (route, response) in [
+            (
+                CONNECTIONS_PATH,
+                connections(&[(PATIENT_ID, "Sam", "Synthetic")]),
+            ),
+            (GRAPH_PATH, graph_ok()),
+        ] {
+            let mut mock = Mock::given(method("GET")).and(path(route));
+            for (name, value) in expected {
+                mock = mock.and(header(name, value));
+            }
+            mock.respond_with(response).mount(&server).await;
+        }
+
+        client(&server).read().await.unwrap();
+        // wiremock's header matcher splits values on commas, and the
+        // User-Agent contains one, so compare it on the recorded requests.
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 3);
+        for request in requests {
+            assert_eq!(request.headers["user-agent"], USER_AGENT_STRING);
+        }
+    }
+
+    #[tokio::test]
+    async fn redirect_resolves_through_the_region_table() {
+        let first = MockServer::start().await;
+        let regional = MockServer::start().await;
+        mount(&first, "POST", LOGIN_PATH, redirect_to("ru")).await;
+        mount_session(&regional, in_one_hour()).await;
+        mount(&regional, "GET", GRAPH_PATH, graph_ok()).await;
+        let regional_uri = regional.uri();
+        let client = client(&first).with_redirect_rewrite(move |resolved| {
+            assert_eq!(resolved, "https://api.libreview.ru");
+            regional_uri.clone()
+        });
+
+        client.read().await.unwrap();
+        assert_eq!(logins(&first).await, 1);
+        assert_eq!(logins(&regional).await, 1);
+        assert_eq!(region_base_url("cn"), Some("https://api-cn.myfreestyle.cn"));
+    }
+
+    #[tokio::test]
+    async fn a_well_formed_region_outside_the_table_is_refused() {
+        let server = MockServer::start().await;
+        mount(&server, "POST", LOGIN_PATH, redirect_to("zz9")).await;
+        let rewritten = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&rewritten);
+        let client = client(&server).with_redirect_rewrite(move |_| {
+            flag.store(true, Ordering::SeqCst);
+            String::new()
+        });
+
+        assert!(valid_redirect_region("zz9"));
+        assert_eq!(
+            client.read().await.unwrap_err().code,
+            "upstream_unavailable"
+        );
+        assert!(!rewritten.load(Ordering::SeqCst));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -900,7 +996,6 @@ mod tests {
         assert_eq!(region_base_url("global"), Some("https://api.libreview.io"));
         assert_eq!(region_base_url("eu2"), Some("https://api-eu2.libreview.io"));
         assert_eq!(region_base_url("unknown"), None);
-        assert_eq!(redirect_base_url("de"), "https://api-de.libreview.io");
         assert!(valid_patient_id(PATIENT_ID));
         assert!(!valid_patient_id("../escape"));
     }
