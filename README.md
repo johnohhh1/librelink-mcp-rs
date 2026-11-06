@@ -1,6 +1,6 @@
 # LibreLink MCP RS
 
-An independent Rust implementation of a local MCP server for LibreLinkUp sharing data. The first stdio MCP server exposes the eight original tool names. Several analytics fields remain unavailable until source time coverage can be established; see [architecture and parity status](docs/architecture.md).
+An independent Rust implementation of a local MCP server for LibreLinkUp sharing data. The first stdio MCP server exposes the eight original tool names. Several analytics fields remain unavailable until source time coverage can be established; see [architecture and parity status](docs/architecture.md) and the [release roadmap](docs/roadmap.md).
 
 This project was inspired by [Amandeep Khurana's LibreLink MCP Server](https://github.com/amansk/librelink-mcp-server). The original project defines the tool names and initial behavior. Its TypeScript code is not included here. Thank you to Amandeep Khurana and the original contributors.
 
