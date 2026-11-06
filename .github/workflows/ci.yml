@@ -4,6 +4,10 @@ on:
   push:
   pull_request:
 
+concurrency:
+  group: rust-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   rust:
     runs-on: ${{ matrix.os }}

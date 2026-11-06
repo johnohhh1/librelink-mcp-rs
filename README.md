@@ -25,6 +25,8 @@ cargo run -- check
 
 On headless Linux systems without Secret Service, `setup` fails. That is intentional until another secure store is designed and tested. If you previously used the original server, its `~/.librelink-mcp/config.json` may contain a plaintext password; this prototype does not read or migrate that file.
 
+To remove this server's saved credentials and preferences, stop any running server and run `cargo run -- clear-local-data` (or `librelink-mcp-rs clear-local-data` if installed). This command deletes only this project's two OS credential-store entries. It does not touch the original server's files. Run `setup` again to reconnect.
+
 ## MCP server
 
 Run `cargo run -- serve` for a local stdio server. MCP clients must launch the binary directly; for example, after `cargo build --release`:

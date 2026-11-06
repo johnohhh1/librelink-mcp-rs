@@ -164,6 +164,22 @@ fn select_patient() -> Result<(), &'static str> {
     Ok(())
 }
 
+fn delete_entry_if_present(entry: Entry) -> Result<(), &'static str> {
+    match entry.delete_credential() {
+        Ok(()) | Err(KeyringError::NoEntry) => Ok(()),
+        Err(_) => Err("Unable to delete an item from the OS credential store."),
+    }
+}
+
+fn clear_local_data() -> Result<(), &'static str> {
+    delete_entry_if_present(keyring_entry()?)?;
+    delete_entry_if_present(settings_entry()?)?;
+    println!(
+        "This server's credentials and local preferences were removed from the OS credential store."
+    );
+    Ok(())
+}
+
 fn load_credentials() -> Result<Credentials, &'static str> {
     let stored = match keyring_entry()?.get_password() {
         Ok(value) => Zeroizing::new(value),
@@ -267,8 +283,9 @@ async fn main() {
         [_, command] if command == "setup" => setup(),
         [_, command] if command == "check" => check().await,
         [_, command] if command == "select-patient" => select_patient(),
+        [_, command] if command == "clear-local-data" => clear_local_data(),
         [_, command] if command == "serve" => mcp::serve().await,
-        _ => Err("Usage: librelink-mcp-rs <setup|select-patient|check|serve>"),
+        _ => Err("Usage: librelink-mcp-rs <setup|select-patient|check|clear-local-data|serve>"),
     };
     if let Err(message) = result {
         eprintln!("{message}");
