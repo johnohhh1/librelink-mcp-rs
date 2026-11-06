@@ -1,14 +1,24 @@
 use chrono::{DateTime, Duration, Utc};
 use keyring::{Entry, Error as KeyringError};
-use libre_link_up_api_client::{ClientConfig, LibreLinkUpClient, LibreLinkUpError, Region};
+use libre_link_up_api_client::{
+    ClientConfig, ConnectionIdentifier, LibreLinkUpClient, LibreLinkUpError, ReadRawResponse,
+    Region,
+};
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
+use std::sync::Arc;
 use std::time::Duration as StdDuration;
+use tokio::sync::{Mutex, OnceCell};
 use zeroize::{Zeroize, Zeroizing};
+
+mod mcp;
 
 const KEYRING_SERVICE: &str = "org.librelink-mcp-rs";
 const KEYRING_USER: &str = "librelinkup-account";
+const SETTINGS_USER: &str = "local-settings";
 const STALE_AFTER_MINUTES: i64 = 15;
+static CLIENT: OnceCell<LibreLinkUpClient> = OnceCell::const_new();
+static API_CALL_LOCK: Mutex<()> = Mutex::const_new(());
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -16,6 +26,24 @@ struct Credentials {
     email: String,
     password: String,
     region: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Settings {
+    target_low: u16,
+    target_high: u16,
+    patient_name: Option<String>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            target_low: 70,
+            target_high: 180,
+            patient_name: None,
+        }
+    }
 }
 
 impl Drop for Credentials {
@@ -35,7 +63,8 @@ enum Freshness {
 
 #[derive(Serialize)]
 struct ReadingSnapshot {
-    glucose_mg_dl: f64,
+    glucose_mg_dl: Option<f64>,
+    value_quality: &'static str,
     source_timestamp: Option<String>,
     freshness: Freshness,
 }
@@ -94,6 +123,25 @@ fn keyring_entry() -> Result<Entry, &'static str> {
         .map_err(|_| "OS credential store is unavailable; no credentials were saved.")
 }
 
+fn settings_entry() -> Result<Entry, &'static str> {
+    Entry::new(KEYRING_SERVICE, SETTINGS_USER).map_err(|_| "OS credential store is unavailable.")
+}
+
+fn load_settings() -> Result<Settings, &'static str> {
+    match settings_entry()?.get_password() {
+        Ok(value) => serde_json::from_str(&value).map_err(|_| "Stored settings are invalid."),
+        Err(KeyringError::NoEntry) => Ok(Settings::default()),
+        Err(_) => Err("Unable to read settings from the OS credential store."),
+    }
+}
+
+fn save_settings(settings: &Settings) -> Result<(), &'static str> {
+    let encoded = serde_json::to_string(settings).map_err(|_| "Unable to encode settings.")?;
+    settings_entry()?
+        .set_password(&encoded)
+        .map_err(|_| "Unable to save settings in the OS credential store.")
+}
+
 fn prompt(label: &str) -> Result<String, &'static str> {
     print!("{label}");
     io::stdout()
@@ -134,6 +182,15 @@ fn setup() -> Result<(), &'static str> {
     Ok(())
 }
 
+fn select_patient() -> Result<(), &'static str> {
+    let name = prompt("Followed person's full name (blank to clear selection): ")?;
+    let mut settings = load_settings()?;
+    settings.patient_name = (!name.is_empty()).then_some(name);
+    save_settings(&settings)?;
+    println!("Patient selection saved locally. Run `check` to verify it.");
+    Ok(())
+}
+
 fn load_credentials() -> Result<Credentials, &'static str> {
     let stored = match keyring_entry()?.get_password() {
         Ok(value) => Zeroizing::new(value),
@@ -154,23 +211,52 @@ fn client_error(error: LibreLinkUpError) -> &'static str {
             "Account authenticated but follows no patients in LibreLinkUp."
         }
         LibreLinkUpError::ConnectionNotFound(_) => "The selected patient was not found.",
+        LibreLinkUpError::ConnectionFunctionFailed => {
+            "No unique followed person was selected. Run `select-patient` locally."
+        }
         _ => "LibreLinkUp request failed; details were withheld to protect account data.",
     }
 }
 
-async fn check() -> Result<(), &'static str> {
-    let credentials = load_credentials()?;
-    let region = parse_region(&credentials.region).ok_or("Stored region is invalid.")?;
-    let config = ClientConfig::new(credentials.email.clone(), credentials.password.clone())
-        .with_region(region);
-    let client = LibreLinkUpClient::new(config).map_err(client_error)?;
+fn unique_match<T>(items: &[T], predicate: impl Fn(&T) -> bool) -> Option<&T> {
+    let mut matches = items.iter().filter(|item| predicate(item));
+    let selected = matches.next()?;
+    matches.next().is_none().then_some(selected)
+}
 
+fn build_client() -> Result<LibreLinkUpClient, &'static str> {
+    let credentials = load_credentials()?;
+    let settings = load_settings()?;
+    let region = parse_region(&credentials.region).ok_or("Stored region is invalid.")?;
+    let selected_name = settings.patient_name.map(|name| name.to_lowercase());
+    let identifier = ConnectionIdentifier::ByFunction(Arc::new(move |connections| {
+        unique_match(connections, |connection| {
+            selected_name.as_ref().is_none_or(|name| {
+                format!("{} {}", connection.first_name, connection.last_name).to_lowercase()
+                    == *name
+            })
+        })
+        .map(|selected| selected.patient_id.clone())
+    }));
+    let config = ClientConfig::new(credentials.email.clone(), credentials.password.clone())
+        .with_connection_identifier(identifier)
+        .with_region(region);
+    LibreLinkUpClient::new(config).map_err(client_error)
+}
+
+async fn fetch_raw() -> Result<ReadRawResponse, &'static str> {
+    let client = CLIENT.get_or_try_init(|| async { build_client() }).await?;
+    let _guard = API_CALL_LOCK.lock().await;
     // read_raw preserves the source timestamp. The client's processed read()
     // currently replaces an unparseable timestamp with Utc::now().
-    let raw = tokio::time::timeout(StdDuration::from_secs(30), client.read_raw())
+    tokio::time::timeout(StdDuration::from_secs(30), client.read_raw())
         .await
         .map_err(|_| "LibreLinkUp request timed out.")?
-        .map_err(client_error)?;
+        .map_err(client_error)
+}
+
+async fn check() -> Result<(), &'static str> {
+    let raw = fetch_raw().await?;
     let measurement = &raw.connection.glucose_measurement;
     let timestamp =
         (!measurement.timestamp.trim().is_empty()).then(|| measurement.timestamp.clone());
@@ -178,7 +264,16 @@ async fn check() -> Result<(), &'static str> {
         status: "connected",
         source: "librelinkup_sharing_api",
         reading: ReadingSnapshot {
-            glucose_mg_dl: measurement.value_in_mg_per_dl,
+            glucose_mg_dl: (measurement.value_in_mg_per_dl.is_finite()
+                && measurement.value_in_mg_per_dl > 0.0)
+                .then_some(measurement.value_in_mg_per_dl),
+            value_quality: if measurement.value_in_mg_per_dl.is_finite()
+                && measurement.value_in_mg_per_dl > 0.0
+            {
+                "observed"
+            } else {
+                "missing"
+            },
             freshness: classify_freshness(timestamp.as_deref(), Utc::now()),
             source_timestamp: timestamp,
         },
@@ -196,7 +291,9 @@ async fn main() {
     let result = match args.as_slice() {
         [_, command] if command == "setup" => setup(),
         [_, command] if command == "check" => check().await,
-        _ => Err("Usage: librelink-mcp-rs <setup|check>"),
+        [_, command] if command == "select-patient" => select_patient(),
+        [_, command] if command == "serve" => mcp::serve().await,
+        _ => Err("Usage: librelink-mcp-rs <setup|select-patient|check|serve>"),
     };
     if let Err(message) = result {
         eprintln!("{message}");
@@ -240,5 +337,14 @@ mod tests {
             classify_freshness(Some("2026-11-05T20:10:00Z"), now()),
             Freshness::Unknown
         );
+    }
+
+    #[test]
+    fn patient_selection_requires_one_match() {
+        let names = ["Alex", "Sam", "Sam"];
+        assert_eq!(unique_match(&names, |name| *name == "Alex"), Some(&"Alex"));
+        assert_eq!(unique_match(&names, |name| *name == "Sam"), None);
+        assert_eq!(unique_match(&names, |name| *name == "Pat"), None);
+        assert_eq!(unique_match(&names, |_| true), None);
     }
 }

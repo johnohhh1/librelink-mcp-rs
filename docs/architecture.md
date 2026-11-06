@@ -6,7 +6,7 @@ The original [TypeScript server](https://github.com/amansk/librelink-mcp-server)
 
 The [Rust API client](https://github.com/ItsXrgon/libre-link-up-api-client) has a published 0.3.3 API with `ClientConfig::new`, `LibreLinkUpClient::new`, `read_raw`, and `read`. Its README still shows dependency version 0.2.1. The 0.3.3 source handles login redirects and region mapping, but its error says credentials must be for **LibreLinkUp**, not a primary **LibreLink** account. The [original server's Node API dependency](https://github.com/DRFR0ST/libre-link-unofficial-api) also requires LibreLinkUp credentials, despite the original server README's wording. The original server stores a region preference but does not pass it to its Node client constructor. `read_raw` requires a followed patient and defaults to the first connection. The processed `read` maps unparseable timestamps to `Utc::now()` and missing or unknown trend arrows to `Flat`; the server should use raw measurements until those cases are preserved correctly. The crate's complete raw models also require many fields, so a successful login does not yet prove it can decode every account's graph response.
 
-Live account compatibility is not established by code inspection. The PoC's local `check` command is the validation step; no credentials are needed in this repository or chat.
+A local user check confirmed that the pinned crate can connect to a LibreLinkUp follower account and return values matching the phone app. That does not verify every account, region, or source timestamp interpretation. No credentials are needed in this repository or chat.
 
 ## Components
 
@@ -28,6 +28,10 @@ Live account compatibility is not established by code inspection. The PoC's loca
 | `configure_credentials` | Preserve the name but accept **no secret arguments**. Report local `setup` instructions and credential-store status only. |
 | `configure_ranges` | Validate ordered numeric bounds and save non-secret range preferences. |
 | `validate_connection` | Perform a safe API read and return connection/data status without credential or raw response leakage. |
+
+## Current parity status
+
+The first `rmcp` stdio server exposes all eight original tool names. `configure_credentials` has no secret input. `get_current_glucose`, `get_sensor_info`, and `validate_connection` use the real graph response. `configure_ranges` persists bounds locally. History returns the graph points actually supplied by the API, with `window_verified: false`; requested hours may exceed the returned graph. Statistics describe those graph samples and leave time-weighted range and GMI unavailable. Trends report observed extrema and arrow counts, leaving clinical-pattern fields unavailable. Full requested-period analytics requires a trusted time basis and a history source with sufficient coverage.
 
 ## Test gates
 

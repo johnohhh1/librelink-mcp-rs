@@ -11,7 +11,9 @@ repository = "https://github.com/johnohhh1/librelink-mcp-rs"
 chrono = { version = "0.4", features = ["serde"] }
 keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service"] }
 libre_link_up_api_client = "=0.3.3"
+rmcp = { version = "=3.9.0", default-features = false, features = ["server", "transport-io", "macros"] }
 rpassword = "7.5.4"
+schemars = "1.2.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

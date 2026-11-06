@@ -1,21 +1,23 @@
 # LibreLink MCP RS
 
-An independent Rust implementation of a local MCP server for LibreLinkUp sharing data. This repository is at the **connectivity proof-of-concept** stage: it does not yet start an MCP server or implement the eight tools.
+An independent Rust implementation of a local MCP server for LibreLinkUp sharing data. The first stdio MCP server exposes the eight original tool names. Several analytics fields remain unavailable until source time coverage can be established; see [architecture and parity status](docs/architecture.md).
 
 This project was inspired by [Amandeep Khurana's LibreLink MCP Server](https://github.com/amansk/librelink-mcp-server). The original project defines the tool names and initial behavior. Its TypeScript code is not included here. Thank you to Amandeep Khurana and the original contributors.
 
 ## Compatibility before use
 
-The current proof of concept uses [`libre_link_up_api_client` 0.3.3](https://github.com/ItsXrgon/libre-link-up-api-client) to test the API connection. That crate authenticates a **LibreLinkUp follower account**, obtains the first followed patient's connection by default, and fetches a graph response. The [Node client used by the original server](https://github.com/DRFR0ST/libre-link-unofficial-api) also calls for a LibreLinkUp follower account, although the original server's README calls it a LibreLink account. A sensor owner's primary LibreLink login may not work unless the same credentials also belong to a LibreLinkUp follower account. Live parity remains **unverified** until a local test with an appropriate account succeeds. Do not enter credentials into chat or an MCP tool.
+This server uses [`libre_link_up_api_client` 0.3.3](https://github.com/ItsXrgon/libre-link-up-api-client). That crate authenticates a **LibreLinkUp follower account** and fetches a graph response. The [Node client used by the original server](https://github.com/DRFR0ST/libre-link-unofficial-api) also calls for a LibreLinkUp follower account, although the original server's README calls it a LibreLink account. A sensor owner's primary LibreLink login may not work unless the same credentials also belong to a LibreLinkUp follower account. A local user check confirmed this crate can connect and return values matching their phone. Other accounts and regions remain untested. Do not enter credentials into chat or an MCP tool.
 
-The crate supports global routing plus US, EU, EU2, AE, AP, AU, CA, DE, FR, JP, LA, RU, and CN endpoints. `setup` accepts an explicit region, defaulting to global auto-redirect. An unknown region is rejected. Multiple followed patients are not yet selectable; the crate's default is the first connection. If that is ambiguous, do not rely on the returned reading.
+The crate supports global routing plus US, EU, EU2, AE, AP, AU, CA, DE, FR, JP, LA, RU, and CN endpoints. `setup` accepts an explicit region, defaulting to global auto-redirect. An unknown region is rejected. If the account follows multiple people, run `select-patient` locally with the followed person's full name. Without a selection, data tools refuse an ambiguous account instead of choosing the first connection.
 
-## Local proof of concept
+## Local setup and connectivity check
 
 Requires Rust 1.89 or newer and an available OS credential store (macOS Keychain, Windows Credential Manager, or a Linux Secret Service session). There is no plaintext fallback.
+If `cargo` is not on your shell path after installing Rust, run `. "$HOME/.cargo/env"` first.
 
 ```sh
 cargo run -- setup
+cargo run -- select-patient  # only if following multiple people
 cargo run -- check
 ```
 
@@ -23,12 +25,28 @@ cargo run -- check
 
 On headless Linux systems without Secret Service, `setup` fails. That is intentional until another secure store is designed and tested. If you previously used the original server, its `~/.librelink-mcp/config.json` may contain a plaintext password; this prototype does not read or migrate that file.
 
-## Status and next steps
+## MCP server
 
-- The eight original MCP tool names and the planned behavior are in [docs/architecture.md](docs/architecture.md).
-- This executable currently provides only `setup` and `check`. A successful API call with a follower account is still needed to confirm live compatibility.
-- `rmcp`, `tracing`, and optional SQLite are planned for the server phase. SQLite will be opt-in and will not store credentials.
-- Tests use synthetic timestamps and no account secrets.
+Run `cargo run -- serve` for a local stdio server. MCP clients must launch the binary directly; for example, after `cargo build --release`:
+
+```json
+{
+  "mcpServers": {
+    "librelink-rs": {
+      "command": "/absolute/path/to/librelink-mcp-rs/target/release/librelink-mcp-rs",
+      "args": ["serve"]
+    }
+  }
+}
+```
+
+The server exposes the eight original tool names. `configure_credentials` accepts no arguments and directs you to the local setup command. `configure_ranges` persists non-secret bounds in the OS credential store. The reading tools report source timestamps and avoid fabricated sensor details. Historical windows cannot yet be verified or filtered accurately because the API graph timestamps lack timezone offsets; statistics summarize returned samples only. `get_glucose_trends` reports observed values and trend-arrow counts without meal or dawn inference. These are deliberate limits, not full behavioral parity.
+
+The server reuses its authenticated API client across tool calls. Restart it after changing credentials or patient selection with the local CLI. Range changes take effect without a restart.
+
+`rmcp` and `tokio` handle stdio. SQLite remains optional future work and will not store credentials. Tests use synthetic data and no account secrets.
+
+CI checks formatting, Clippy, and tests on Linux, macOS, and Windows. Only Linux has been compiled locally so far.
 
 This is an unofficial project and is not affiliated with Abbott. It is for inspecting shared data, not making medical decisions.
 
