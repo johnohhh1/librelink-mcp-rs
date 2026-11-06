@@ -22,6 +22,16 @@ const RETENTION_KEY: &str = "retention_days";
 const SALT_BYTES: usize = 32;
 const DB_FILE_NAME: &str = "readings.sqlite3";
 
+/// The oldest schema a read-only open can read: version 2 added the
+/// collector's patient key, which every read needs.
+const MIN_READABLE_VERSION: usize = 2;
+
+/// Origins written by `import-csv`, as SQL.
+const CSV_ORIGINS: &str = "('libreview_csv_historic', 'libreview_csv_scan')";
+
+/// Seconds within which a collected reading supersedes a CSV row (ADR 0003).
+pub(crate) const CSV_OVERLAP_SECONDS: i64 = 90;
+
 /// Migrations in order; `PRAGMA user_version` is the number applied.
 const MIGRATIONS: &[&str] = &[
     r#"
@@ -298,12 +308,15 @@ fn create_private_file(db: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn migrate(conn: &mut Connection) -> StoreResult<()> {
-    let applied: usize = conn
-        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+fn schema_version(conn: &Connection) -> StoreResult<usize> {
+    conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
         .map_err(db_error)?
         .try_into()
-        .map_err(|_| "The local database has an invalid schema version.")?;
+        .map_err(|_| "The local database has an invalid schema version.")
+}
+
+fn migrate(conn: &mut Connection) -> StoreResult<()> {
+    let applied = schema_version(conn)?;
     if applied > MIGRATIONS.len() {
         return Err("The local database was created by a newer version of librelink-mcp-rs.");
     }
@@ -349,10 +362,15 @@ fn epoch(time: DateTime<Utc>) -> i64 {
 /// writing anything (for `import-csv --dry-run`). `None` if the database or
 /// the value does not exist.
 pub(crate) fn read_retention_days(db: &Path) -> StoreResult<Option<u32>> {
-    use rusqlite::OpenFlags;
     if !db.exists() {
         return Ok(None);
     }
+    retention_from(&open_read_only_connection(db)?)
+}
+
+/// Opens `db` without writing to it or creating anything beside it.
+fn open_read_only_connection(db: &Path) -> StoreResult<Connection> {
+    use rusqlite::OpenFlags;
     let read_only = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = if with_suffix(db, "-wal").exists() {
         // A collector has the database open: read through its WAL.
@@ -366,7 +384,7 @@ pub(crate) fn read_retention_days(db: &Path) -> StoreResult<Option<u32>> {
     .map_err(db_error)?;
     conn.busy_timeout(std::time::Duration::from_secs(5))
         .map_err(db_error)?;
-    retention_from(&conn)
+    Ok(conn)
 }
 
 /// A `file:` URI for `db` with `immutable=1`, percent-encoding anything
@@ -437,9 +455,58 @@ impl Store {
         Ok(Self { conn, salt })
     }
 
+    /// Opens an existing database for reading only, as `serve` does: no
+    /// migration, no writes, and no files created. Refuses a schema newer
+    /// than this build or older than it can read. Only `collect` and
+    /// `import-csv` migrate.
+    pub(crate) fn open_read_only(path: &Path) -> StoreResult<Self> {
+        if !path.exists() {
+            return Err("The local database does not exist.");
+        }
+        let conn = open_read_only_connection(path)?;
+        let version = schema_version(&conn)?;
+        if version > MIGRATIONS.len() {
+            return Err("The local database was created by a newer version of librelink-mcp-rs.");
+        }
+        if version < MIN_READABLE_VERSION {
+            return Err("The local database is too old to read; run collect once to upgrade it.");
+        }
+        let stored: Vec<u8> = conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", [SALT_KEY], |row| {
+                row.get(0)
+            })
+            .map_err(db_error)?;
+        let salt = stored
+            .try_into()
+            .map_err(|_| "The local database has an invalid salt.")?;
+        Ok(Self { conn, salt })
+    }
+
     #[cfg(test)]
     pub(crate) fn connection(&self) -> &Connection {
         &self.conn
+    }
+
+    /// The first and last observed times of this patient's CSV rows, all of
+    /// them, including rows hidden by a collected reading.
+    pub(crate) fn csv_span(
+        &self,
+        patient_key: &str,
+    ) -> StoreResult<Option<(DateTime<Utc>, DateTime<Utc>)>> {
+        let (first, last): (Option<i64>, Option<i64>) = self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT MIN(observed_at_utc), MAX(observed_at_utc) FROM readings
+                     WHERE patient_key = ?1 AND origin IN {CSV_ORIGINS}"
+                ),
+                [patient_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(db_error)?;
+        Ok(first.zip(last).and_then(|(first, last)| {
+            DateTime::from_timestamp(first, 0).zip(DateTime::from_timestamp(last, 0))
+        }))
     }
 
     /// Records the collector's retention so `import-csv` applies the same.
@@ -603,8 +670,11 @@ impl Store {
     /// The newest stored reading with a usable UTC time.
     pub(crate) fn latest_reading(&self, patient_key: &str) -> StoreResult<Option<StoredReading>> {
         let mut readings = self.query_readings(
-            "WHERE patient_key = ?1 AND observed_at_utc IS NOT NULL
-             ORDER BY observed_at_utc DESC, factory_timestamp DESC LIMIT 1",
+            &format!(
+                "WHERE patient_key = ?1 AND observed_at_utc IS NOT NULL AND {}
+                 ORDER BY observed_at_utc DESC, factory_timestamp DESC LIMIT 1",
+                visible()
+            ),
             params![patient_key],
         )?;
         Ok(readings.pop())
@@ -613,7 +683,10 @@ impl Store {
     pub(crate) fn reading_count(&self, patient_key: &str) -> StoreResult<i64> {
         self.conn
             .query_row(
-                "SELECT COUNT(*) FROM readings WHERE patient_key = ?1",
+                &format!(
+                    "SELECT COUNT(*) FROM readings WHERE patient_key = ?1 AND {}",
+                    visible()
+                ),
                 [patient_key],
                 |row| row.get(0),
             )
@@ -696,6 +769,7 @@ impl Store {
         rows.map(|row| row.map_err(db_error)).collect()
     }
 
+    /// Every reading the tools see is filtered through [`visible`].
     fn query_readings(
         &self,
         clause: &str,
@@ -771,8 +845,11 @@ impl Store {
         to: DateTime<Utc>,
     ) -> StoreResult<Vec<StoredReading>> {
         self.query_readings(
-            "WHERE patient_key = ?1 AND observed_at_utc BETWEEN ?2 AND ?3
-             ORDER BY observed_at_utc, factory_timestamp",
+            &format!(
+                "WHERE patient_key = ?1 AND observed_at_utc BETWEEN ?2 AND ?3 AND {}
+                 ORDER BY observed_at_utc, factory_timestamp",
+                visible()
+            ),
             params![patient_key, epoch(from), epoch(to)],
         )
     }
@@ -797,6 +874,20 @@ impl Store {
             .map_err(db_error)?;
         Ok(Pruned { readings, polls })
     }
+}
+
+/// SQL condition on `readings` (unaliased): hides a CSV row within
+/// ±90 seconds of a collected reading of the same patient, so overlapping
+/// imports never double-count, whichever was stored first.
+fn visible() -> String {
+    format!(
+        "NOT (readings.origin IN {CSV_ORIGINS} AND EXISTS (
+             SELECT 1 FROM readings AS collected
+             WHERE collected.patient_key = readings.patient_key
+               AND collected.origin NOT IN {CSV_ORIGINS}
+               AND collected.observed_at_utc BETWEEN readings.observed_at_utc - {CSV_OVERLAP_SECONDS}
+                                                 AND readings.observed_at_utc + {CSV_OVERLAP_SECONDS}))"
+    )
 }
 
 fn replace_sensors(
@@ -933,6 +1024,31 @@ mod tests {
         let reopened = Store::open(&path).unwrap();
         assert_eq!(reopened.patient_key(PATIENT), key);
         assert_eq!(count(&reopened, "meta"), 1);
+    }
+
+    #[test]
+    fn read_only_open_never_creates_migrates_or_reads_unknown_schemas() {
+        let (_dir, path) = temp_db();
+        assert!(Store::open_read_only(&path).is_err());
+        assert!(!path.exists(), "a read-only open created the database");
+
+        drop(Store::open(&path).unwrap());
+        for (version, readable) in [(1, false), (2, true), (3, true), (4, false)] {
+            Connection::open(&path)
+                .unwrap()
+                .pragma_update(None, "user_version", version)
+                .unwrap();
+            assert_eq!(
+                Store::open_read_only(&path).is_ok(),
+                readable,
+                "version {version}"
+            );
+            let after: i64 = Connection::open(&path)
+                .unwrap()
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(after, version);
+        }
     }
 
     #[test]

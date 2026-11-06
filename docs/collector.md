@@ -50,16 +50,29 @@ Every data reply includes `data_source`. From the store:
 
 - `get_current_glucose` reports the newest stored reading. Its `retrieved_at_utc` is when the collector stored it, so freshness turns `stale` if the collector falls behind, for example during a long rate-limit cooldown.
 - `get_glucose_history`, `get_glucose_stats`, and `get_glucose_trends` use the requested window, up to each tool's maximum. When stored coverage spans the window without gaps, `period_status` is `sample_summary` instead of `partial`.
-- Each interior gap in `coverage` has a `cause`:
-  - `before_collection`: the gap ends before the first recorded poll. For that period the database holds only the graph LibreLinkUp returned when collection began, so the cause is unknown. Once retention prunes the oldest poll records, older gaps are labeled this way too.
-  - `collector_not_running`: after collection began, no poll attempt was recorded in the gap.
-  - `no_data_from_api`: the collector polled during the gap but got no readings for that span.
+- Each interior gap in `coverage` has a `cause`, the first of these that applies:
+  1. `no_data_from_api`: the collector polled during the gap but got no readings for that span.
+  2. `no_data_in_export`: the gap lies entirely within the span of [imported CSV](csv-import.md) rows, so the device's own history has nothing there, for example during a sensor change.
+  3. `before_collection`: the gap ends before the first recorded poll. For that period the database holds only the graph LibreLinkUp returned when collection began, so the cause is unknown. Once retention prunes the oldest poll records, older gaps are labeled this way too.
+  4. `collector_not_running`: after collection began, no poll attempt was recorded in the gap.
+- An imported CSV row within 90 seconds of a collected reading is left out of every reply, so overlapping data is never counted twice.
 
   The gap threshold uses the graph's cadence (normally 15 minutes), so minute-by-minute current readings do not hide or create gaps.
 - `get_sensor_info` reads the latest snapshot's sensors, which the database holds only in masked form.
 - `validate_connection` reports the collector heartbeat age, the last poll outcome and time, and the number of stored readings.
 
-`serve` does not create the database. If it cannot read it, it uses the live API.
+`serve` opens the database read-only: it never creates, migrates, or writes to it, so it is safe to run a newer `serve` beside an older collector. If it cannot read the database, or the database is from a newer version, it uses the live API. Only `collect` and `import-csv` upgrade the database.
+
+## Upgrading
+
+`collect` and `import-csv` upgrade the database schema when they open it. The schema changes in 0.4.0, and a 0.3.0 collector refuses an upgraded database at startup. To upgrade:
+
+1. Stop the collector.
+2. Install the new version.
+3. Run `import-csv` if you have an export to import, or start `collect`. Either one upgrades the database.
+4. Start the collector, if it is not already running.
+
+There is no downgrade: an older version refuses an upgraded database with "created by a newer version". Keep the old version's binary only if you also keep a copy of the database from before the upgrade.
 
 ## Privacy
 

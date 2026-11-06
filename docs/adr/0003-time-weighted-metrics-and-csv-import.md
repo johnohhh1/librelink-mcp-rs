@@ -178,4 +178,7 @@ The step 0 review raised these concerns, and the PM settled them on 2026-11-06. 
 5. **Band edges, window edges, the population SD, the GMI gate, headers and delimiters, date order, skip reasons, and the size check:** the step 0 proposals were adopted.
 6. **Clearing during an import:** an import lock, which `clear-local-data` respects.
 
-Gap labels for imported periods, including whether CSV historic readings count toward the cadence estimate, remain to be decided in step 3.
+The step 3 review settled two more:
+
+7. **Gap labels for imported periods:** a gap entirely inside the imported span (the patient's first to last CSV row) with no polls in it is `no_data_in_export`. The order of causes is `no_data_from_api`, `no_data_in_export`, `before_collection`, `collector_not_running`. The cadence estimate still uses graph readings only.
+8. **`serve` and migrations:** `serve` opens the database read-only and never migrates it. It reads schema versions 2 and 3, and uses the live API for a newer database. Only `collect` and `import-csv` migrate.

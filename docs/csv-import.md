@@ -53,8 +53,16 @@ Exit statuses: 0 on success, 2 for invalid options, and 1 when the import is ref
 
 The other skip reasons are `unparseable_time` and `invalid_value`, for a missing, non-numeric, or non-positive glucose value.
 
+## Overlap with collected readings
+
+Collected readings take precedence. When a collected reading lies within 90 seconds of an imported row, `serve` leaves that CSV row out of every reply, including the current reading, history, statistics, trends, coverage, and counts. The rule applies when the data is read, so it works whichever was stored first, and importing never deletes or changes collected rows.
+
+Inside the span of imported rows, a gap with no collector polls in it is labeled `no_data_in_export`: the device's own history has nothing there, for example during a sensor change. See the [collector guide](collector.md#how-serve-chooses-its-data) for all gap causes.
+
 ## Running beside a collector
 
 An import can run while a collector is running on the same database; SQLite's WAL mode handles both writers. It writes in batches of about 1,000 rows, so it never blocks the collector for long.
+
+Before 0.4.0's first import or collector start, stop any older collector: the import upgrades the database, and a 0.3.0 collector refuses it afterward. See [Upgrading](collector.md#upgrading).
 
 An import holds its own lock, `<db>.import.lock`, so a second import on the same database is refused. `clear-local-data` refuses while either the collector or an import holds its lock.

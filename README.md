@@ -95,7 +95,9 @@ cargo run -- collect
 
 It runs in the foreground until Ctrl+C, allows one collector per database, and stops with exit status 78 on errors a retry cannot fix. While a collector is running (its heartbeat is under 3 minutes old), `serve` answers every data tool from the database and makes no LibreLinkUp requests; otherwise it uses the live API. Every data reply says which in `data_source` (`local_store` or `live_api`), and stored data is only as fresh as the collector. Both commands accept `--db <path>`. See the [collector guide](docs/collector.md) for options, what is and isn't stored, and a systemd user service example.
 
-To add history from before the collector started, `import-csv <file> --timezone <IANA zone>` loads a LibreView CSV export into the same database, offline. See [Importing a LibreView CSV export](docs/csv-import.md).
+To add history from before the collector started, `import-csv <file> --timezone <IANA zone>` loads a LibreView CSV export into the same database, offline. See [Importing a LibreView CSV export](docs/csv-import.md). When the export and collected data overlap, the collected readings win, so nothing is counted twice.
+
+Upgrading from 0.3: stop the collector, install the new version, run `import-csv` or `collect` (either one upgrades the database), then start the collector. `serve` never upgrades or writes the database, and an upgraded database cannot be used by 0.3.0. See [Upgrading](docs/collector.md#upgrading).
 
 ## Privacy and local data
 

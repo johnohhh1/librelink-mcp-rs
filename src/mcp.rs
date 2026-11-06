@@ -89,6 +89,7 @@ impl LocalStore {
             let polls = PollWindow {
                 times: store.poll_times(from, now)?,
                 first_ever: store.first_poll_time()?,
+                csv_span: key.map(|key| store.csv_span(key)).transpose()?.flatten(),
             };
             match key {
                 Some(key) => Ok((store.readings_for_key(key, from, now)?, polls)),
@@ -125,7 +126,7 @@ impl LibreMcp {
             if !db.exists() {
                 return None;
             }
-            let store = Store::open(&db).ok()?;
+            let store = Store::open_read_only(&db).ok()?;
             let status = store.collector_status().ok()??;
             Some((store, status))
         })
@@ -215,7 +216,7 @@ struct GraphGap {
     from_utc: DateTime<Utc>,
     to_utc: DateTime<Utc>,
     duration_minutes: f64,
-    /// Local store only: `collector_not_running` or `no_data_from_api`.
+    /// Local store only: why the store has no readings there.
     #[serde(skip_serializing_if = "Option::is_none")]
     cause: Option<&'static str>,
 }
@@ -320,31 +321,42 @@ fn local_coverage(readings: &[StoredReading], now: DateTime<Utc>) -> CoverageOpt
     }
 }
 
-/// Poll attempts inside a window, and the oldest attempt still recorded.
+/// Poll attempts inside a window, the oldest attempt still recorded, and
+/// the span of imported CSV rows.
 struct PollWindow {
     times: Vec<DateTime<Utc>>,
     first_ever: Option<DateTime<Utc>>,
+    /// First and last observed time of the patient's CSV rows.
+    csv_span: Option<(DateTime<Utc>, DateTime<Utc>)>,
 }
 
-/// Labels each listed interior gap:
-/// - `before_collection`: the gap ends before the first recorded poll. The
-///   store holds only the API's backfilled graph for that period, so the
-///   cause is unknown.
-/// - `no_data_from_api`: the collector polled during the gap but got no
-///   readings for it.
-/// - `collector_not_running`: the gap is after collection began and no poll
-///   attempt was recorded inside it.
+/// Labels each listed interior gap, taking the first that applies:
+/// 1. `no_data_from_api`: the collector polled during the gap but got no
+///    readings for it.
+/// 2. `no_data_in_export`: the gap lies entirely within the imported CSV
+///    span, so the device's own history has nothing there (for example, a
+///    sensor change).
+/// 3. `before_collection`: the gap ends before the first recorded poll. The
+///    store holds only the API's backfilled graph for that period, so the
+///    cause is unknown.
+/// 4. `collector_not_running`: the gap is after collection began and no poll
+///    attempt was recorded inside it.
 fn classify_gaps(coverage: &mut GraphCoverage, polls: &PollWindow) {
     for gap in &mut coverage.interior_gaps {
-        let before_collection = polls.first_ever.is_none_or(|first| gap.to_utc < first);
         let polled = polls
             .times
             .iter()
             .any(|time| *time > gap.from_utc && *time < gap.to_utc);
-        gap.cause = Some(if before_collection {
-            "before_collection"
-        } else if polled {
+        let in_export = polls
+            .csv_span
+            .is_some_and(|(first, last)| gap.from_utc >= first && gap.to_utc <= last);
+        let before_collection = polls.first_ever.is_none_or(|first| gap.to_utc < first);
+        gap.cause = Some(if polled {
             "no_data_from_api"
+        } else if in_export {
+            "no_data_in_export"
+        } else if before_collection {
+            "before_collection"
         } else {
             "collector_not_running"
         });
@@ -2111,6 +2123,238 @@ mod tests {
         assert_eq!(point["time_basis"], "csv_local_declared_timezone");
         assert!(point["observed_at_utc"].is_string());
         assert_eq!(reads.load(Ordering::SeqCst), 0);
+    }
+
+    /// A synthetic CSV historic row at `at`.
+    fn csv_row(at: DateTime<Utc>, value: f64) -> crate::store::CsvReading {
+        crate::store::CsvReading {
+            key: format!("csv:0:{}", at.timestamp()),
+            source_timestamp: at.format("%m-%d-%Y %I:%M %p").to_string(),
+            observed_at_utc: at,
+            value_mg_dl: value,
+            origin: Origin::LibreviewCsvHistoric,
+        }
+    }
+
+    fn import_rows(fixture: &LocalFixture, rows: &[crate::store::CsvReading]) {
+        let now = fixture.now;
+        fixture.with_store(|store| {
+            let key = store
+                .collector_status()
+                .unwrap()
+                .unwrap()
+                .patient_key
+                .unwrap();
+            store.insert_csv_readings(&key, rows, now).unwrap();
+        });
+    }
+
+    fn directory_contents(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut files: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                let bytes = std::fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect();
+        files.sort();
+        files
+    }
+
+    #[tokio::test]
+    async fn serve_reads_an_older_database_without_migrating_it() {
+        let fixture = local_fixture(&[20, 5], None, Some(10));
+        // The v2 and v3 schemas are identical; v3 only adds values.
+        fixture.with_store(|store| {
+            store
+                .connection()
+                .pragma_update(None, "user_version", 2)
+                .unwrap()
+        });
+        let dir = fixture.db.parent().unwrap().to_path_buf();
+        let before = directory_contents(&dir);
+        let (server, reads) = store_server(&fixture.db);
+        for result in all_data_tools(&server).await {
+            assert_eq!(body(&result)["data_source"], "local_store", "{result:?}");
+        }
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+        // No migration, no writes, no new files.
+        assert!(
+            directory_contents(&dir) == before,
+            "serve changed the database"
+        );
+        let version: i64 = rusqlite::Connection::open(&fixture.db)
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+
+        // A database from a newer build is not read: serve uses the live API.
+        fixture.with_store(|store| {
+            store
+                .connection()
+                .pragma_update(None, "user_version", 99)
+                .unwrap()
+        });
+        let (server, reads) = store_server(&fixture.db);
+        let reply = server.get_current_glucose(Parameters(EmptyArgs {})).await;
+        assert_eq!(body(&reply)["data_source"], "live_api");
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn csv_rows_near_collected_readings_are_hidden_in_either_import_order() {
+        for csv_first in [false, true] {
+            // Collected readings 20 and 10 minutes ago (110 mg/dL).
+            let fixture = local_fixture(&[], None, Some(10));
+            let collected = fixture.at(10);
+            let csv = [
+                // Within 90 s of a collected reading: hidden. One is newer
+                // than the collected reading and would otherwise be current.
+                csv_row(fixture.at(20) - Duration::seconds(90), 200.0),
+                csv_row(collected + Duration::seconds(60), 200.0),
+                // 91 s away: kept.
+                csv_row(collected - Duration::seconds(91), 150.0),
+                // Nothing collected near it: kept.
+                csv_row(fixture.at(40), 150.0),
+            ];
+            let snapshot = Snapshot {
+                patient_id: STORE_PATIENT_ID.to_owned(),
+                current: synthetic_item(""),
+                graph: vec![
+                    synthetic_item(&fixture.ago(20)),
+                    synthetic_item(&fixture.ago(10)),
+                ],
+                active_sensors: vec![],
+            };
+            let collect = |fixture: &LocalFixture| {
+                let now = fixture.now;
+                fixture.with_store(|store| {
+                    store
+                        .insert_snapshot(STORE_PATIENT_ID, &snapshot, now)
+                        .unwrap()
+                });
+            };
+            if csv_first {
+                import_rows(&fixture, &csv);
+                collect(&fixture);
+            } else {
+                collect(&fixture);
+                import_rows(&fixture, &csv);
+            }
+            let (server, _) = store_server(&fixture.db);
+            let order = if csv_first {
+                "csv first"
+            } else {
+                "collected first"
+            };
+
+            let current = server.get_current_glucose(Parameters(EmptyArgs {})).await;
+            assert_eq!(body(&current)["glucose_mg_dl"], 110.0, "{order}");
+
+            let history = server
+                .get_glucose_history(Parameters(HistoryArgs { hours: Some(1) }))
+                .await;
+            let history = body(&history);
+            assert_eq!(history["total_readings"], 4, "{order}");
+            let sources: Vec<_> = history["readings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|point| point["source"].as_str().unwrap().to_owned())
+                .collect();
+            assert_eq!(
+                sources,
+                [
+                    "libreview_csv_historic",
+                    "graph",
+                    "libreview_csv_historic",
+                    "graph"
+                ],
+                "{order}"
+            );
+            assert_eq!(history["coverage"]["actual_points_in_window"], 4, "{order}");
+
+            let stats = server
+                .get_glucose_stats(Parameters(StatsArgs { days: Some(1) }))
+                .await;
+            let stats = body(&stats);
+            assert_eq!(stats["sample_count"], 4, "{order}");
+            assert_eq!(stats["time_weighted"]["readings_used"], 4, "{order}");
+
+            let trends = server
+                .get_glucose_trends(Parameters(TrendsArgs {
+                    period: Some(Period::Daily),
+                }))
+                .await;
+            assert_eq!(body(&trends)["sample_count"], 4, "{order}");
+
+            let status = server.validate_connection(Parameters(EmptyArgs {})).await;
+            assert_eq!(body(&status)["stored_reading_count"], 4, "{order}");
+        }
+    }
+
+    #[tokio::test]
+    async fn gaps_in_imported_history_are_labeled_by_precedence() {
+        // Minutes ago. Graph readings before the export, a 15-minute export
+        // from 700 to 400 minutes ago, then graph readings to now.
+        let early_graph = [800, 785, 770];
+        let late_graph: Vec<i64> = (0..26)
+            .map(|step| 5 + 15 * step)
+            .filter(|m| !(200 < *m && *m < 245))
+            .collect();
+        let csv_minutes: Vec<i64> = (0..=20)
+            .map(|step| 400 + 15 * step)
+            .filter(|m| !(670 < *m && *m < 700))
+            .filter(|m| !(490 < *m && *m < 550))
+            .filter(|m| !(430 < *m && *m < 460))
+            .collect();
+        let graph: Vec<i64> = early_graph.into_iter().chain(late_graph).collect();
+        let fixture = local_fixture(&graph, None, Some(10));
+        let csv: Vec<_> = csv_minutes
+            .iter()
+            .map(|m| csv_row(fixture.at(*m), 120.0))
+            .collect();
+        import_rows(&fixture, &csv);
+        // Collection began 650 minutes ago; one poll 520 minutes ago.
+        let (first_poll, later_poll) = (fixture.at(650), fixture.at(520));
+        fixture.with_store(|store| {
+            store.record_poll("ok", 40, first_poll).unwrap();
+            store.record_poll("ok", 0, later_poll).unwrap();
+        });
+        let (server, _) = store_server(&fixture.db);
+        let reply = server
+            .get_glucose_history(Parameters(HistoryArgs { hours: Some(14) }))
+            .await;
+        let gaps: Vec<(f64, String)> = body(&reply)["coverage"]["interior_gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|gap| {
+                (
+                    gap["duration_minutes"].as_f64().unwrap(),
+                    gap["cause"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        let expected = [
+            // 770 to 700: starts before the export, ends before the first poll.
+            (70.0, "before_collection"),
+            // 700 to 670: inside the export, before the first poll.
+            (30.0, "no_data_in_export"),
+            // 550 to 490: inside the export, but the collector polled in it.
+            (60.0, "no_data_from_api"),
+            // 460 to 430: inside the export, after collection began.
+            (30.0, "no_data_in_export"),
+            // 245 to 200: after the export, no poll.
+            (45.0, "collector_not_running"),
+        ];
+        let expected: Vec<(f64, String)> = expected
+            .iter()
+            .map(|(minutes, cause)| (*minutes, (*cause).to_owned()))
+            .collect();
+        assert_eq!(gaps, expected);
     }
 
     #[tokio::test]

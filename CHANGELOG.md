@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.4.0 — unreleased (draft)
+
+### Added
+- `import-csv <file> --timezone <IANA zone> [--date-format mdy|dmy] [--db <path>] [--dry-run]` imports a locally saved LibreView CSV export into the collector's database, offline. It reads only the device timestamp, record type, and historic and scan glucose columns. It stores record types 0 and 1 as `libreview_csv_historic` and `libreview_csv_scan`, with `time_basis: csv_local_declared_timezone`. DST-ambiguous and nonexistent local times, rows outside the collector's retention, future rows, and bad values are skipped and counted. Output is counts only. See [Importing a LibreView CSV export](docs/csv-import.md).
+- Time-weighted statistics in `get_glucose_stats`, next to the unchanged sample statistics, in a new `time_weighted` object:
+  - each reading counts for the time until the next one, at most 15 minutes;
+  - `coverage_percent` of the requested window;
+  - the consensus bands (`<54`, `54–<70`, `70–180`, `>180–250`, `>250` mg/dL) and time in the configured target range, as percent of covered time;
+  - a time-weighted mean, SD, and CV.
+- The gap cause `no_data_in_export`, for a gap inside the imported span with no collector polls.
+
+### Changed
+- `time_in_range_percent` is now the time-weighted share of covered time in 70–180 mg/dL. It was always `null` before.
+- `gmi_percent` is now an estimate (3.31 + 0.02392 × time-weighted mean) when the requested window is at least 14 days and at least 70% covered. Otherwise it stays `null`, with `gmi_unavailable_reason` `window_too_short` or `coverage_too_low`. With the live graph alone it is never available.
+- A CSV row within 90 seconds of a collected reading is left out of every store-backed reply.
+- Gap causes are decided in this order: `no_data_from_api`, `no_data_in_export`, `before_collection`, `collector_not_running`. Before, a gap before the first poll was `before_collection` even when the collector had polled inside it.
+- `serve` opens the database read-only and never creates, migrates, or writes it. A database from a newer version makes `serve` use the live API.
+- `collect` records its retention in the database, and `clear-local-data` refuses while an import holds `<db>.import.lock`.
+
+### Upgrading
+- The database schema moves to version 3 the first time 0.4.0's `collect` or `import-csv` opens it. **There is no downgrade path:** 0.3.0 refuses an upgraded database. Stop the collector, install 0.4.0, run `import-csv` or `collect`, then start the collector. See [Upgrading](docs/collector.md#upgrading).
+
 ## 0.3.0 — 2026-11-06
 
 ### Added
