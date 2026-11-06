@@ -72,7 +72,7 @@ The server reuses its authenticated API client. Restart it after changing creden
 | `get_glucose_history` | Graph readings plus the current measurement, each labeled with its source; coverage and whether filtering applied |
 | `get_glucose_stats` | Descriptive statistics over the returned graph, labeled `partial` when it covers less than the requested days |
 | `get_glucose_trends` | Partial-period status, extrema, source arrows, and descriptive adjacent-point rates |
-| `get_sensor_info` | Source identifiers, interpreted activation epoch, warmup minutes, and product type code |
+| `get_sensor_info` | Masked serial and device ID (last four characters), interpreted activation epoch, warmup minutes, and product type code |
 | `configure_credentials` | Local setup instructions; accepts **no credentials** |
 | `configure_ranges` | Validates and saves local target bounds in mg/dL |
 | `validate_connection` | Connection and data-availability status without glucose values or secrets |

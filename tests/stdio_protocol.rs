@@ -64,6 +64,15 @@ fn stdio_lists_eight_tools_and_rejects_secret_input() {
     let initialized = server.receive();
     assert_eq!(initialized["id"], 1);
     assert!(initialized.get("result").is_some());
+    assert_eq!(
+        initialized["result"]["serverInfo"]["name"],
+        "librelink-mcp-rs"
+    );
+    assert!(
+        initialized["result"]["instructions"]
+            .as_str()
+            .is_some_and(|text| text.contains("freshness"))
+    );
     server.send(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
 
     server.send(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }));

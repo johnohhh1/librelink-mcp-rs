@@ -5,7 +5,10 @@ use crate::{
 use chrono::{DateTime, Duration, Utc};
 use libre_link_up_api_client::GlucoseItem;
 use rmcp::{
-    ServiceExt, handler::server::wrapper::Parameters, model::CallToolResult, tool, tool_router,
+    ServerHandler, ServiceExt,
+    handler::server::wrapper::Parameters,
+    model::{CallToolResult, Implementation, ServerCapabilities, ServerConfig},
+    tool, tool_handler, tool_router,
     transport::stdio,
 };
 use schemars::JsonSchema;
@@ -224,9 +227,28 @@ fn graph_coverage(items: &[GlucoseItem], hours: i64, now: DateTime<Utc>) -> Grap
     }
 }
 
-fn nonempty(value: &str) -> Option<String> {
-    (!value.trim().is_empty()).then(|| value.to_owned())
+/// Sensor serial numbers and device IDs identify a person's hardware. Only the
+/// last four characters go to the model, which is enough to tell sensors apart.
+fn masked_identifier(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let chars: Vec<char> = trimmed.chars().collect();
+    if chars.len() <= 4 {
+        return Some("****".to_owned());
+    }
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    Some(format!("****{tail}"))
 }
+
+const SERVER_INSTRUCTIONS: &str = "Unofficial, read-only access to LibreLinkUp follower data. \
+Glucose values are mg/dL. Only get_current_glucose reports freshness: treat `stale` or `unknown` \
+as not real-time and say so. `time_basis: factory_utc_inferred` means the UTC time is inferred \
+from the API's factory clock. The LibreLinkUp graph covers about 12 hours, so stats and trends \
+for a day or more are labeled `partial`; report the observed span from `coverage` rather than \
+the requested period. Results are descriptive only: do not diagnose, recommend treatment, or \
+infer meals. Credentials are never accepted through MCP; direct users to the local `setup` command.";
 
 fn sensor_activation_time(epoch_seconds: i32, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     // Sensor a is an epoch-seconds field in observed LibreLinkUp payloads.
@@ -440,7 +462,7 @@ fn invalid_window(value: u32, max: u32) -> bool {
     value == 0 || value > max
 }
 
-#[tool_router(server_handler)]
+#[tool_router]
 impl LibreMcp {
     #[tool(
         description = "Get the latest available glucose reading with its source timestamp and freshness. An unknown or stale reading is not real-time data."
@@ -623,8 +645,8 @@ impl LibreMcp {
             .map(|active| {
                 let activation_time = sensor_activation_time(active.sensor.a, Utc::now());
                 serde_json::json!({
-                    "device_id": nonempty(&active.sensor.device_id),
-                    "serial_number": nonempty(&active.sensor.sn),
+                    "device_id_masked": masked_identifier(&active.sensor.device_id),
+                    "serial_number_masked": masked_identifier(&active.sensor.sn),
                     "source_activation_epoch_seconds": activation_time.map(|_| active.sensor.a),
                     "activation_time": activation_time,
                     "activation_time_basis": activation_time.map(|_| "source_epoch_seconds_interpreted"),
@@ -707,6 +729,18 @@ impl LibreMcp {
     }
 }
 
+#[tool_handler]
+impl ServerHandler for LibreMcp {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(
+                Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+                    .with_title("LibreLinkUp MCP (Rust)"),
+            )
+            .with_instructions(SERVER_INSTRUCTIONS)
+    }
+}
+
 pub(crate) async fn serve() -> Result<(), &'static str> {
     let service = LibreMcp
         .serve(stdio())
@@ -749,6 +783,28 @@ mod tests {
         assert!(!schema.contains("password"));
         assert!(!schema.contains("token"));
         assert!(schema.contains("\"additionalProperties\":false"));
+    }
+
+    #[test]
+    fn server_identifies_itself_and_explains_freshness() {
+        let info = LibreMcp.get_info();
+        assert_eq!(info.server_info.name, "librelink-mcp-rs");
+        assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
+        let instructions = info.instructions.unwrap();
+        assert!(instructions.contains("freshness"));
+        assert!(instructions.contains("partial"));
+        assert!(info.capabilities.tools.is_some());
+    }
+
+    #[test]
+    fn sensor_identifiers_are_masked_to_four_characters() {
+        assert_eq!(masked_identifier("0U28SYNTH9").as_deref(), Some("****NTH9"));
+        assert_eq!(masked_identifier("ab1").as_deref(), Some("****"));
+        assert_eq!(masked_identifier("  "), None);
+        assert_eq!(
+            masked_identifier("01a15fb1-0000-0000-0000-00000000abcd").as_deref(),
+            Some("****abcd")
+        );
     }
 
     #[test]

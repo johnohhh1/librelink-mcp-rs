@@ -351,7 +351,11 @@ fn load_credentials() -> Result<Credentials, &'static str> {
     let stored = match keyring_entry()?.get_password() {
         Ok(value) => Zeroizing::new(value),
         Err(KeyringError::NoEntry) => return Err("No credentials found. Run `setup` locally."),
-        Err(_) => return Err("Unable to read the OS credential store."),
+        Err(_) => {
+            return Err(
+                "Unable to read the OS credential store. On Linux, a Secret Service keyring (such as GNOME Keyring or KWallet) must be running and unlocked in the user's session.",
+            );
+        }
     };
     serde_json::from_str(&stored).map_err(|_| "Stored credentials have an unsupported format.")
 }
@@ -507,8 +511,64 @@ async fn check() -> Result<(), &'static str> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() {
+/// On Linux the keyring talks to Secret Service over the D-Bus session bus.
+/// MCP clients started outside a desktop session often lack
+/// DBUS_SESSION_BUS_ADDRESS even though the user's bus socket exists. Returns
+/// the address to use, or None when it is already set or no usable socket exists.
+#[cfg(target_os = "linux")]
+fn session_bus_fallback(
+    existing: Option<std::ffi::OsString>,
+    uid: u32,
+    socket_is_owned_by_uid: impl Fn(&str) -> bool,
+) -> Option<String> {
+    if existing.is_some_and(|value| !value.is_empty()) {
+        return None;
+    }
+    let socket = format!("/run/user/{uid}/bus");
+    socket_is_owned_by_uid(&socket).then(|| format!("unix:path={socket}"))
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_session_bus() {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let Ok(process) = std::fs::metadata("/proc/self") else {
+        return;
+    };
+    let uid = process.uid();
+    let address = session_bus_fallback(
+        std::env::var_os("DBUS_SESSION_BUS_ADDRESS"),
+        uid,
+        |socket| {
+            std::fs::metadata(socket)
+                .is_ok_and(|meta| meta.file_type().is_socket() && meta.uid() == uid)
+        },
+    );
+    if let Some(address) = address {
+        // SAFETY: called first thing in main, before the Tokio runtime or any
+        // other thread exists, so nothing can read the environment concurrently.
+        unsafe { std::env::set_var("DBUS_SESSION_BUS_ADDRESS", address) };
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_session_bus() {}
+
+fn main() {
+    ensure_session_bus();
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(_) => {
+            eprintln!("Unable to start the async runtime.");
+            std::process::exit(1);
+        }
+    };
+    runtime.block_on(run());
+}
+
+async fn run() {
     let args: Vec<String> = std::env::args().collect();
     let result = match args.as_slice() {
         [_, command] if command == "setup" => setup(),
@@ -543,6 +603,25 @@ mod tests {
             serde_json::from_str(r#"{"target_low":70,"target_high":180,"patient_name":null}"#)
                 .unwrap();
         assert_eq!(old_settings.api_version, "4.16.0");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn session_bus_fallback_only_fills_a_missing_address() {
+        let owned = |_: &str| true;
+        assert_eq!(
+            session_bus_fallback(None, 1000, owned).as_deref(),
+            Some("unix:path=/run/user/1000/bus")
+        );
+        assert_eq!(
+            session_bus_fallback(Some("".into()), 1000, owned).as_deref(),
+            Some("unix:path=/run/user/1000/bus")
+        );
+        assert_eq!(
+            session_bus_fallback(Some("unix:path=/custom".into()), 1000, owned),
+            None
+        );
+        assert_eq!(session_bus_fallback(None, 1000, |_| false), None);
     }
 
     #[test]
