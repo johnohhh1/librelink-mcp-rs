@@ -25,11 +25,17 @@ pub(crate) struct Cooldown {
     pub error: FetchError,
 }
 
-/// A rejected password cannot fix itself while the server holds the same
-/// credentials, and each retry is another failed login that moves the account
-/// toward an Abbott lockout. Latch it until restart instead of retrying.
+/// Errors that cannot fix themselves while the server keeps its current
+/// configuration latch until restart instead of retrying:
+/// - a rejected password: each retry is another failed login that moves the
+///   account toward an Abbott lockout;
+/// - a rejected client version: the version is read at startup;
+/// - rejected request headers: a client bug that a retry repeats.
 pub(crate) fn latches_until_restart(error: &FetchError) -> bool {
-    error.code == "authentication_failed"
+    matches!(
+        error.code,
+        "authentication_failed" | "client_version_rejected" | "request_rejected"
+    )
 }
 
 /// Local configuration problems (no credentials yet, bad stored settings)

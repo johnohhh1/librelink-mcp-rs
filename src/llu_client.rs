@@ -163,7 +163,7 @@ const ACTION_REQUIRED: FetchError = error(
 );
 const REQUEST_REJECTED: FetchError = final_error(
     "request_rejected",
-    "LibreLinkUp rejected this client's request headers. This needs a client update; retrying will not help.",
+    "LibreLinkUp rejected this client's request headers. This is a bug in librelink-mcp-rs: please report it, without account details. No further requests will be made until the server is restarted.",
 );
 /// A candidate retirement signal, not proof that the API was retired.
 const API_CHANGED: FetchError = error(
@@ -204,10 +204,10 @@ fn plain_version(text: &str) -> bool {
 fn version_rejected(minimum: Option<&str>) -> FetchError {
     let message = match minimum.filter(|version| plain_version(version)) {
         Some(version) => Cow::Owned(format!(
-            "LibreLinkUp requires a newer client version (minimum {version}). Run `set-api-version` locally, then restart the server."
+            "LibreLinkUp requires a newer client version (minimum {version}). Run `set-api-version` locally, then restart the server; no further requests will be made until then."
         )),
         None => Cow::Borrowed(
-            "LibreLinkUp requires a newer client version. Run `set-api-version` locally, then restart the server.",
+            "LibreLinkUp requires a newer client version. Run `set-api-version` locally, then restart the server; no further requests will be made until then.",
         ),
     };
     FetchError {
@@ -1356,6 +1356,56 @@ mod tests {
         ] {
             let (error, _) = graph_failure(response).await;
             assert!(!error.message.contains(marker));
+        }
+    }
+
+    #[test]
+    fn unfixable_rejections_latch_until_restart() {
+        use crate::fetch::{Cooldown, cooldown_active, cooldown_until, latches_until_restart};
+        use std::time::{Duration as StdDuration, Instant};
+        let now = Instant::now();
+        for error in [
+            BAD_CREDENTIALS,
+            version_rejected(Some("4.17.0")),
+            REQUEST_REJECTED,
+        ] {
+            assert!(latches_until_restart(&error), "{}", error.code);
+            assert!(error.message.contains("restart"), "{}", error.code);
+            let latched = Cooldown {
+                until: cooldown_until(&error, now),
+                error,
+            };
+            assert!(latched.until.is_none());
+            assert!(cooldown_active(
+                &latched,
+                now + StdDuration::from_secs(86_400)
+            ));
+        }
+        assert!(version_rejected(None).message.contains("set-api-version"));
+        assert!(REQUEST_REJECTED.message.contains("report"));
+        // Temporary failures still expire.
+        assert!(!latches_until_restart(&rate_limited(Some(120))));
+        assert!(!latches_until_restart(&UNAVAILABLE));
+    }
+
+    #[tokio::test]
+    async fn fetcher_makes_no_further_requests_after_a_latched_rejection() {
+        use crate::fetch::Fetcher;
+        for (status, body) in [
+            (
+                403,
+                json!({ "status": 920, "data": { "minimumVersion": "4.17.0" } }),
+            ),
+            (400, json!({ "message": "RequiredHeaderMissing" })),
+        ] {
+            let server = MockServer::start().await;
+            mount(&server, "POST", LOGIN_PATH, json_reply(status, body)).await;
+            let fetcher = Fetcher::new(Box::new(client(&server)));
+            let first = fetcher.fetch().await.unwrap_err();
+            let second = fetcher.fetch().await.unwrap_err();
+            assert_eq!(first.code, second.code);
+            assert_eq!(second.retry_after_seconds, None);
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
         }
     }
 
