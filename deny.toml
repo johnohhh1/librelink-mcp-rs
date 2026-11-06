@@ -1,0 +1,59 @@
+# Supply-chain gate, run in CI with `cargo deny check`.
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# Every target the release builds for, so platform-only crates are checked.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+
+[advisories]
+# Security advisories fail the build, as do yanked versions.
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Permissive licenses compatible with the project's MIT license only.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.9
+
+# option-ext is MPL-2.0: file-level copyleft, which allows use in an MIT
+# binary as long as option-ext's own files stay MPL-2.0 and their source is
+# available (it is, unmodified, on crates.io). It reaches us only through
+# directories -> dirs-sys, which locate the platform data directory; that
+# location is part of the database path existing users already have, so
+# replacing the crate would move their data. Allowed for this crate only.
+[[licenses.exceptions]]
+crate = "option-ext"
+allow = ["MPL-2.0"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Duplicate versions that come from upstream crates and cannot be unified
+# here. Each is a build-size cost only.
+skip = [
+    # syn 2 is used by jni-macros (reqwest -> rustls-platform-verifier ->
+    # jni); everything else uses syn 3.
+    { crate = "syn@2", reason = "jni-macros, via reqwest's platform verifier, still uses syn 2" },
+    # keyring 3.6 pins windows-sys 0.60; tokio and others use 0.61.
+    { crate = "windows-sys@0.60", reason = "keyring 3.6 depends on windows-sys 0.60" },
+]
+
+[sources]
+# crates.io only: no other registries and no git dependencies.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -568,7 +568,7 @@ impl Store {
         let mut hasher = Sha256::new();
         hasher.update(self.salt);
         hasher.update(patient_id.as_bytes());
-        format!("{:x}", hasher.finalize())
+        crate::source::lower_hex(&hasher.finalize())
     }
 
     /// Stores the snapshot's graph and current reading, ignoring readings
@@ -1128,7 +1128,10 @@ mod tests {
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         );
         // Not the unsalted hash.
-        assert_ne!(key, format!("{:x}", Sha256::digest(PATIENT.as_bytes())));
+        assert_ne!(
+            key,
+            crate::source::lower_hex(&Sha256::digest(PATIENT.as_bytes()))
+        );
     }
 
     #[test]

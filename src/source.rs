@@ -58,6 +58,11 @@ pub(crate) trait DataSource: Send + Sync {
 
 /// Sensor serial numbers and device IDs identify a person's hardware. Only the
 /// last four characters are kept, which is enough to tell sensors apart.
+/// Lowercase hex of `bytes`, as used for hashed identifiers.
+pub(crate) fn lower_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 pub(crate) fn masked_identifier(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {

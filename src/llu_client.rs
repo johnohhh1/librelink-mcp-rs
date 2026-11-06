@@ -465,7 +465,7 @@ fn parse<T: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<T, FetchError> {
 }
 
 fn account_id_hash(user_id: &str) -> String {
-    format!("{:x}", Sha256::digest(user_id.as_bytes()))
+    crate::source::lower_hex(&Sha256::digest(user_id.as_bytes()))
 }
 
 impl LluClient {
