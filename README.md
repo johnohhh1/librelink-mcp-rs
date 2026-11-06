@@ -23,7 +23,7 @@ This independent port preserves the **eight MCP tool names** from [Amandeep Khur
 | **Platforms** | Linux, macOS, and Windows CI builds and tests |
 | **Secrets** | OS credential store; no plaintext fallback or MCP password arguments |
 | **Readings** | Source timestamps retained; factory UTC interpretation labeled as inferred |
-| **History** | Graph points, observed span, estimated cadence, and gaps; API completeness remains unverified |
+| **History** | About 12 hours from the live graph, or the requested window from the optional local collector; observed span, cadence, and labeled gaps |
 | **Analytics** | Statistics over a graph shorter than requested are labeled `partial`; GMI and time-weighted time in range unavailable |
 
 ## Quick start
@@ -77,7 +77,7 @@ The server reuses its authenticated API client. Restart it after changing creden
 | `configure_ranges` | Validates and saves local target bounds in mg/dL |
 | `validate_connection` | Connection and data-availability status without glucose values or secrets |
 
-Tool replies contain MCP `structuredContent` plus a JSON text block for clients that only display text. Errors set `isError: true` and use safe codes including `invalid_input`, `insufficient_data`, `rate_limited`, `timeout`, `session_expired`, `authentication_failed`, `account_action_required`, `client_version_rejected` (Abbott requires a newer client version; run `set-api-version`), `request_rejected` (the API refused this client's request headers; please report it as a bug), `api_changed`, and `upstream_unavailable`. `api_changed` means a successful response was not JSON: the API may have changed or been retired, but it is not proof of either. After `authentication_failed`, `client_version_rejected`, or `request_rejected`, the server makes no further LibreLinkUp requests until it is restarted, so a wrong password cannot drive the account into an Abbott lockout. The client logs in only when it has no valid session or after a 401, and never because of throttling or other errors. Rate-limit replies include `retry_after_seconds`. Upstream response bodies and tokens are never included in error messages.
+Tool replies contain MCP `structuredContent` plus a JSON text block for clients that only display text. Errors set `isError: true` and use safe codes including `invalid_input`, `insufficient_data`, `rate_limited`, `timeout`, `session_expired`, `authentication_failed`, `account_action_required`, `client_version_rejected` (Abbott requires a newer client version; run `set-api-version`), `request_rejected` (the API refused this client's request headers; please report it as a bug), `api_changed`, `local_store_unavailable` (the collector's database could not be read), and `upstream_unavailable`. `api_changed` means a successful response was not JSON: the API may have changed or been retired, but it is not proof of either. After `authentication_failed`, `client_version_rejected`, or `request_rejected`, the server makes no further LibreLinkUp requests until it is restarted, so a wrong password cannot drive the account into an Abbott lockout. The client logs in only when it has no valid session or after a 401, and never because of throttling or other errors. Rate-limit replies include `retry_after_seconds`. Upstream response bodies and tokens are never included in error messages.
 
 ## Data quality
 
@@ -93,14 +93,14 @@ The LibreLinkUp graph covers only about 12 hours. The opt-in `collect` command p
 cargo run -- collect
 ```
 
-It runs in the foreground until Ctrl+C, allows one collector per database, and stops with exit status 78 on errors a retry cannot fix. `serve` does not read the database yet; that arrives later in v0.3. See the [collector guide](docs/collector.md) for options, what is and isn't stored, and a systemd user service example.
+It runs in the foreground until Ctrl+C, allows one collector per database, and stops with exit status 78 on errors a retry cannot fix. While a collector is running (its heartbeat is under 3 minutes old), `serve` answers every data tool from the database and makes no LibreLinkUp requests; otherwise it uses the live API. Every data reply says which in `data_source` (`local_store` or `live_api`), and stored data is only as fresh as the collector. Both commands accept `--db <path>`. See the [collector guide](docs/collector.md) for options, what is and isn't stored, and a systemd user service example.
 
 ## Privacy and local data
 
 - Credentials live in the OS credential store. There is no plaintext file fallback, command-line password flag, or MCP secret input.
 - `serve` does not persist glucose history. The opt-in `collect` command stores readings in a local SQLite database: values and timestamps keyed by a salted patient pseudonym, with no credentials, tokens, names, or raw patient IDs. Nothing is uploaded. See [what the collector stores](docs/collector.md#privacy).
 - Successful graph reads are cached in memory for 60 seconds. Detected rate limits and account lockouts trigger a cooldown, using the server's retry time within 60 to 900 seconds; other upstream failures also pause calls for 60 seconds. Cached readings keep their original retrieval time.
-- `cargo run -- clear-local-data` removes this project's credential and preference entries from the OS store, and the collector's default database. It refuses while a collector is running. Stop the server first; run `setup` again to reconnect.
+- `cargo run -- clear-local-data [--db <path>]` removes this project's credential and preference entries from the OS store, and the collector's database. It refuses while a collector holds that database's lock. Stop the server first; run `setup` again to reconnect.
 - The `.gitignore` excludes local configuration, data exports, databases, logs, and key files. Tests use synthetic fixtures only.
 
 On headless Linux systems without Secret Service, `setup` fails closed. If you used the original server, its `~/.librelink-mcp/config.json` may contain a plaintext password; this port does not read, migrate, or delete that file.

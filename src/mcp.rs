@@ -1,7 +1,8 @@
 use crate::{
     fetch::{FetchError, Fetcher},
     load_settings, save_settings,
-    source::GlucoseSample,
+    source::{GlucoseSample, SensorSummary, sensor_activation_time},
+    store::{CollectorStatus, Origin, Store, StoreResult, StoredReading},
     time::{STALE_AFTER_MINUTES, TimeAssessment, TimeBasis, assess_time, assess_time_at},
 };
 use chrono::{DateTime, Duration, Utc};
@@ -14,24 +15,123 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
-/// The MCP server. Tools read only through `fetcher`, so they work with any
-/// `DataSource`.
+/// The MCP server. Each data tool call reads from the local store while a
+/// collector is running, and through `fetcher` (any `DataSource`) otherwise.
 #[derive(Clone)]
 pub(crate) struct LibreMcp {
     fetcher: Arc<Fetcher>,
+    /// The collector's database, if any.
+    db: Option<PathBuf>,
     /// Tests use fixed target bounds instead of reading the OS keyring.
     #[cfg(test)]
     fixed_ranges: Option<(u16, u16)>,
+}
+
+const LIVE_API: &str = "live_api";
+const LOCAL_STORE: &str = "local_store";
+/// A collector heartbeat younger than this means a collector is running.
+const COLLECTOR_FRESH_SECONDS: i64 = 180;
+/// Tolerated heartbeat clock skew into the future.
+const COLLECTOR_FUTURE_TOLERANCE_SECONDS: i64 = 60;
+
+fn collector_running(heartbeat_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    let age = now.signed_duration_since(heartbeat_at).num_seconds();
+    age < COLLECTOR_FRESH_SECONDS && age > -COLLECTOR_FUTURE_TOLERANCE_SECONDS
+}
+
+/// Where one tool call reads from.
+enum DataPath {
+    Live,
+    Local(LocalStore),
+}
+
+/// An open store with a running collector. Queries run on the blocking pool
+/// and never contact LibreLinkUp.
+struct LocalStore {
+    store: Arc<Mutex<Store>>,
+    status: CollectorStatus,
+}
+
+impl LocalStore {
+    async fn query<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&Store, Option<&str>) -> StoreResult<T> + Send + 'static,
+    ) -> Result<T, CallToolResult> {
+        let store = Arc::clone(&self.store);
+        let key = self.status.patient_key.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let store = store
+                .lock()
+                .map_err(|_| "The local database is unavailable.")?;
+            operation(&store, key.as_deref())
+        })
+        .await
+        .unwrap_or(Err("The local database task failed."));
+        result.map_err(|message| failure_code("local_store_unavailable", message))
+    }
+
+    /// Readings in the window and the poll times inside it.
+    async fn window(
+        &self,
+        hours: i64,
+        now: DateTime<Utc>,
+    ) -> Result<(Vec<StoredReading>, Vec<DateTime<Utc>>), CallToolResult> {
+        let from = now - Duration::hours(hours);
+        self.query(move |store, key| match key {
+            Some(key) => Ok((
+                store.readings_for_key(key, from, now)?,
+                store.poll_times(from, now)?,
+            )),
+            None => Ok((vec![], vec![])),
+        })
+        .await
+    }
 }
 
 impl LibreMcp {
     pub(crate) fn new(fetcher: Fetcher) -> Self {
         Self {
             fetcher: Arc::new(fetcher),
+            db: None,
             #[cfg(test)]
             fixed_ranges: None,
+        }
+    }
+
+    pub(crate) fn with_store(mut self, db: Option<PathBuf>) -> Self {
+        self.db = db;
+        self
+    }
+
+    /// Chooses the data source for one call: the store while its collector
+    /// heartbeat is fresh, otherwise the live API. Any store problem falls
+    /// back to the live API.
+    async fn data_path(&self) -> DataPath {
+        let Some(db) = self.db.clone() else {
+            return DataPath::Live;
+        };
+        let opened = tokio::task::spawn_blocking(move || {
+            if !db.exists() {
+                return None;
+            }
+            let store = Store::open(&db).ok()?;
+            let status = store.collector_status().ok()??;
+            Some((store, status))
+        })
+        .await
+        .ok()
+        .flatten();
+        match opened {
+            Some((store, status)) if collector_running(status.heartbeat.at, Utc::now()) => {
+                DataPath::Local(LocalStore {
+                    store: Arc::new(Mutex::new(store)),
+                    status,
+                })
+            }
+            _ => DataPath::Live,
         }
     }
 
@@ -99,6 +199,7 @@ struct Reading {
     time: TimeAssessment,
     trend: Option<&'static str>,
     cache_hit: bool,
+    data_source: &'static str,
 }
 
 #[derive(Serialize)]
@@ -106,6 +207,9 @@ struct GraphGap {
     from_utc: DateTime<Utc>,
     to_utc: DateTime<Utc>,
     duration_minutes: f64,
+    /// Local store only: `collector_not_running` or `no_data_from_api`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cause: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -166,7 +270,78 @@ fn observed_rates(items: &[&GlucoseSample], now: DateTime<Utc>) -> RateSummary {
     }
 }
 
+/// How coverage is computed for one data source.
+#[derive(Clone, Copy)]
+struct CoverageOptions {
+    source: &'static str,
+    /// Use this cadence instead of estimating one from all intervals.
+    cadence_seconds: Option<i64>,
+}
+
+const LIVE_COVERAGE: CoverageOptions = CoverageOptions {
+    source: "librelinkup_graph",
+    cadence_seconds: None,
+};
+
 fn graph_coverage(items: &[GlucoseSample], hours: i64, now: DateTime<Utc>) -> GraphCoverage {
+    coverage_with(items, hours, now, LIVE_COVERAGE)
+}
+
+/// The median interval between graph-origin readings. Stored data mixes
+/// 15-minute graph points with minute-by-minute current readings; the graph
+/// cadence is the one that defines a gap.
+fn graph_cadence_seconds(readings: &[StoredReading], now: DateTime<Utc>) -> Option<i64> {
+    let mut times: Vec<_> = readings
+        .iter()
+        .filter(|reading| reading.origin == Origin::Graph)
+        .filter_map(|reading| {
+            assess_time(
+                Some(&reading.sample.timestamp),
+                Some(&reading.sample.factory_timestamp),
+                now,
+            )
+            .observed_at_utc
+        })
+        .collect();
+    times.sort_unstable();
+    let mut intervals: Vec<i64> = times
+        .windows(2)
+        .map(|pair| pair[1].signed_duration_since(pair[0]).num_seconds())
+        .filter(|seconds| *seconds >= 60 && *seconds <= 3600)
+        .collect();
+    intervals.sort_unstable();
+    (intervals.len() >= 2).then(|| intervals[intervals.len() / 2])
+}
+
+fn local_coverage(readings: &[StoredReading], now: DateTime<Utc>) -> CoverageOptions {
+    CoverageOptions {
+        source: LOCAL_STORE,
+        cadence_seconds: graph_cadence_seconds(readings, now),
+    }
+}
+
+/// Labels each listed interior gap: no poll attempt inside it means the
+/// collector was not running; attempts without readings mean the API had
+/// no data for that span.
+fn classify_gaps(coverage: &mut GraphCoverage, poll_times: &[DateTime<Utc>]) {
+    for gap in &mut coverage.interior_gaps {
+        let polled = poll_times
+            .iter()
+            .any(|time| *time > gap.from_utc && *time < gap.to_utc);
+        gap.cause = Some(if polled {
+            "no_data_from_api"
+        } else {
+            "collector_not_running"
+        });
+    }
+}
+
+fn coverage_with(
+    items: &[GlucoseSample],
+    hours: i64,
+    now: DateTime<Utc>,
+    options: CoverageOptions,
+) -> GraphCoverage {
     let cutoff = now - Duration::hours(hours);
     let assessed: Vec<_> = items
         .iter()
@@ -178,7 +353,7 @@ fn graph_coverage(items: &[GlucoseSample], hours: i64, now: DateTime<Utc>) -> Gr
             .all(|time| time.observed_at_utc.is_some_and(|observed| observed <= now));
     if !usable {
         return GraphCoverage {
-            source: "librelinkup_graph",
+            source: options.source,
             requested_hours: hours,
             first_observed_at_utc: None,
             last_observed_at_utc: None,
@@ -212,7 +387,9 @@ fn graph_coverage(items: &[GlucoseSample], hours: i64, now: DateTime<Utc>) -> Gr
         .filter(|seconds| *seconds >= 60 && *seconds <= 3600)
         .collect();
     intervals.sort_unstable();
-    let cadence_seconds = (intervals.len() >= 2).then(|| intervals[intervals.len() / 2]);
+    let cadence_seconds = options
+        .cadence_seconds
+        .or_else(|| (intervals.len() >= 2).then(|| intervals[intervals.len() / 2]));
     let mut interior_gaps = Vec::new();
     let mut interior_gap_count = 0;
     if let Some(cadence) = cadence_seconds {
@@ -225,6 +402,7 @@ fn graph_coverage(items: &[GlucoseSample], hours: i64, now: DateTime<Utc>) -> Gr
                         from_utc: pair[0],
                         to_utc: pair[1],
                         duration_minutes: seconds as f64 / 60.0,
+                        cause: None,
                     });
                 }
             }
@@ -238,7 +416,7 @@ fn graph_coverage(items: &[GlucoseSample], hours: i64, now: DateTime<Utc>) -> Gr
             && interior_gap_count == 0
     });
     GraphCoverage {
-        source: "librelinkup_graph",
+        source: options.source,
         requested_hours: hours,
         first_observed_at_utc: Some(first),
         last_observed_at_utc: Some(last),
@@ -255,38 +433,34 @@ fn graph_coverage(items: &[GlucoseSample], hours: i64, now: DateTime<Utc>) -> Gr
     }
 }
 
-/// Sensor serial numbers and device IDs identify a person's hardware. Only the
-/// last four characters go to the model, which is enough to tell sensors apart.
-fn masked_identifier(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let chars: Vec<char> = trimmed.chars().collect();
-    if chars.len() <= 4 {
-        return Some("****".to_owned());
-    }
-    let tail: String = chars[chars.len() - 4..].iter().collect();
-    Some(format!("****{tail}"))
-}
-
 const SERVER_INSTRUCTIONS: &str = "Unofficial, read-only access to LibreLinkUp follower data. \
 Glucose values are mg/dL. Only get_current_glucose reports freshness: treat `stale` or `unknown` \
 as not real-time and say so. `time_basis: factory_utc_inferred` means the UTC time is inferred \
 from the API's factory clock. The LibreLinkUp graph covers about 12 hours, so stats and trends \
 for a day or more are labeled `partial`; report the observed span from `coverage` rather than \
 the requested period. Results are descriptive only: do not diagnose, recommend treatment, or \
-infer meals. Credentials are never accepted through MCP; direct users to the local `setup` command.";
+infer meals. Credentials are never accepted through MCP; direct users to the local `setup` command. \
+Every data reply has `data_source`: `live_api` (read from LibreLinkUp now) or `local_store` (read \
+from the local collector's database). `local_store` data is only as fresh as the collector's last \
+successful poll; check freshness and coverage before calling a reading current.";
 
-fn sensor_activation_time(epoch_seconds: i32, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    // Sensor a is an epoch-seconds field in observed LibreLinkUp payloads.
-    // Reject a days-since-start value or a clock that has not happened yet.
-    const FIRST_PLAUSIBLE_ACTIVATION: i64 = 1_388_534_400; // 2014-01-01 UTC
-    let seconds = i64::from(epoch_seconds);
-    (seconds >= FIRST_PLAUSIBLE_ACTIVATION)
-        .then(|| DateTime::<Utc>::from_timestamp(seconds, 0))
-        .flatten()
-        .filter(|time| *time <= now)
+/// The tool form of one sensor, from either data source.
+fn sensor_json(sensor: &SensorSummary, now: DateTime<Utc>) -> serde_json::Value {
+    let epoch = sensor
+        .activation_epoch_seconds
+        .filter(|epoch| sensor_activation_time(*epoch, now).is_some());
+    let activation_time = epoch.and_then(|epoch| sensor_activation_time(epoch, now));
+    serde_json::json!({
+        "device_id_masked": sensor.device_id_masked,
+        "serial_number_masked": sensor.serial_number_masked,
+        "source_activation_epoch_seconds": epoch,
+        "activation_time": activation_time,
+        "activation_time_basis": activation_time.map(|_| "source_epoch_seconds_interpreted"),
+        "warmup_minutes": sensor.warmup_minutes,
+        "product_type_code": sensor.product_type_code,
+        "device_type": null,
+        "remaining_life": null,
+    })
 }
 
 fn value(value: f64) -> (Option<f64>, ValueQuality) {
@@ -435,8 +609,18 @@ fn summarize_stats(
     target_high: u16,
     now: DateTime<Utc>,
 ) -> Result<serde_json::Value, CallToolResult> {
+    let coverage = graph_coverage(graph, i64::from(days) * 24, now);
+    summarize_stats_with(graph, days, (target_low, target_high), now, coverage)
+}
+
+fn summarize_stats_with(
+    graph: &[GlucoseSample],
+    days: u8,
+    (target_low, target_high): (u16, u16),
+    now: DateTime<Utc>,
+    coverage: GraphCoverage,
+) -> Result<serde_json::Value, CallToolResult> {
     let hours = i64::from(days) * 24;
-    let coverage = graph_coverage(graph, hours, now);
     let (items, window_filter_applied) = select_graph_window(graph, hours, now);
     let values: Vec<f64> = items
         .iter()
@@ -489,8 +673,248 @@ fn summarize_stats(
     }))
 }
 
+fn summarize_trends(
+    period: &str,
+    hours: i64,
+    points: &[GlucoseSample],
+    coverage: GraphCoverage,
+    now: DateTime<Utc>,
+) -> serde_json::Value {
+    let (items, window_filter_applied) = select_graph_window(points, hours, now);
+    let rates = observed_rates(&items, now);
+    let values: Vec<f64> = items
+        .iter()
+        .map(|item| item.value_in_mg_per_dl)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .collect();
+    let min = values.iter().copied().reduce(f64::min);
+    let max = values.iter().copied().reduce(f64::max);
+    let mut falling = 0;
+    let mut stable = 0;
+    let mut rising = 0;
+    let mut unknown = 0;
+    for item in &items {
+        match trend(item.trend_arrow) {
+            Some("falling_fast" | "falling") => falling += 1,
+            Some("stable") => stable += 1,
+            Some("rising" | "rising_fast") => rising += 1,
+            _ => unknown += 1,
+        }
+    }
+    serde_json::json!({
+        "requested_period": period,
+        "window_verified": false,
+        "window_filter_applied": window_filter_applied,
+        "coverage": coverage,
+        "period_status": if coverage.period_span_sufficient { "sample_summary" } else { "partial" },
+        "sample_count": values.len(),
+        "observed_min_mg_dl": min,
+        "observed_max_mg_dl": max,
+        "trend_arrow_counts": {
+            "falling": falling, "stable": stable, "rising": rising, "unknown": unknown
+        },
+        "adjacent_point_rates": rates,
+        "dawn_phenomenon": null,
+        "meal_response_average": null,
+        "overnight_stability": null,
+        "reason": "Rates are descriptive changes between returned graph points, not source trend arrows or treatment guidance. The graph does not contain meal and sleep context.",
+    })
+}
+
 fn invalid_window(value: u32, max: u32) -> bool {
     value == 0 || value > max
+}
+
+// --- Local store paths. None of these contact LibreLinkUp. ---------------
+
+fn point_source(origin: Origin) -> PointSource {
+    match origin {
+        Origin::Graph => PointSource::Graph,
+        Origin::CurrentMeasurement => PointSource::CurrentMeasurement,
+    }
+}
+
+fn samples(readings: &[StoredReading]) -> Vec<GlucoseSample> {
+    readings
+        .iter()
+        .map(|reading| reading.sample.clone())
+        .collect()
+}
+
+async fn local_current(local: &LocalStore) -> CallToolResult {
+    let latest = match local
+        .query(|store, key| key.map_or(Ok(None), |key| store.latest_reading(key)))
+        .await
+    {
+        Ok(latest) => latest,
+        Err(error) => return error,
+    };
+    let now = Utc::now();
+    let reading = match latest {
+        Some(reading) => {
+            let (glucose_mg_dl, value_quality) = value(reading.sample.value_in_mg_per_dl);
+            Reading {
+                glucose_mg_dl,
+                value_quality,
+                // Retrieval time is when the collector first stored it, so a
+                // lagging collector shows `stale` honestly.
+                time: assess_time_at(
+                    Some(&reading.sample.timestamp),
+                    Some(&reading.sample.factory_timestamp),
+                    reading.first_seen_utc,
+                    now,
+                ),
+                trend: trend(reading.sample.trend_arrow),
+                cache_hit: false,
+                data_source: LOCAL_STORE,
+            }
+        }
+        None => Reading {
+            glucose_mg_dl: None,
+            value_quality: ValueQuality::Missing,
+            time: assess_time_at(None, None, local.status.heartbeat.at, now),
+            trend: None,
+            cache_hit: false,
+            data_source: LOCAL_STORE,
+        },
+    };
+    success(reading)
+}
+
+async fn local_history(local: &LocalStore, hours: u16) -> CallToolResult {
+    let now = Utc::now();
+    let hours_i64 = i64::from(hours);
+    let (readings, polls) = match local.window(hours_i64, now).await {
+        Ok(window) => window,
+        Err(error) => return error,
+    };
+    let mut coverage = coverage_with(
+        &samples(&readings),
+        hours_i64,
+        now,
+        local_coverage(&readings, now),
+    );
+    classify_gaps(&mut coverage, &polls);
+    let points: Vec<HistoryPoint> = readings
+        .iter()
+        .map(|reading| history_point(&reading.sample, point_source(reading.origin), now))
+        .collect();
+    success(serde_json::json!({
+        "requested_hours": hours,
+        "window_verified": false,
+        "window_filter_applied": true,
+        "cache_hit": false,
+        "retrieved_at_utc": readings.iter().map(|reading| reading.first_seen_utc).max(),
+        "current_measurement_appended": readings
+            .iter()
+            .any(|reading| reading.origin == Origin::CurrentMeasurement),
+        "coverage": coverage,
+        "reason": "Readings come from the local collector's store, filtered by their UTC timestamps. Coverage and gaps show where the store has no data.",
+        "total_readings": points.len(),
+        "readings": points,
+        "data_source": LOCAL_STORE,
+    }))
+}
+
+async fn local_stats(local: &LocalStore, days: u8, range: (u16, u16)) -> CallToolResult {
+    let now = Utc::now();
+    let hours = i64::from(days) * 24;
+    let (readings, polls) = match local.window(hours, now).await {
+        Ok(window) => window,
+        Err(error) => return error,
+    };
+    let points = samples(&readings);
+    let mut coverage = coverage_with(&points, hours, now, local_coverage(&readings, now));
+    classify_gaps(&mut coverage, &polls);
+    match summarize_stats_with(&points, days, range, now, coverage) {
+        Ok(mut body) => {
+            body["reason"] = if body["period_status"] == "partial" {
+                "These statistics describe only the stored readings, which cover less than the requested period; see coverage for the observed span and gaps. Time-weighted range and GMI are unavailable."
+            } else {
+                "These statistics describe stored samples only; samples are not weighted by time. Time-weighted range and GMI are unavailable."
+            }
+            .into();
+            body["cache_hit"] = false.into();
+            body["data_source"] = LOCAL_STORE.into();
+            success(body)
+        }
+        Err(error) => error,
+    }
+}
+
+async fn local_trends(local: &LocalStore, period: &str, hours: i64) -> CallToolResult {
+    let now = Utc::now();
+    let (readings, polls) = match local.window(hours, now).await {
+        Ok(window) => window,
+        Err(error) => return error,
+    };
+    let points = samples(&readings);
+    let mut coverage = coverage_with(&points, hours, now, local_coverage(&readings, now));
+    classify_gaps(&mut coverage, &polls);
+    let mut body = summarize_trends(period, hours, &points, coverage, now);
+    body["reason"] = "Rates are descriptive changes between stored points, not source trend arrows or treatment guidance. The data does not contain meal and sleep context.".into();
+    body["cache_hit"] = false.into();
+    body["data_source"] = LOCAL_STORE.into();
+    success(body)
+}
+
+async fn local_sensors(local: &LocalStore) -> CallToolResult {
+    let sensors = match local.query(|store, _| store.sensors()).await {
+        Ok(sensors) => sensors,
+        Err(error) => return error,
+    };
+    let now = Utc::now();
+    let sensors: Vec<_> = sensors
+        .iter()
+        .map(|sensor| sensor_json(sensor, now))
+        .collect();
+    success(serde_json::json!({
+        "sensor_count": sensors.len(),
+        "active_sensors": sensors,
+        "cache_hit": false,
+        "data_source": LOCAL_STORE,
+    }))
+}
+
+async fn local_validate(local: &LocalStore) -> CallToolResult {
+    let (last_poll, stored, latest) = match local
+        .query(|store, key| {
+            let (count, latest) = match key {
+                Some(key) => (store.reading_count(key)?, store.latest_reading(key)?),
+                None => (0, None),
+            };
+            Ok((store.last_poll()?, count, latest))
+        })
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => return error,
+    };
+    let now = Utc::now();
+    let reading_time = match &latest {
+        Some(reading) => assess_time_at(
+            Some(&reading.sample.timestamp),
+            Some(&reading.sample.factory_timestamp),
+            reading.first_seen_utc,
+            now,
+        ),
+        None => assess_time_at(None, None, local.status.heartbeat.at, now),
+    };
+    success(serde_json::json!({
+        "collector_running": true,
+        "collector_heartbeat_age_seconds": now
+            .signed_duration_since(local.status.heartbeat.at)
+            .num_seconds()
+            .max(0),
+        "last_poll_outcome": last_poll.as_ref().map(|poll| poll.outcome.as_str()),
+        "last_poll_at_utc": last_poll.as_ref().map(|poll| poll.at),
+        "stored_reading_count": stored,
+        "reading_time": reading_time,
+        "upstream_contacted": false,
+        "cache_hit": false,
+        "stale_threshold_minutes": STALE_AFTER_MINUTES,
+        "data_source": LOCAL_STORE,
+    }))
 }
 
 #[tool_router]
@@ -502,6 +926,9 @@ impl LibreMcp {
         &self,
         Parameters(_args): Parameters<EmptyArgs>,
     ) -> CallToolResult {
+        if let DataPath::Local(local) = self.data_path().await {
+            return local_current(&local).await;
+        }
         let raw = match self.fetcher.fetch().await {
             Ok(raw) => raw,
             Err(error) => return failure_fetch(error),
@@ -519,6 +946,7 @@ impl LibreMcp {
             ),
             trend: trend(item.trend_arrow),
             cache_hit: raw.cache_hit,
+            data_source: LIVE_API,
         })
     }
 
@@ -532,6 +960,9 @@ impl LibreMcp {
         let hours = args.hours.unwrap_or(24);
         if invalid_window(u32::from(hours), 720) {
             return failure_code("invalid_input", "hours must be between 1 and 720.");
+        }
+        if let DataPath::Local(local) = self.data_path().await {
+            return local_history(&local, hours).await;
         }
         let raw = match self.fetcher.fetch().await {
             Ok(raw) => raw,
@@ -569,6 +1000,7 @@ impl LibreMcp {
             },
             "total_readings": readings.len(),
             "readings": readings,
+            "data_source": LIVE_API,
         }))
     }
 
@@ -580,18 +1012,23 @@ impl LibreMcp {
         if invalid_window(u32::from(days), 90) {
             return failure_code("invalid_input", "days must be between 1 and 90.");
         }
+        let range = match self.target_range() {
+            Ok(range) => range,
+            Err(message) => return failure(message),
+        };
+        if let DataPath::Local(local) = self.data_path().await {
+            return local_stats(&local, days, range).await;
+        }
         let raw = match self.fetcher.fetch().await {
             Ok(raw) => raw,
             Err(error) => return failure_fetch(error),
         };
-        let (target_low, target_high) = match self.target_range() {
-            Ok(range) => range,
-            Err(message) => return failure(message),
-        };
+        let (target_low, target_high) = range;
         let (points, _) = points_with_current(&raw.graph, &raw.current);
         match summarize_stats(&points, days, target_low, target_high, Utc::now()) {
             Ok(mut body) => {
                 body["cache_hit"] = serde_json::Value::Bool(raw.cache_hit);
+                body["data_source"] = LIVE_API.into();
                 success(body)
             }
             Err(error) => error,
@@ -607,6 +1044,9 @@ impl LibreMcp {
             Period::Weekly => ("weekly", 7 * 24),
             Period::Monthly => ("monthly", 30 * 24),
         };
+        if let DataPath::Local(local) = self.data_path().await {
+            return local_trends(&local, period, hours).await;
+        }
         let raw = match self.fetcher.fetch().await {
             Ok(raw) => raw,
             Err(error) => return failure_fetch(error),
@@ -614,79 +1054,34 @@ impl LibreMcp {
         let now = Utc::now();
         let (points, _) = points_with_current(&raw.graph, &raw.current);
         let coverage = graph_coverage(&points, hours, now);
-        let (items, window_filter_applied) = select_graph_window(&points, hours, now);
-        let rates = observed_rates(&items, now);
-        let values: Vec<f64> = items
-            .iter()
-            .map(|item| item.value_in_mg_per_dl)
-            .filter(|value| value.is_finite() && *value > 0.0)
-            .collect();
-        let min = values.iter().copied().reduce(f64::min);
-        let max = values.iter().copied().reduce(f64::max);
-        let mut falling = 0;
-        let mut stable = 0;
-        let mut rising = 0;
-        let mut unknown = 0;
-        for item in &items {
-            match trend(item.trend_arrow) {
-                Some("falling_fast" | "falling") => falling += 1,
-                Some("stable") => stable += 1,
-                Some("rising" | "rising_fast") => rising += 1,
-                _ => unknown += 1,
-            }
-        }
-        success(serde_json::json!({
-            "requested_period": period,
-            "window_verified": false,
-            "window_filter_applied": window_filter_applied,
-            "cache_hit": raw.cache_hit,
-            "coverage": coverage,
-            "period_status": if coverage.period_span_sufficient { "sample_summary" } else { "partial" },
-            "sample_count": values.len(),
-            "observed_min_mg_dl": min,
-            "observed_max_mg_dl": max,
-            "trend_arrow_counts": {
-                "falling": falling, "stable": stable, "rising": rising, "unknown": unknown
-            },
-            "adjacent_point_rates": rates,
-            "dawn_phenomenon": null,
-            "meal_response_average": null,
-            "overnight_stability": null,
-            "reason": "Rates are descriptive changes between returned graph points, not source trend arrows or treatment guidance. The graph does not contain meal and sleep context.",
-        }))
+        let mut body = summarize_trends(period, hours, &points, coverage, now);
+        body["cache_hit"] = serde_json::Value::Bool(raw.cache_hit);
+        body["data_source"] = LIVE_API.into();
+        success(body)
     }
 
     #[tool(
         description = "Return source-provided sensor identifiers, activation epoch, warmup minutes, and product type code. Unknown details remain null."
     )]
     async fn get_sensor_info(&self, Parameters(_args): Parameters<EmptyArgs>) -> CallToolResult {
+        if let DataPath::Local(local) = self.data_path().await {
+            return local_sensors(&local).await;
+        }
         let raw = match self.fetcher.fetch().await {
             Ok(raw) => raw,
             Err(error) => return failure_fetch(error),
         };
+        let now = Utc::now();
         let sensors: Vec<_> = raw
             .active_sensors
             .iter()
-            .map(|active| {
-                let activation_time =
-                    sensor_activation_time(active.activation_epoch_seconds, Utc::now());
-                serde_json::json!({
-                    "device_id_masked": masked_identifier(&active.device_id),
-                    "serial_number_masked": masked_identifier(&active.serial_number),
-                    "source_activation_epoch_seconds": activation_time.map(|_| active.activation_epoch_seconds),
-                    "activation_time": activation_time,
-                    "activation_time_basis": activation_time.map(|_| "source_epoch_seconds_interpreted"),
-                    "warmup_minutes": (active.warmup_minutes >= 0).then_some(active.warmup_minutes),
-                    "product_type_code": (active.product_type_code >= 0).then_some(active.product_type_code),
-                    "device_type": null,
-                    "remaining_life": null,
-                })
-            })
+            .map(|active| sensor_json(&SensorSummary::from_record(active, now), now))
             .collect();
         success(serde_json::json!({
             "sensor_count": sensors.len(),
             "active_sensors": sensors,
             "cache_hit": raw.cache_hit,
+            "data_source": LIVE_API,
         }))
     }
 
@@ -735,6 +1130,9 @@ impl LibreMcp {
         &self,
         Parameters(_args): Parameters<EmptyArgs>,
     ) -> CallToolResult {
+        if let DataPath::Local(local) = self.data_path().await {
+            return local_validate(&local).await;
+        }
         let raw = match self.fetcher.fetch().await {
             Ok(raw) => raw,
             Err(error) => return failure_fetch(error),
@@ -751,6 +1149,7 @@ impl LibreMcp {
             ),
             "cache_hit": raw.cache_hit,
             "stale_threshold_minutes": STALE_AFTER_MINUTES,
+            "data_source": LIVE_API,
         }))
     }
 }
@@ -767,8 +1166,9 @@ impl ServerHandler for LibreMcp {
     }
 }
 
-pub(crate) async fn serve(fetcher: Fetcher) -> Result<(), &'static str> {
+pub(crate) async fn serve(fetcher: Fetcher, db: Option<PathBuf>) -> Result<(), &'static str> {
     let service = LibreMcp::new(fetcher)
+        .with_store(db)
         .serve(stdio())
         .await
         .map_err(|_| "Unable to start MCP stdio server.")?;
@@ -782,6 +1182,9 @@ pub(crate) async fn serve(fetcher: Fetcher) -> Result<(), &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source::masked_identifier;
+    use crate::store::Heartbeat;
+    use std::path::Path;
 
     #[test]
     fn all_original_names_are_exposed_without_a_secret_argument() {
@@ -1252,5 +1655,298 @@ mod tests {
         ] {
             assert_eq!(appended[0][field], current[field], "{field}");
         }
+    }
+
+    // --- Local store path -------------------------------------------------
+
+    const STORE_PATIENT_ID: &str = "SYNTHETIC-PID-store-k27";
+    const RAW_SERIAL: &str = "SYNTHSERIAL-RAW-0001";
+    const RAW_DEVICE: &str = "synthetic-device-raw-7777";
+
+    fn ago(minutes: i64) -> String {
+        minutes_ago(minutes)
+    }
+
+    struct LocalFixture {
+        _dir: tempfile::TempDir,
+        db: PathBuf,
+    }
+
+    impl LocalFixture {
+        fn with_store<T>(&self, operation: impl FnOnce(&mut Store) -> T) -> T {
+            operation(&mut Store::open(&self.db).unwrap())
+        }
+    }
+
+    /// A store holding graph readings at `graph_minutes_ago`, an optional
+    /// current reading, one sensor, and a heartbeat `heartbeat_age` seconds
+    /// old (none if `None`).
+    fn local_fixture(
+        graph_minutes_ago: &[i64],
+        current_minutes_ago: Option<i64>,
+        heartbeat_age: Option<i64>,
+    ) -> LocalFixture {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("readings.sqlite3");
+        let fixture = LocalFixture { _dir: dir, db };
+        let snapshot = Snapshot {
+            patient_id: STORE_PATIENT_ID.to_owned(),
+            current: synthetic_item(&current_minutes_ago.map(ago).unwrap_or_default()),
+            graph: graph_minutes_ago
+                .iter()
+                .map(|m| synthetic_item(&ago(*m)))
+                .collect(),
+            active_sensors: vec![SensorRecord {
+                device_id: RAW_DEVICE.to_owned(),
+                serial_number: RAW_SERIAL.to_owned(),
+                activation_epoch_seconds: 1_652_400_270,
+                warmup_minutes: 60,
+                product_type_code: 4,
+            }],
+        };
+        fixture.with_store(|store| {
+            store
+                .insert_snapshot(STORE_PATIENT_ID, &snapshot, Utc::now())
+                .unwrap();
+            if let Some(age) = heartbeat_age {
+                store
+                    .write_heartbeat(&Heartbeat {
+                        at: Utc::now() - Duration::seconds(age),
+                        pid: 4242,
+                        version: "0.0.0-synthetic".to_owned(),
+                    })
+                    .unwrap();
+            }
+        });
+        fixture
+    }
+
+    /// A server whose live source counts reads, pointed at `db`.
+    fn store_server(db: &Path) -> (LibreMcp, Arc<AtomicUsize>) {
+        let (server, reads) = fake_server(Ok(live_snapshot()));
+        let mut server = server.with_store(Some(db.to_path_buf()));
+        server.fixed_ranges = Some((70, 180));
+        (server, reads)
+    }
+
+    /// Every 15 minutes from 5 minutes ago back to `hours` ago.
+    fn every_15_minutes(hours: i64) -> Vec<i64> {
+        (0..)
+            .map(|step| 5 + 15 * step)
+            .take_while(|minutes| *minutes <= hours * 60)
+            .collect()
+    }
+
+    async fn all_data_tools(server: &LibreMcp) -> Vec<CallToolResult> {
+        vec![
+            server.get_current_glucose(Parameters(EmptyArgs {})).await,
+            server
+                .get_glucose_history(Parameters(HistoryArgs { hours: Some(24) }))
+                .await,
+            server
+                .get_glucose_stats(Parameters(StatsArgs { days: Some(1) }))
+                .await,
+            server
+                .get_glucose_trends(Parameters(TrendsArgs {
+                    period: Some(Period::Daily),
+                }))
+                .await,
+            server.get_sensor_info(Parameters(EmptyArgs {})).await,
+            server.validate_connection(Parameters(EmptyArgs {})).await,
+        ]
+    }
+
+    #[tokio::test]
+    async fn source_selection_follows_the_collector_heartbeat() {
+        let source_of = |result: &CallToolResult| body(result)["data_source"].clone();
+
+        let fresh = local_fixture(&[20, 5], None, Some(10));
+        let (server, reads) = store_server(&fresh.db);
+        let reply = server.get_current_glucose(Parameters(EmptyArgs {})).await;
+        assert_eq!(source_of(&reply), "local_store");
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+
+        for age in [240, -600] {
+            let stale = local_fixture(&[20, 5], None, Some(age));
+            let (server, reads) = store_server(&stale.db);
+            let reply = server.get_current_glucose(Parameters(EmptyArgs {})).await;
+            assert_eq!(source_of(&reply), "live_api", "heartbeat age {age}");
+            assert_eq!(reads.load(Ordering::SeqCst), 1);
+        }
+
+        // Readings but no heartbeat ever written.
+        let silent = local_fixture(&[20, 5], None, None);
+        let (server, _) = store_server(&silent.db);
+        let reply = server.get_current_glucose(Parameters(EmptyArgs {})).await;
+        assert_eq!(source_of(&reply), "live_api");
+
+        // No database file: live, and serve does not create one.
+        let dir = tempfile::TempDir::new().unwrap();
+        let missing = dir.path().join("absent.sqlite3");
+        let (server, reads) = store_server(&missing);
+        let reply = server.get_current_glucose(Parameters(EmptyArgs {})).await;
+        assert_eq!(source_of(&reply), "live_api");
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        assert!(!missing.exists());
+    }
+
+    #[tokio::test]
+    async fn the_local_store_path_never_contacts_the_api_or_leaks_identifiers() {
+        let fixture = local_fixture(&every_15_minutes(30), Some(2), Some(10));
+        let (server, reads) = store_server(&fixture.db);
+        for result in all_data_tools(&server).await {
+            assert_eq!(result.is_error, Some(false), "{result:?}");
+            assert_eq!(body(&result)["data_source"], "local_store");
+            let serialized = serde_json::to_string(&result).unwrap();
+            for forbidden in [STORE_PATIENT_ID, "k27", RAW_SERIAL, RAW_DEVICE, "7777-"] {
+                assert!(
+                    !serialized.contains(forbidden),
+                    "{forbidden} in {serialized}"
+                );
+            }
+        }
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn sensors_and_status_come_from_the_store() {
+        let fixture = local_fixture(&[20, 5], Some(2), Some(10));
+        fixture.with_store(|store| store.record_poll("ok", 3, Utc::now()).unwrap());
+        let (server, reads) = store_server(&fixture.db);
+
+        let sensors = server.get_sensor_info(Parameters(EmptyArgs {})).await;
+        let sensors = body(&sensors);
+        assert_eq!(sensors["sensor_count"], 1);
+        let sensor = &sensors["active_sensors"][0];
+        assert_eq!(sensor["serial_number_masked"], "****0001");
+        assert_eq!(sensor["device_id_masked"], "****7777");
+        assert_eq!(sensor["source_activation_epoch_seconds"], 1_652_400_270);
+        assert_eq!(sensor["warmup_minutes"], 60);
+        assert_eq!(sensor["product_type_code"], 4);
+
+        let status = server.validate_connection(Parameters(EmptyArgs {})).await;
+        let status = body(&status);
+        assert_eq!(status["collector_running"], true);
+        assert_eq!(status["upstream_contacted"], false);
+        assert!(status["collector_heartbeat_age_seconds"].as_i64().unwrap() <= 15);
+        assert_eq!(status["last_poll_outcome"], "ok");
+        assert!(status["last_poll_at_utc"].is_string());
+        assert_eq!(status["stored_reading_count"], 3);
+        assert!(status.get("glucose_mg_dl").is_none());
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_lagging_collector_reports_its_newest_reading_as_stale() {
+        let fixture = local_fixture(&[60, 45, 30], None, Some(10));
+        let (server, _) = store_server(&fixture.db);
+        let reply = server.get_current_glucose(Parameters(EmptyArgs {})).await;
+        let reply = body(&reply);
+        assert_eq!(reply["data_source"], "local_store");
+        assert_eq!(reply["glucose_mg_dl"], 110.0);
+        assert_eq!(reply["freshness"], "stale");
+        assert_eq!(reply["cache_hit"], false);
+        assert_eq!(reply["source_timestamp"], ago(30));
+
+        // A fresh newest reading is recent.
+        let fixture = local_fixture(&[30, 15], Some(2), Some(10));
+        let (server, _) = store_server(&fixture.db);
+        let reply = server.get_current_glucose(Parameters(EmptyArgs {})).await;
+        assert_eq!(body(&reply)["freshness"], "recent");
+    }
+
+    #[tokio::test]
+    async fn history_from_the_store_spans_more_than_the_12_hour_graph() {
+        let fixture = local_fixture(&every_15_minutes(30), None, Some(10));
+        let (server, _) = store_server(&fixture.db);
+        let reply = server
+            .get_glucose_history(Parameters(HistoryArgs { hours: Some(24) }))
+            .await;
+        let reply = body(&reply);
+        assert_eq!(reply["data_source"], "local_store");
+        assert_eq!(reply["window_filter_applied"], true);
+        assert_eq!(reply["total_readings"], 96);
+        assert_eq!(reply["coverage"]["source"], "local_store");
+        let span = reply["coverage"]["observed_span_hours"].as_f64().unwrap();
+        assert!(span > 23.0, "{span}");
+        assert_eq!(reply["readings"][0]["source"], "graph");
+    }
+
+    #[tokio::test]
+    async fn sufficient_store_coverage_is_a_sample_summary() {
+        let fixture = local_fixture(&every_15_minutes(30), Some(2), Some(10));
+        let (server, _) = store_server(&fixture.db);
+        let stats = server
+            .get_glucose_stats(Parameters(StatsArgs { days: Some(1) }))
+            .await;
+        let stats = body(&stats);
+        assert_eq!(stats["data_source"], "local_store");
+        assert_eq!(stats["period_status"], "sample_summary");
+        assert_eq!(stats["coverage"]["period_span_sufficient"], true);
+        assert_eq!(stats["coverage"]["estimated_cadence_minutes"], 15.0);
+        assert_eq!(stats["gmi_percent"], serde_json::Value::Null);
+        let trends = server
+            .get_glucose_trends(Parameters(TrendsArgs {
+                period: Some(Period::Daily),
+            }))
+            .await;
+        assert_eq!(body(&trends)["period_status"], "sample_summary");
+
+        // A week requested from a day and a quarter of data stays partial.
+        let week = server
+            .get_glucose_stats(Parameters(StatsArgs { days: Some(7) }))
+            .await;
+        assert_eq!(body(&week)["period_status"], "partial");
+    }
+
+    #[tokio::test]
+    async fn store_gaps_are_labeled_by_what_the_collector_saw() {
+        let minutes: Vec<i64> = every_15_minutes(10)
+            .into_iter()
+            .filter(|m| !(300 < *m && *m < 420) && !(120 < *m && *m < 180))
+            .collect();
+        let fixture = local_fixture(&minutes, None, Some(10));
+        // The collector polled during the newer gap but got no readings.
+        let polled_at = Utc::now() - Duration::minutes(150);
+        fixture.with_store(|store| store.record_poll("ok", 0, polled_at).unwrap());
+        let (server, _) = store_server(&fixture.db);
+        let reply = server
+            .get_glucose_history(Parameters(HistoryArgs { hours: Some(10) }))
+            .await;
+        let gaps = &body(&reply)["coverage"]["interior_gaps"];
+        let causes: Vec<_> = gaps
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|gap| gap["cause"].as_str().unwrap())
+            .collect();
+        assert_eq!(causes, ["collector_not_running", "no_data_from_api"]);
+
+        // The live path never labels gaps.
+        let now = Utc::now();
+        let graph = [
+            synthetic_item(&ago(60)),
+            synthetic_item(&ago(45)),
+            synthetic_item(&ago(5)),
+        ];
+        let coverage = serde_json::to_value(graph_coverage(&graph, 1, now)).unwrap();
+        assert!(coverage["interior_gaps"][0].get("cause").is_none());
+        assert_eq!(coverage["source"], "librelinkup_graph");
+    }
+
+    #[tokio::test]
+    async fn live_replies_say_live_api() {
+        let (mut server, _) = fake_server(Ok(live_snapshot()));
+        server.fixed_ranges = Some((70, 180));
+        for result in all_data_tools(&server).await {
+            assert_eq!(body(&result)["data_source"], "live_api");
+        }
+    }
+
+    #[test]
+    fn instructions_explain_the_data_source() {
+        assert!(SERVER_INSTRUCTIONS.contains("data_source"));
+        assert!(SERVER_INSTRUCTIONS.contains("local_store"));
+        assert!(SERVER_INSTRUCTIONS.contains("only as fresh as the collector"));
     }
 }

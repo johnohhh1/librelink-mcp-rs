@@ -4,7 +4,7 @@
 //! database holds values, timestamps, and a salted patient key, never
 //! credentials, tokens, or raw patient IDs.
 
-use crate::source::{GlucoseSample, Snapshot};
+use crate::source::{GlucoseSample, SensorSummary, Snapshot};
 use crate::time::assess_time;
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -22,7 +22,8 @@ const SALT_BYTES: usize = 32;
 const DB_FILE_NAME: &str = "readings.sqlite3";
 
 /// Migrations in order; `PRAGMA user_version` is the number applied.
-const MIGRATIONS: &[&str] = &[r#"
+const MIGRATIONS: &[&str] = &[
+    r#"
 CREATE TABLE meta (
     key   TEXT PRIMARY KEY,
     value BLOB NOT NULL
@@ -52,7 +53,19 @@ CREATE TABLE collector_state (
     pid           INTEGER NOT NULL,
     version       TEXT    NOT NULL
 );
-"#];
+"#,
+    r#"
+ALTER TABLE collector_state ADD COLUMN patient_key TEXT;
+CREATE TABLE sensors (
+    position                 INTEGER PRIMARY KEY,
+    device_id_masked         TEXT,
+    serial_number_masked     TEXT,
+    activation_epoch_seconds INTEGER,
+    warmup_minutes           INTEGER,
+    product_type_code        INTEGER
+);
+"#,
+];
 
 pub(crate) type StoreResult<T> = Result<T, &'static str>;
 
@@ -75,7 +88,6 @@ impl Origin {
         }
     }
 
-    #[allow(dead_code)] // Read by `serve` in v0.3 step 3, which removes this.
     fn parse(text: &str) -> Option<Self> {
         match text {
             "graph" => Some(Self::Graph),
@@ -86,11 +98,29 @@ impl Origin {
 }
 
 /// A reading as the tools use it, plus where it came from.
-#[allow(dead_code)] // Read by `serve` in v0.3 step 3, which removes this.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct StoredReading {
     pub sample: GlucoseSample,
     pub origin: Origin,
+    /// When the collector first stored this reading.
+    pub first_seen_utc: DateTime<Utc>,
+}
+
+/// What the collector last reported about itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CollectorStatus {
+    pub heartbeat: Heartbeat,
+    /// The salted key of the patient the collector is writing, once it has
+    /// stored a snapshot.
+    pub patient_key: Option<String>,
+}
+
+/// The most recent poll attempt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PollRecord {
+    pub at: DateTime<Utc>,
+    pub outcome: String,
+    pub readings_added: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -327,6 +357,17 @@ impl Store {
         for (sample, origin) in rows {
             added += insert_reading(&transaction, &key, sample, origin, now)?;
         }
+        replace_sensors(&transaction, snapshot, now)?;
+        // Tell `serve` which patient's rows are current. Heartbeat 0 keeps
+        // a missing collector row stale until a real heartbeat arrives.
+        transaction
+            .execute(
+                "INSERT INTO collector_state (id, heartbeat_utc, pid, version, patient_key)
+                 VALUES (1, 0, 0, '', ?1)
+                 ON CONFLICT (id) DO UPDATE SET patient_key = excluded.patient_key",
+                [&key],
+            )
+            .map_err(db_error)?;
         transaction.commit().map_err(db_error)?;
         Ok(added)
     }
@@ -360,50 +401,136 @@ impl Store {
         Ok(())
     }
 
-    #[allow(dead_code)] // Read by `serve` in v0.3 step 3, which removes this.
+    #[cfg(test)]
     pub(crate) fn read_heartbeat(&self) -> StoreResult<Option<Heartbeat>> {
+        Ok(self.collector_status()?.map(|status| status.heartbeat))
+    }
+
+    pub(crate) fn collector_status(&self) -> StoreResult<Option<CollectorStatus>> {
         let row = self
             .conn
             .query_row(
-                "SELECT heartbeat_utc, pid, version FROM collector_state WHERE id = 1",
+                "SELECT heartbeat_utc, pid, version, patient_key FROM collector_state WHERE id = 1",
                 [],
                 |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, u32>(1)?,
                         row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
                     ))
                 },
             )
             .optional()
             .map_err(db_error)?;
-        Ok(row.and_then(|(at, pid, version)| {
-            DateTime::from_timestamp(at, 0).map(|at| Heartbeat { at, pid, version })
+        Ok(row.and_then(|(at, pid, version, patient_key)| {
+            DateTime::from_timestamp(at, 0).map(|at| CollectorStatus {
+                heartbeat: Heartbeat { at, pid, version },
+                patient_key,
+            })
         }))
     }
 
-    /// Readings with `from <= observed_at_utc <= to`, oldest first. Readings
-    /// without a usable UTC time cannot be placed in a window and are left
-    /// out.
-    #[allow(dead_code)] // Read by `serve` in v0.3 step 3, which removes this.
-    pub(crate) fn readings_in_window(
+    /// The newest stored reading with a usable UTC time.
+    pub(crate) fn latest_reading(&self, patient_key: &str) -> StoreResult<Option<StoredReading>> {
+        let mut readings = self.query_readings(
+            "WHERE patient_key = ?1 AND observed_at_utc IS NOT NULL
+             ORDER BY observed_at_utc DESC, factory_timestamp DESC LIMIT 1",
+            params![patient_key],
+        )?;
+        Ok(readings.pop())
+    }
+
+    pub(crate) fn reading_count(&self, patient_key: &str) -> StoreResult<i64> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM readings WHERE patient_key = ?1",
+                [patient_key],
+                |row| row.get(0),
+            )
+            .map_err(db_error)
+    }
+
+    pub(crate) fn last_poll(&self) -> StoreResult<Option<PollRecord>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT polled_at_utc, outcome, readings_added FROM polls
+                 ORDER BY polled_at_utc DESC, rowid DESC LIMIT 1",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(db_error)?;
+        Ok(row.and_then(|(at, outcome, readings_added)| {
+            DateTime::from_timestamp(at, 0).map(|at| PollRecord {
+                at,
+                outcome,
+                readings_added,
+            })
+        }))
+    }
+
+    /// Times of all poll attempts with `from <= polled_at_utc <= to`.
+    pub(crate) fn poll_times(
         &self,
-        patient_id: &str,
         from: DateTime<Utc>,
         to: DateTime<Utc>,
-    ) -> StoreResult<Vec<StoredReading>> {
-        let key = self.patient_key(patient_id);
+    ) -> StoreResult<Vec<DateTime<Utc>>> {
         let mut statement = self
             .conn
             .prepare(
-                "SELECT source_timestamp, factory_timestamp, value_mg_dl, trend_arrow, origin
-                 FROM readings
-                 WHERE patient_key = ?1 AND observed_at_utc BETWEEN ?2 AND ?3
-                 ORDER BY observed_at_utc, factory_timestamp",
+                "SELECT polled_at_utc FROM polls WHERE polled_at_utc BETWEEN ?1 AND ?2
+                 ORDER BY polled_at_utc",
             )
             .map_err(db_error)?;
         let rows = statement
-            .query_map(params![key, epoch(from), epoch(to)], |row| {
+            .query_map(params![epoch(from), epoch(to)], |row| row.get::<_, i64>(0))
+            .map_err(db_error)?;
+        rows.map(|row| {
+            let seconds = row.map_err(db_error)?;
+            DateTime::from_timestamp(seconds, 0).ok_or("The local database has an invalid time.")
+        })
+        .collect()
+    }
+
+    /// The latest snapshot's sensors, in source order.
+    pub(crate) fn sensors(&self) -> StoreResult<Vec<SensorSummary>> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT device_id_masked, serial_number_masked, activation_epoch_seconds,
+                        warmup_minutes, product_type_code
+                 FROM sensors ORDER BY position",
+            )
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(SensorSummary {
+                    device_id_masked: row.get(0)?,
+                    serial_number_masked: row.get(1)?,
+                    activation_epoch_seconds: row.get(2)?,
+                    warmup_minutes: row.get(3)?,
+                    product_type_code: row.get(4)?,
+                })
+            })
+            .map_err(db_error)?;
+        rows.map(|row| row.map_err(db_error)).collect()
+    }
+
+    fn query_readings(
+        &self,
+        clause: &str,
+        parameters: impl rusqlite::Params,
+    ) -> StoreResult<Vec<StoredReading>> {
+        let sql = format!(
+            "SELECT source_timestamp, factory_timestamp, value_mg_dl, trend_arrow, origin,
+                    first_seen_utc
+             FROM readings {clause}"
+        );
+        let mut statement = self.conn.prepare(&sql).map_err(db_error)?;
+        let rows = statement
+            .query_map(parameters, |row| {
                 Ok((
                     GlucoseSample {
                         timestamp: row.get(0)?,
@@ -412,16 +539,53 @@ impl Store {
                         trend_arrow: row.get(3)?,
                     },
                     row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
                 ))
             })
             .map_err(db_error)?;
         rows.map(|row| {
-            let (sample, origin) = row.map_err(db_error)?;
+            let (sample, origin, first_seen) = row.map_err(db_error)?;
             let origin =
                 Origin::parse(&origin).ok_or("The local database has an unknown origin.")?;
-            Ok(StoredReading { sample, origin })
+            let first_seen_utc = DateTime::from_timestamp(first_seen, 0)
+                .ok_or("The local database has an invalid time.")?;
+            Ok(StoredReading {
+                sample,
+                origin,
+                first_seen_utc,
+            })
         })
         .collect()
+    }
+
+    /// Readings with `from <= observed_at_utc <= to`, oldest first. Readings
+    /// without a usable UTC time cannot be placed in a window and are left
+    /// out.
+    #[cfg(test)]
+    pub(crate) fn readings_in_window(
+        &self,
+        patient_id: &str,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> StoreResult<Vec<StoredReading>> {
+        self.readings_for_key(&self.patient_key(patient_id), from, to)
+    }
+
+    /// Readings with `from <= observed_at_utc <= to` for a salted patient
+    /// key, oldest first. `serve` only ever has the key, never the raw ID.
+    /// Readings without a usable UTC time cannot be placed in a window and
+    /// are left out.
+    pub(crate) fn readings_for_key(
+        &self,
+        patient_key: &str,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+    ) -> StoreResult<Vec<StoredReading>> {
+        self.query_readings(
+            "WHERE patient_key = ?1 AND observed_at_utc BETWEEN ?2 AND ?3
+             ORDER BY observed_at_utc, factory_timestamp",
+            params![patient_key, epoch(from), epoch(to)],
+        )
     }
 
     /// Deletes readings and polls older than `retention_days`. Readings are
@@ -444,6 +608,35 @@ impl Store {
             .map_err(db_error)?;
         Ok(Pruned { readings, polls })
     }
+}
+
+fn replace_sensors(
+    transaction: &Transaction<'_>,
+    snapshot: &Snapshot,
+    now: DateTime<Utc>,
+) -> StoreResult<()> {
+    transaction
+        .execute("DELETE FROM sensors", [])
+        .map_err(db_error)?;
+    for (position, record) in snapshot.active_sensors.iter().enumerate() {
+        let sensor = SensorSummary::from_record(record, now);
+        transaction
+            .execute(
+                "INSERT INTO sensors (position, device_id_masked, serial_number_masked,
+                     activation_epoch_seconds, warmup_minutes, product_type_code)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    i64::try_from(position).unwrap_or(i64::MAX),
+                    sensor.device_id_masked,
+                    sensor.serial_number_masked,
+                    sensor.activation_epoch_seconds,
+                    sensor.warmup_minutes,
+                    sensor.product_type_code,
+                ],
+            )
+            .map_err(db_error)?;
+    }
+    Ok(())
 }
 
 fn insert_reading(
@@ -872,6 +1065,129 @@ mod tests {
             lock_path(Path::new("/data/readings.sqlite3")),
             PathBuf::from("/data/readings.sqlite3.lock")
         );
+    }
+
+    fn with_sensor(mut snapshot: Snapshot) -> Snapshot {
+        snapshot.active_sensors = vec![crate::source::SensorRecord {
+            device_id: "synthetic-device-raw-7777".to_owned(),
+            serial_number: "SYNTHSERIAL-RAW-0001".to_owned(),
+            activation_epoch_seconds: 1_652_400_270,
+            warmup_minutes: 60,
+            product_type_code: 4,
+        }];
+        snapshot
+    }
+
+    #[test]
+    fn migrates_a_version_1_database_to_version_2() {
+        let (_dir, path) = temp_db();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATIONS[0]).unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+            conn.execute(
+                "INSERT INTO readings VALUES ('synthetic-key', 'f1', 's1', 1762372800, 'offset_known', 120.0, 3, 'graph', 1762372800)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO collector_state (id, heartbeat_utc, pid, version) VALUES (1, 1762372800, 7, '0.0.0-synthetic')",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        assert_eq!(store.reading_count("synthetic-key").unwrap(), 1);
+        let status = store.collector_status().unwrap().unwrap();
+        assert_eq!(status.heartbeat.pid, 7);
+        assert_eq!(status.patient_key, None);
+        assert!(store.sensors().unwrap().is_empty());
+    }
+
+    #[test]
+    fn sensors_are_stored_masked_and_replaced_on_each_snapshot() {
+        let (_dir, path) = temp_db();
+        let mut store = Store::open(&path).unwrap();
+        let now = at("2026-11-05T20:00:00Z");
+        let first = with_sensor(snapshot(&["2026-11-05T19:30:00Z"], "2026-11-05T19:45:00Z"));
+        store.insert_snapshot(PATIENT, &first, now).unwrap();
+        assert_eq!(
+            store.sensors().unwrap(),
+            [SensorSummary {
+                device_id_masked: Some("****7777".to_owned()),
+                serial_number_masked: Some("****0001".to_owned()),
+                activation_epoch_seconds: Some(1_652_400_270),
+                warmup_minutes: Some(60),
+                product_type_code: Some(4),
+            }]
+        );
+        let status = store.collector_status().unwrap().unwrap();
+        assert_eq!(
+            status.patient_key.as_deref(),
+            Some(store.patient_key(PATIENT).as_str())
+        );
+        // A row created by an insert alone has an epoch heartbeat: stale.
+        assert_eq!(status.heartbeat.at.timestamp(), 0);
+
+        let files_contain = |needle: &str| {
+            [path.clone(), with_suffix(&path, "-wal")]
+                .iter()
+                .filter_map(|file| fs::read(file).ok())
+                .any(|bytes| {
+                    bytes
+                        .windows(needle.len())
+                        .any(|window| window == needle.as_bytes())
+                })
+        };
+        assert!(!files_contain("SYNTHSERIAL-RAW"));
+        assert!(!files_contain("synthetic-device-raw"));
+
+        let second = snapshot(&["2026-11-05T19:50:00Z"], "2026-11-05T19:55:00Z");
+        store.insert_snapshot(PATIENT, &second, now).unwrap();
+        assert!(store.sensors().unwrap().is_empty());
+    }
+
+    #[test]
+    fn latest_reading_last_poll_and_poll_times() {
+        let (_dir, path) = temp_db();
+        let mut store = Store::open(&path).unwrap();
+        let now = at("2026-11-05T20:00:00Z");
+        let key = store.patient_key(PATIENT);
+        assert_eq!(store.latest_reading(&key).unwrap(), None);
+        assert_eq!(store.last_poll().unwrap(), None);
+        store
+            .insert_snapshot(
+                PATIENT,
+                &snapshot(
+                    &["2026-11-05T19:30:00Z", "2026-11-05T19:45:00Z"],
+                    "2026-11-05T19:58:00Z",
+                ),
+                now,
+            )
+            .unwrap();
+        let latest = store.latest_reading(&key).unwrap().unwrap();
+        assert_eq!(latest.sample.timestamp, "2026-11-05T19:58:00Z");
+        assert_eq!(latest.origin, Origin::CurrentMeasurement);
+        assert_eq!(latest.first_seen_utc, now);
+        store
+            .record_poll("ok", 3, at("2026-11-05T19:59:00Z"))
+            .unwrap();
+        store.record_poll("rate_limited", 0, now).unwrap();
+        let last = store.last_poll().unwrap().unwrap();
+        assert_eq!(
+            (last.outcome.as_str(), last.readings_added, last.at),
+            ("rate_limited", 0, now)
+        );
+        assert_eq!(
+            store.poll_times(at("2026-11-05T19:59:30Z"), now).unwrap(),
+            [now]
+        );
+        assert_eq!(store.reading_count(&key).unwrap(), 3);
     }
 
     #[test]

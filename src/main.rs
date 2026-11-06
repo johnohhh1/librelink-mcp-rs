@@ -3,6 +3,7 @@ use keyring::{Entry, Error as KeyringError};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use zeroize::{Zeroize, Zeroizing};
 
 mod collect;
@@ -188,16 +189,29 @@ fn delete_entry_if_present(entry: Entry) -> Result<(), &'static str> {
     }
 }
 
-fn clear_local_data() -> Result<(), &'static str> {
-    let db = store::default_db_path();
-    // Check before deleting anything, so a refusal leaves everything intact.
-    if let Some(db) = &db
-        && store::database_locked(db)?
-    {
-        return Err(
-            "A collector is running for the local database. Stop it, then run clear-local-data again.",
-        );
+/// Parses an optional `--db <path>` and nothing else.
+fn parse_db_option(args: &[String]) -> Result<Option<PathBuf>, &'static str> {
+    match args {
+        [] => Ok(None),
+        [flag, path] if flag == "--db" && !path.is_empty() => Ok(Some(PathBuf::from(path))),
+        _ => Err("The only option is --db <path>."),
     }
+}
+
+/// Refuses while a collector holds the database's lock.
+fn ensure_no_collector(db: Option<&Path>) -> Result<(), &'static str> {
+    match db {
+        Some(db) if store::database_locked(db)? => Err(
+            "A collector is running for the local database. Stop it, then run clear-local-data again.",
+        ),
+        _ => Ok(()),
+    }
+}
+
+fn clear_local_data(db: Option<PathBuf>) -> Result<(), &'static str> {
+    let db = db.or_else(store::default_db_path);
+    // Check before deleting anything, so a refusal leaves everything intact.
+    ensure_no_collector(db.as_deref())?;
     delete_entry_if_present(keyring_entry()?)?;
     delete_entry_if_present(settings_entry()?)?;
     if let Some(db) = &db {
@@ -326,10 +340,17 @@ async fn run() {
         [_, command] if command == "check" => check().await,
         [_, command] if command == "select-patient" => select_patient().map_err(Cow::from),
         [_, command] if command == "set-api-version" => set_api_version().map_err(Cow::from),
-        [_, command] if command == "clear-local-data" => clear_local_data().map_err(Cow::from),
-        [_, command] if command == "serve" => mcp::serve(live_fetcher()).await.map_err(Cow::from),
+        [_, command, rest @ ..] if command == "clear-local-data" => parse_db_option(rest)
+            .and_then(clear_local_data)
+            .map_err(Cow::from),
+        [_, command, rest @ ..] if command == "serve" => match parse_db_option(rest) {
+            Ok(db) => mcp::serve(live_fetcher(), db.or_else(store::default_db_path))
+                .await
+                .map_err(Cow::from),
+            Err(message) => Err(Cow::from(message)),
+        },
         _ => Err(Cow::from(
-            "Usage: librelink-mcp-rs <setup|select-patient|set-api-version|check|collect|clear-local-data|serve>",
+            "Usage: librelink-mcp-rs <setup|select-patient|set-api-version|check|collect|clear-local-data|serve> [--db <path>]",
         )),
     };
     if let Err(message) = result {
@@ -338,10 +359,44 @@ async fn run() {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn db_option_is_the_only_accepted_option() {
+        let args = |list: &[&str]| list.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+        assert_eq!(parse_db_option(&args(&[])).unwrap(), None);
+        assert_eq!(
+            parse_db_option(&args(&["--db", "/synthetic/x.db"])).unwrap(),
+            Some(PathBuf::from("/synthetic/x.db"))
+        );
+        for bad in [
+            &["--db"][..],
+            &["--db", ""],
+            &["--force"],
+            &["--db", "a", "b"],
+        ] {
+            assert!(parse_db_option(&args(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn clearing_a_database_is_refused_while_a_collector_holds_its_lock() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("readings.sqlite3");
+        drop(store::Store::open(&db).unwrap());
+        assert!(ensure_no_collector(Some(&db)).is_ok());
+        let held = store::lock_database(&db).unwrap();
+        assert!(ensure_no_collector(Some(&db)).is_err());
+        drop(held);
+        assert!(ensure_no_collector(Some(&db)).is_ok());
+        assert!(ensure_no_collector(None).is_ok());
+        // A path that does not exist is not locked.
+        assert!(ensure_no_collector(Some(&dir.path().join("missing.sqlite3"))).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn session_bus_fallback_only_fills_a_missing_address() {
         let owned = |_: &str| true;
