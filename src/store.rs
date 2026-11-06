@@ -5,7 +5,7 @@
 //! credentials, tokens, or raw patient IDs.
 
 use crate::source::{GlucoseSample, SensorSummary, Snapshot};
-use crate::time::assess_time;
+use crate::time::{StoredTime, TimeBasis, assess_time};
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
@@ -18,6 +18,7 @@ pub(crate) const MIN_RETENTION_DAYS: u32 = 1;
 pub(crate) const MAX_RETENTION_DAYS: u32 = 3650;
 pub(crate) const DEFAULT_RETENTION_DAYS: u32 = 90;
 const SALT_KEY: &str = "patient_key_salt";
+const RETENTION_KEY: &str = "retention_days";
 const SALT_BYTES: usize = 32;
 const DB_FILE_NAME: &str = "readings.sqlite3";
 
@@ -65,6 +66,10 @@ CREATE TABLE sensors (
     product_type_code        INTEGER
 );
 "#,
+    // Version 3 adds LibreView CSV origins and the CSV time basis, values
+    // that 0.3.0 cannot read. The version bump makes 0.3.0 refuse the
+    // database at open instead of failing on those rows.
+    "",
 ];
 
 pub(crate) type StoreResult<T> = Result<T, &'static str>;
@@ -78,23 +83,44 @@ fn db_error(_: rusqlite::Error) -> &'static str {
 pub(crate) enum Origin {
     Graph,
     CurrentMeasurement,
+    /// LibreView CSV record type 0.
+    LibreviewCsvHistoric,
+    /// LibreView CSV record type 1.
+    LibreviewCsvScan,
 }
 
 impl Origin {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Graph => "graph",
             Self::CurrentMeasurement => "current_measurement",
+            Self::LibreviewCsvHistoric => "libreview_csv_historic",
+            Self::LibreviewCsvScan => "libreview_csv_scan",
         }
     }
 
     fn parse(text: &str) -> Option<Self> {
-        match text {
-            "graph" => Some(Self::Graph),
-            "current_measurement" => Some(Self::CurrentMeasurement),
-            _ => None,
-        }
+        [
+            Self::Graph,
+            Self::CurrentMeasurement,
+            Self::LibreviewCsvHistoric,
+            Self::LibreviewCsvScan,
+        ]
+        .into_iter()
+        .find(|origin| origin.as_str() == text)
     }
+}
+
+/// One LibreView CSV reading, ready to store.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CsvReading {
+    /// The dedup key: `csv:<record type>:<original timestamp text>`.
+    pub key: String,
+    /// The original device timestamp text.
+    pub source_timestamp: String,
+    pub observed_at_utc: DateTime<Utc>,
+    pub value_mg_dl: f64,
+    pub origin: Origin,
 }
 
 /// A reading as the tools use it, plus where it came from.
@@ -153,6 +179,11 @@ pub(crate) fn lock_path(db: &Path) -> PathBuf {
     with_suffix(db, ".lock")
 }
 
+/// The advisory lock file that allows one CSV import per database.
+pub(crate) fn import_lock_path(db: &Path) -> PathBuf {
+    with_suffix(db, ".import.lock")
+}
+
 /// Why the collector lock could not be taken.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum LockError {
@@ -166,6 +197,17 @@ pub(crate) enum LockError {
 /// database. The lock lasts as long as the returned file is open, and the
 /// OS releases it if the process dies.
 pub(crate) fn lock_database(db: &Path) -> Result<fs::File, LockError> {
+    lock_file(&lock_path(db))
+}
+
+/// Takes the exclusive advisory lock that allows one CSV import per
+/// database. It is separate from the collector's lock, so an import runs
+/// alongside a collector.
+pub(crate) fn lock_import(db: &Path) -> Result<fs::File, LockError> {
+    lock_file(&import_lock_path(db))
+}
+
+fn lock_file(path: &Path) -> Result<fs::File, LockError> {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
@@ -173,9 +215,7 @@ pub(crate) fn lock_database(db: &Path) -> Result<fs::File, LockError> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let file = options
-        .open(lock_path(db))
-        .map_err(|_| LockError::Unavailable)?;
+    let file = options.open(path).map_err(|_| LockError::Unavailable)?;
     match file.try_lock() {
         Ok(()) => Ok(file),
         Err(fs::TryLockError::WouldBlock) => Err(LockError::Held),
@@ -185,10 +225,19 @@ pub(crate) fn lock_database(db: &Path) -> Result<fs::File, LockError> {
 
 /// Whether a collector currently holds the database lock.
 pub(crate) fn database_locked(db: &Path) -> StoreResult<bool> {
-    if !lock_path(db).exists() {
+    file_locked(&lock_path(db))
+}
+
+/// Whether a CSV import currently holds the import lock.
+pub(crate) fn import_locked(db: &Path) -> StoreResult<bool> {
+    file_locked(&import_lock_path(db))
+}
+
+fn file_locked(path: &Path) -> StoreResult<bool> {
+    if !path.exists() {
         return Ok(false);
     }
-    match lock_database(db) {
+    match lock_file(path) {
         Ok(_released_on_drop) => Ok(false),
         Err(LockError::Held) => Ok(true),
         Err(LockError::Unavailable) => Err("Unable to check the local database lock."),
@@ -196,13 +245,14 @@ pub(crate) fn database_locked(db: &Path) -> StoreResult<bool> {
 }
 
 /// Removes the database, its WAL and shared-memory files, and its lock
-/// file. Missing files are not an error.
+/// files. Missing files are not an error.
 pub(crate) fn delete_database_files(db: &Path) -> StoreResult<()> {
     for path in [
         db.to_path_buf(),
         with_suffix(db, "-wal"),
         with_suffix(db, "-shm"),
         lock_path(db),
+        import_lock_path(db),
     ] {
         match fs::remove_file(&path) {
             Ok(()) => {}
@@ -295,11 +345,76 @@ fn epoch(time: DateTime<Utc>) -> i64 {
     time.timestamp()
 }
 
-fn time_basis_text(time_basis: crate::time::TimeBasis) -> String {
-    serde_json::to_value(time_basis)
-        .ok()
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .unwrap_or_else(|| "invalid".to_owned())
+/// The retention the collector last recorded, read without migrating or
+/// writing anything (for `import-csv --dry-run`). `None` if the database or
+/// the value does not exist.
+pub(crate) fn read_retention_days(db: &Path) -> StoreResult<Option<u32>> {
+    use rusqlite::OpenFlags;
+    if !db.exists() {
+        return Ok(None);
+    }
+    let read_only = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = if with_suffix(db, "-wal").exists() {
+        // A collector has the database open: read through its WAL.
+        Connection::open_with_flags(db, read_only)
+    } else {
+        // No WAL, so the file is complete. `immutable` reads it without
+        // creating `-wal` or `-shm` files beside it.
+        let uri = immutable_uri(db).ok_or("Unable to read the local database path.")?;
+        Connection::open_with_flags(uri, read_only | OpenFlags::SQLITE_OPEN_URI)
+    }
+    .map_err(db_error)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(db_error)?;
+    retention_from(&conn)
+}
+
+/// A `file:` URI for `db` with `immutable=1`, percent-encoding anything
+/// outside the unreserved set.
+fn immutable_uri(db: &Path) -> Option<String> {
+    let absolute = std::path::absolute(db).ok()?;
+    let text = absolute.to_str()?;
+    let mut uri = String::from(if cfg!(windows) { "file:///" } else { "file:" });
+    for byte in text.bytes() {
+        match byte {
+            b'\\' if cfg!(windows) => uri.push('/'),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
+                uri.push(char::from(byte));
+            }
+            _ => uri.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    uri.push_str("?immutable=1");
+    Some(uri)
+}
+
+fn retention_from(conn: &Connection) -> StoreResult<Option<u32>> {
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(db_error)?;
+    if !exists {
+        return Ok(None);
+    }
+    let value: Option<i64> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            [RETENTION_KEY],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(db_error)?;
+    value
+        .map(|days| {
+            u32::try_from(days)
+                .ok()
+                .filter(|days| (MIN_RETENTION_DAYS..=MAX_RETENTION_DAYS).contains(days))
+                .ok_or("The local database has an invalid retention setting.")
+        })
+        .transpose()
 }
 
 pub(crate) struct Store {
@@ -325,6 +440,60 @@ impl Store {
     #[cfg(test)]
     pub(crate) fn connection(&self) -> &Connection {
         &self.conn
+    }
+
+    /// Records the collector's retention so `import-csv` applies the same.
+    pub(crate) fn set_retention_days(&self, days: u32) -> StoreResult<()> {
+        if !(MIN_RETENTION_DAYS..=MAX_RETENTION_DAYS).contains(&days) {
+            return Err("Retention must be between 1 and 3650 days.");
+        }
+        self.conn
+            .execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                params![RETENTION_KEY, i64::from(days)],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    /// The retention the collector last recorded, if any.
+    pub(crate) fn retention_days(&self) -> StoreResult<Option<u32>> {
+        retention_from(&self.conn)
+    }
+
+    /// Stores CSV readings for `patient_key` in one transaction, ignoring
+    /// keys already stored. Returns the number of rows added.
+    pub(crate) fn insert_csv_readings(
+        &mut self,
+        patient_key: &str,
+        readings: &[CsvReading],
+        now: DateTime<Utc>,
+    ) -> StoreResult<usize> {
+        let transaction = self.conn.transaction().map_err(db_error)?;
+        let mut added = 0;
+        for reading in readings {
+            added += transaction
+                .execute(
+                    "INSERT OR IGNORE INTO readings (patient_key, factory_timestamp,
+                         source_timestamp, observed_at_utc, time_basis, value_mg_dl,
+                         trend_arrow, origin, first_seen_utc)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8)",
+                    params![
+                        patient_key,
+                        reading.key,
+                        reading.source_timestamp,
+                        epoch(reading.observed_at_utc),
+                        TimeBasis::CsvLocalDeclaredTimezone.as_str(),
+                        reading.value_mg_dl,
+                        reading.origin.as_str(),
+                        epoch(now),
+                    ],
+                )
+                .map_err(db_error)?;
+        }
+        transaction.commit().map_err(db_error)?;
+        Ok(added)
     }
 
     /// Lowercase hex SHA-256 of `salt || patient_id`.
@@ -534,7 +703,7 @@ impl Store {
     ) -> StoreResult<Vec<StoredReading>> {
         let sql = format!(
             "SELECT source_timestamp, factory_timestamp, value_mg_dl, trend_arrow, origin,
-                    first_seen_utc
+                    first_seen_utc, observed_at_utc, time_basis
              FROM readings {clause}"
         );
         let mut statement = self.conn.prepare(&sql).map_err(db_error)?;
@@ -546,14 +715,25 @@ impl Store {
                         factory_timestamp: row.get(1)?,
                         value_in_mg_per_dl: row.get(2)?,
                         trend_arrow: row.get(3)?,
+                        stored_time: None,
                     },
                     row.get::<_, String>(4)?,
                     row.get::<_, i64>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, String>(7)?,
                 ))
             })
             .map_err(db_error)?;
         rows.map(|row| {
-            let (sample, origin, first_seen) = row.map_err(db_error)?;
+            let (mut sample, origin, first_seen, observed, basis) = row.map_err(db_error)?;
+            if let Some(observed) = observed {
+                sample.stored_time = Some(StoredTime {
+                    observed_at_utc: DateTime::from_timestamp(observed, 0)
+                        .ok_or("The local database has an invalid time.")?,
+                    time_basis: TimeBasis::parse(&basis)
+                        .ok_or("The local database has an unknown time basis.")?,
+                });
+            }
             let origin =
                 Origin::parse(&origin).ok_or("The local database has an unknown origin.")?;
             let first_seen_utc = DateTime::from_timestamp(first_seen, 0)
@@ -671,7 +851,7 @@ fn insert_reading(
                 factory,
                 sample.timestamp,
                 time.observed_at_utc.map(epoch),
-                time_basis_text(time.time_basis),
+                time.time_basis.as_str(),
                 value,
                 sample.trend_arrow,
                 origin.as_str(),
@@ -702,6 +882,7 @@ mod tests {
             factory_timestamp: timestamp.to_owned(),
             value_in_mg_per_dl: value,
             trend_arrow: Some(3),
+            stored_time: None,
         }
     }
 
@@ -924,6 +1105,7 @@ mod tests {
             factory_timestamp: "synthetic-bad-factory".to_owned(),
             value_in_mg_per_dl: 100.0,
             trend_arrow: None,
+            stored_time: None,
         });
         store.insert_snapshot(PATIENT, &mine, now).unwrap();
         store
@@ -968,6 +1150,7 @@ mod tests {
                 factory_timestamp: factory.to_owned(),
                 value_in_mg_per_dl: 100.0,
                 trend_arrow: None,
+                stored_time: None,
             },
             graph: vec![],
             active_sensors: vec![],
@@ -1088,7 +1271,7 @@ mod tests {
     }
 
     #[test]
-    fn migrates_a_version_1_database_to_version_2() {
+    fn migrates_a_version_1_database_to_the_current_version() {
         let (_dir, path) = temp_db();
         {
             let conn = Connection::open(&path).unwrap();
@@ -1110,7 +1293,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         assert_eq!(store.reading_count("synthetic-key").unwrap(), 1);
         let status = store.collector_status().unwrap().unwrap();
         assert_eq!(status.heartbeat.pid, 7);

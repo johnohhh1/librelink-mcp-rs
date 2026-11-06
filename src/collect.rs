@@ -161,6 +161,13 @@ impl Collector {
             .await
     }
 
+    /// Records the retention in the database, so `import-csv` applies it.
+    async fn record_retention(&mut self) -> Result<(), Exit> {
+        let days = self.retention_days;
+        self.store_op(move |store| store.set_retention_days(days))
+            .await
+    }
+
     async fn prune(&mut self) -> Result<(), Exit> {
         let (days, now) = (self.retention_days, self.clock.now());
         self.store_op(move |store| store.prune(days, now).map(|_| ()))
@@ -241,6 +248,7 @@ impl Collector {
     }
 
     async fn run_inner(&mut self) -> Result<(), Exit> {
+        self.record_retention().await?;
         self.prune().await?;
         let mut last_prune = Instant::now();
         loop {
@@ -389,6 +397,7 @@ mod tests {
                 factory_timestamp: time,
                 value_in_mg_per_dl: value,
                 trend_arrow: Some(3),
+                stored_time: None,
             }
         };
         Snapshot {
@@ -679,6 +688,12 @@ mod tests {
         harness.stop.send(true).unwrap();
         task.await.unwrap();
         assert_eq!(harness.polls(), [("ok".to_owned(), 3)]);
+        // The retention is recorded for import-csv.
+        let store = harness.store.lock().unwrap();
+        assert_eq!(
+            store.retention_days().unwrap(),
+            Some(DEFAULT_RETENTION_DAYS)
+        );
     }
 
     #[tokio::test(start_paused = true)]

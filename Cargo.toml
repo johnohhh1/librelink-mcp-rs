@@ -9,6 +9,8 @@ repository = "https://github.com/johnohhh1/librelink-mcp-rs"
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10.4"
+csv = "1.4.0"
 directories = "6.0.0"
 getrandom = "0.4.3"
 keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service"] }

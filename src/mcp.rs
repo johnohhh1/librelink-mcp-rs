@@ -5,7 +5,10 @@ use crate::{
     save_settings,
     source::{GlucoseSample, SensorSummary, sensor_activation_time},
     store::{CollectorStatus, Origin, Store, StoreResult, StoredReading},
-    time::{STALE_AFTER_MINUTES, TimeAssessment, TimeBasis, assess_time, assess_time_at},
+    time::{
+        STALE_AFTER_MINUTES, TimeAssessment, TimeBasis, assess_sample, assess_sample_at,
+        assess_time_at,
+    },
 };
 use chrono::{DateTime, Duration, Utc};
 use rmcp::{
@@ -248,8 +251,7 @@ fn observed_rates(items: &[&GlucoseSample], now: DateTime<Utc>) -> RateSummary {
     let mut points: Vec<_> = items
         .iter()
         .filter_map(|item| {
-            let time = assess_time(Some(&item.timestamp), Some(&item.factory_timestamp), now)
-                .observed_at_utc?;
+            let time = assess_sample(item, now).observed_at_utc?;
             (item.value_in_mg_per_dl.is_finite() && item.value_in_mg_per_dl > 0.0 && time <= now)
                 .then_some((time, item.value_in_mg_per_dl))
         })
@@ -299,14 +301,7 @@ fn graph_cadence_seconds(readings: &[StoredReading], now: DateTime<Utc>) -> Opti
     let mut times: Vec<_> = readings
         .iter()
         .filter(|reading| reading.origin == Origin::Graph)
-        .filter_map(|reading| {
-            assess_time(
-                Some(&reading.sample.timestamp),
-                Some(&reading.sample.factory_timestamp),
-                now,
-            )
-            .observed_at_utc
-        })
+        .filter_map(|reading| assess_sample(&reading.sample, now).observed_at_utc)
         .collect();
     times.sort_unstable();
     let mut intervals: Vec<i64> = times
@@ -363,10 +358,7 @@ fn coverage_with(
     options: CoverageOptions,
 ) -> GraphCoverage {
     let cutoff = now - Duration::hours(hours);
-    let assessed: Vec<_> = items
-        .iter()
-        .map(|item| assess_time(Some(&item.timestamp), Some(&item.factory_timestamp), now))
-        .collect();
+    let assessed: Vec<_> = items.iter().map(|item| assess_sample(item, now)).collect();
     let usable = !assessed.is_empty()
         && assessed
             .iter()
@@ -510,6 +502,8 @@ fn trend(arrow: Option<i32>) -> Option<&'static str> {
 enum PointSource {
     Graph,
     CurrentMeasurement,
+    LibreviewCsvHistoric,
+    LibreviewCsvScan,
 }
 
 /// One historical sample. Freshness is deliberately absent: it describes how
@@ -527,7 +521,7 @@ struct HistoryPoint {
 
 fn history_point(item: &GlucoseSample, source: PointSource, now: DateTime<Utc>) -> HistoryPoint {
     let (glucose_mg_dl, value_quality) = value(item.value_in_mg_per_dl);
-    let time = assess_time(Some(&item.timestamp), Some(&item.factory_timestamp), now);
+    let time = assess_sample(item, now);
     HistoryPoint {
         glucose_mg_dl,
         value_quality,
@@ -567,12 +561,7 @@ fn select_graph_window(
 ) -> (Vec<&GlucoseSample>, bool) {
     let assessed: Vec<_> = items
         .iter()
-        .map(|item| {
-            (
-                item,
-                assess_time(Some(&item.timestamp), Some(&item.factory_timestamp), now),
-            )
-        })
+        .map(|item| (item, assess_sample(item, now)))
         .collect();
     let can_filter = !assessed.is_empty()
         && assessed
@@ -716,8 +705,7 @@ fn time_weighted_stats(
     let samples: Vec<metrics::Sample> = graph
         .iter()
         .map(|item| metrics::Sample {
-            at: assess_time(Some(&item.timestamp), Some(&item.factory_timestamp), now)
-                .observed_at_utc,
+            at: assess_sample(item, now).observed_at_utc,
             mg_dl: item.value_in_mg_per_dl,
         })
         .collect();
@@ -806,6 +794,8 @@ fn point_source(origin: Origin) -> PointSource {
     match origin {
         Origin::Graph => PointSource::Graph,
         Origin::CurrentMeasurement => PointSource::CurrentMeasurement,
+        Origin::LibreviewCsvHistoric => PointSource::LibreviewCsvHistoric,
+        Origin::LibreviewCsvScan => PointSource::LibreviewCsvScan,
     }
 }
 
@@ -833,12 +823,7 @@ async fn local_current(local: &LocalStore) -> CallToolResult {
                 value_quality,
                 // Retrieval time is when the collector first stored it, so a
                 // lagging collector shows `stale` honestly.
-                time: assess_time_at(
-                    Some(&reading.sample.timestamp),
-                    Some(&reading.sample.factory_timestamp),
-                    reading.first_seen_utc,
-                    now,
-                ),
+                time: assess_sample_at(&reading.sample, reading.first_seen_utc, now),
                 trend: trend(reading.sample.trend_arrow),
                 cache_hit: false,
                 data_source: LOCAL_STORE,
@@ -967,12 +952,7 @@ async fn local_validate(local: &LocalStore) -> CallToolResult {
     };
     let now = Utc::now();
     let reading_time = match &latest {
-        Some(reading) => assess_time_at(
-            Some(&reading.sample.timestamp),
-            Some(&reading.sample.factory_timestamp),
-            reading.first_seen_utc,
-            now,
-        ),
+        Some(reading) => assess_sample_at(&reading.sample, reading.first_seen_utc, now),
         None => assess_time_at(None, None, local.status.heartbeat.at, now),
     };
     success(serde_json::json!({
@@ -1337,6 +1317,7 @@ mod tests {
             timestamp: timestamp.to_owned(),
             value_in_mg_per_dl: 110.0,
             trend_arrow: Some(3),
+            stored_time: None,
         }
     }
 
@@ -2075,6 +2056,60 @@ mod tests {
         let stats = body(&stats);
         assert_eq!(stats["gmi_percent"], serde_json::Value::Null);
         assert_eq!(stats["gmi_unavailable_reason"], "window_too_short");
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn imported_csv_rows_are_counted_by_stats_and_history() {
+        // A collector has run (it set the patient), but stored no readings.
+        let fixture = local_fixture(&[], None, Some(10));
+        let header = "Device,Serial Number,Device Timestamp,Record Type,\
+                      Historic Glucose mg/dL,Scan Glucose mg/dL,Notes";
+        let mut lines = vec![
+            "Glucose Data,Generated on,synthetic,Generated by,Synthetic Person".to_owned(),
+            header.to_owned(),
+        ];
+        // Every 15 minutes for 24 hours, in device-local time (UTC here).
+        lines.extend((0..96).map(|step| {
+            let at = fixture.at(5 + 15 * step);
+            format!("Synthetic,SYNTH,{},0,150,,", at.format("%m-%d-%Y %I:%M %p"))
+        }));
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("export.csv");
+        std::fs::write(&file, lines.join("\r\n")).unwrap();
+        let options = crate::import_csv::Options {
+            file,
+            timezone: chrono_tz::UTC,
+            date_format: Some(crate::import_csv::DateOrder::Mdy),
+            db: Some(fixture.db.clone()),
+            dry_run: false,
+        };
+        let counts = crate::import_csv::import(&options, fixture.now, &mut Vec::new()).unwrap();
+        assert_eq!(counts.imported, 96);
+
+        let (server, reads) = store_server(&fixture.db);
+        let stats = server
+            .get_glucose_stats(Parameters(StatsArgs { days: Some(1) }))
+            .await;
+        let stats = body(&stats);
+        assert_eq!(stats["data_source"], "local_store");
+        assert_eq!(stats["sample_count"], 96);
+        assert_eq!(stats["window_filter_applied"], true);
+        assert_eq!(stats["time_weighted"]["readings_used"], 96);
+        assert_eq!(stats["time_weighted"]["readings_without_utc"], 0);
+        let coverage = stats["time_weighted"]["coverage_percent"].as_f64().unwrap();
+        assert!(coverage > 98.0, "{coverage}");
+        assert_eq!(stats["time_in_range_percent"], 100.0);
+
+        let history = server
+            .get_glucose_history(Parameters(HistoryArgs { hours: Some(24) }))
+            .await;
+        let history = body(&history);
+        assert_eq!(history["total_readings"], 96);
+        let point = &history["readings"][0];
+        assert_eq!(point["source"], "libreview_csv_historic");
+        assert_eq!(point["time_basis"], "csv_local_declared_timezone");
+        assert!(point["observed_at_utc"].is_string());
         assert_eq!(reads.load(Ordering::SeqCst), 0);
     }
 

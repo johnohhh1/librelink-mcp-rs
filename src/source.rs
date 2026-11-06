@@ -1,6 +1,7 @@
 //! The data the tools need from LibreLinkUp, independent of any HTTP client.
 
 use crate::fetch::FetchError;
+use crate::time::StoredTime;
 use chrono::{DateTime, Utc};
 use std::future::Future;
 use std::pin::Pin;
@@ -16,6 +17,9 @@ pub(crate) struct GlucoseSample {
     pub value_in_mg_per_dl: f64,
     /// Source trend arrow code, if the source sent one.
     pub trend_arrow: Option<i32>,
+    /// Set only for readings read back from the local store: the UTC time
+    /// and basis established when the reading was stored.
+    pub stored_time: Option<StoredTime>,
 }
 
 /// An active sensor's source fields, named for what they hold.

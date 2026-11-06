@@ -1,3 +1,4 @@
+use crate::source::GlucoseSample;
 use chrono::{DateTime, Duration, NaiveDateTime, Utc};
 use serde::Serialize;
 
@@ -24,6 +25,44 @@ pub(crate) enum TimeBasis {
     Conflicting,
     Invalid,
     Missing,
+    /// A LibreView CSV device-local time, converted with the time zone the
+    /// user declared at import.
+    CsvLocalDeclaredTimezone,
+}
+
+impl TimeBasis {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::OffsetKnown => "offset_known",
+            Self::FactoryUtcInferred => "factory_utc_inferred",
+            Self::OffsetMissing => "offset_missing",
+            Self::Conflicting => "conflicting",
+            Self::Invalid => "invalid",
+            Self::Missing => "missing",
+            Self::CsvLocalDeclaredTimezone => "csv_local_declared_timezone",
+        }
+    }
+
+    pub(crate) fn parse(text: &str) -> Option<Self> {
+        [
+            Self::OffsetKnown,
+            Self::FactoryUtcInferred,
+            Self::OffsetMissing,
+            Self::Conflicting,
+            Self::Invalid,
+            Self::Missing,
+            Self::CsvLocalDeclaredTimezone,
+        ]
+        .into_iter()
+        .find(|basis| basis.as_str() == text)
+    }
+}
+
+/// A UTC time already established for a stored reading, with its basis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StoredTime {
+    pub observed_at_utc: DateTime<Utc>,
+    pub time_basis: TimeBasis,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -84,6 +123,38 @@ pub(crate) fn assess_time(
     now: DateTime<Utc>,
 ) -> TimeAssessment {
     assess_time_at(display_raw, factory_raw, now, now)
+}
+
+/// Assesses a sample's time. A stored reading carries the UTC time and basis
+/// established when it was stored, which is the only way to place a CSV row
+/// (its text has no offset and does not parse under the API's rules).
+/// Readings from the API are assessed from their text as usual.
+pub(crate) fn assess_sample_at(
+    sample: &GlucoseSample,
+    retrieved_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> TimeAssessment {
+    let mut time = assess_time_at(
+        Some(&sample.timestamp),
+        Some(&sample.factory_timestamp),
+        retrieved_at,
+        now,
+    );
+    if let Some(stored) = sample.stored_time {
+        if stored.time_basis == TimeBasis::CsvLocalDeclaredTimezone {
+            // The factory column holds the import's dedup key, not a clock.
+            time.factory_timestamp = None;
+            time.display_minus_factory_minutes = None;
+        }
+        time.observed_at_utc = Some(stored.observed_at_utc);
+        time.time_basis = stored.time_basis;
+        time.freshness = freshness_at(stored.observed_at_utc, now);
+    }
+    time
+}
+
+pub(crate) fn assess_sample(sample: &GlucoseSample, now: DateTime<Utc>) -> TimeAssessment {
+    assess_sample_at(sample, now, now)
 }
 
 pub(crate) fn assess_time_at(
@@ -156,6 +227,23 @@ pub(crate) fn assess_time_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn time_basis_text_matches_its_json_name_and_round_trips() {
+        for basis in [
+            TimeBasis::OffsetKnown,
+            TimeBasis::FactoryUtcInferred,
+            TimeBasis::OffsetMissing,
+            TimeBasis::Conflicting,
+            TimeBasis::Invalid,
+            TimeBasis::Missing,
+            TimeBasis::CsvLocalDeclaredTimezone,
+        ] {
+            assert_eq!(serde_json::to_value(basis).unwrap(), basis.as_str());
+            assert_eq!(TimeBasis::parse(basis.as_str()), Some(basis));
+        }
+        assert_eq!(TimeBasis::parse("unknown_basis"), None);
+    }
 
     fn now() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-11-05T20:00:00Z")

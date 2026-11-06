@@ -376,6 +376,7 @@ impl From<GlucoseWire> for GlucoseSample {
             factory_timestamp: wire.factory_timestamp,
             value_in_mg_per_dl: wire.value_in_mg_per_dl,
             trend_arrow: wire.trend_arrow,
+            stored_time: None,
         }
     }
 }
@@ -864,6 +865,7 @@ mod tests {
                 factory_timestamp: "11/05/2026 07:58:00 PM".to_owned(),
                 value_in_mg_per_dl: 123.0,
                 trend_arrow: Some(4),
+                stored_time: None,
             }
         );
         assert_eq!(snapshot.graph.len(), 2);

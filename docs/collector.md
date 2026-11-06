@@ -26,7 +26,7 @@ How it behaves:
 - **Polling:** at most once every 60 seconds, plus 0–5 seconds of random jitter. The 60-second floor cannot be lowered. When LibreLinkUp asks for a longer wait, for example during a rate limit, the collector waits that long instead.
 - **Heartbeat:** written to the database at least every 30 seconds, including while waiting out a cooldown. `serve` uses it to tell whether a collector is running.
 - **One collector per database:** an advisory lock on `<db>.lock` is held while running. A second `collect` on the same database exits with "another collector is already running for this database". The OS releases the lock when the process exits, so a crash cannot leave a stale lock.
-- **Retention:** expired readings and poll records are pruned at startup and then once a day.
+- **Retention:** expired readings and poll records are pruned at startup and then once a day. The retention is recorded in the database at startup, and [`import-csv`](csv-import.md) applies it to imported rows.
 - **Stopping:** Ctrl+C, or SIGTERM on Unix, finishes any write in progress and exits with status 0.
 - **Logs:** one line per poll on stderr, with the outcome and the number of readings added, or the error code and the wait in seconds.
 
@@ -65,11 +65,11 @@ Every data reply includes `data_source`. From the store:
 
 What the database stores:
 
-- Glucose readings: the source timestamp text, the reading's deduplication key (the factory clock text for readings from LibreLinkUp), the interpreted UTC time and its basis, the mg/dL value, the trend arrow code, whether the reading came from the graph or the current measurement, and when it was first seen.
+- Glucose readings, collected or [imported from a LibreView CSV](csv-import.md): the source timestamp text, the reading's deduplication key (the factory clock text for readings from LibreLinkUp), the interpreted UTC time and its basis, the mg/dL value, the trend arrow code, whether the reading came from the graph, the current measurement, or a CSV historic or scan row, and when it was first seen.
 - One row per poll attempt: its time, the outcome (`ok` or an error code), and how many readings it added. This lets later steps tell "collector not running" apart from "LibreLinkUp had no data".
 - The collector heartbeat: time, process ID, version, and the salted key of the patient being collected.
 - The latest snapshot's sensors, in the form tools show them: the last four characters of the serial number and device ID, the activation time, warmup minutes, and product type code.
-- A random per-database salt.
+- A random per-database salt, and the collector's retention in days.
 
 What it never stores:
 
@@ -85,7 +85,7 @@ To delete everything, stop the collector and run:
 librelink-mcp-rs clear-local-data
 ```
 
-That removes the credentials, the local preferences, and the database with its `-wal`, `-shm`, and `.lock` files. Pass `--db <path>` to delete a database at a custom location. It refuses while a collector holds that database's lock.
+That removes the credentials, the local preferences, and the database with its `-wal`, `-shm`, `.lock`, and `.import.lock` files. Pass `--db <path>` to delete a database at a custom location. It refuses while a collector or a CSV import holds that database's lock.
 
 ## Running it as a systemd user service
 

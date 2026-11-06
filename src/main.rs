@@ -8,6 +8,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 mod collect;
 mod fetch;
+mod import_csv;
 mod llu_client;
 mod mcp;
 mod metrics;
@@ -199,11 +200,15 @@ fn parse_db_option(args: &[String]) -> Result<Option<PathBuf>, &'static str> {
     }
 }
 
-/// Refuses while a collector holds the database's lock.
-fn ensure_no_collector(db: Option<&Path>) -> Result<(), &'static str> {
+/// Refuses while a collector or a CSV import holds one of the database's
+/// locks.
+fn ensure_not_in_use(db: Option<&Path>) -> Result<(), &'static str> {
     match db {
         Some(db) if store::database_locked(db)? => Err(
             "A collector is running for the local database. Stop it, then run clear-local-data again.",
+        ),
+        Some(db) if store::import_locked(db)? => Err(
+            "A CSV import is running for the local database. Let it finish, then run clear-local-data again.",
         ),
         _ => Ok(()),
     }
@@ -212,7 +217,7 @@ fn ensure_no_collector(db: Option<&Path>) -> Result<(), &'static str> {
 fn clear_local_data(db: Option<PathBuf>) -> Result<(), &'static str> {
     let db = db.or_else(store::default_db_path);
     // Check before deleting anything, so a refusal leaves everything intact.
-    ensure_no_collector(db.as_deref())?;
+    ensure_not_in_use(db.as_deref())?;
     delete_entry_if_present(keyring_entry()?)?;
     delete_entry_if_present(settings_entry()?)?;
     if let Some(db) = &db {
@@ -336,6 +341,9 @@ async fn run() {
         let code = collect::run_cli(&args[2..], live_fetcher()).await;
         std::process::exit(code);
     }
+    if args.get(1).map(String::as_str) == Some("import-csv") {
+        std::process::exit(import_csv::run_cli(&args[2..]));
+    }
     let result: Result<(), Cow<'static, str>> = match args.as_slice() {
         [_, command] if command == "setup" => setup().map_err(Cow::from),
         [_, command] if command == "check" => check().await,
@@ -351,7 +359,7 @@ async fn run() {
             Err(message) => Err(Cow::from(message)),
         },
         _ => Err(Cow::from(
-            "Usage: librelink-mcp-rs <setup|select-patient|set-api-version|check|collect|clear-local-data|serve> [--db <path>]",
+            "Usage: librelink-mcp-rs <setup|select-patient|set-api-version|check|collect|import-csv|clear-local-data|serve> [--db <path>]",
         )),
     };
     if let Err(message) = result {
@@ -387,14 +395,29 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let db = dir.path().join("readings.sqlite3");
         drop(store::Store::open(&db).unwrap());
-        assert!(ensure_no_collector(Some(&db)).is_ok());
+        assert!(ensure_not_in_use(Some(&db)).is_ok());
         let held = store::lock_database(&db).unwrap();
-        assert!(ensure_no_collector(Some(&db)).is_err());
+        assert!(ensure_not_in_use(Some(&db)).is_err());
         drop(held);
-        assert!(ensure_no_collector(Some(&db)).is_ok());
-        assert!(ensure_no_collector(None).is_ok());
+        assert!(ensure_not_in_use(Some(&db)).is_ok());
+        assert!(ensure_not_in_use(None).is_ok());
         // A path that does not exist is not locked.
-        assert!(ensure_no_collector(Some(&dir.path().join("missing.sqlite3"))).is_ok());
+        assert!(ensure_not_in_use(Some(&dir.path().join("missing.sqlite3"))).is_ok());
+    }
+
+    #[test]
+    fn clearing_a_database_is_refused_while_an_import_holds_its_lock() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = dir.path().join("readings.sqlite3");
+        drop(store::Store::open(&db).unwrap());
+        let held = store::lock_import(&db).unwrap();
+        assert!(store::import_locked(&db).unwrap());
+        // Refused before anything is deleted, keyring entries included.
+        let error = clear_local_data(Some(db.clone())).unwrap_err();
+        assert!(error.contains("CSV import"), "{error}");
+        assert!(db.exists());
+        drop(held);
+        assert!(ensure_not_in_use(Some(&db)).is_ok());
     }
 
     #[cfg(target_os = "linux")]
