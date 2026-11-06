@@ -49,7 +49,7 @@ Exit statuses:
 Every data reply includes `data_source`. From the store:
 
 - `get_current_glucose` reports the newest stored reading. Its `retrieved_at_utc` is when the collector stored it, so freshness turns `stale` if the collector falls behind, for example during a long rate-limit cooldown.
-- `get_glucose_history`, `get_glucose_stats`, and `get_glucose_trends` use the requested window, up to each tool's maximum. When stored coverage spans the window without gaps, `period_status` is `sample_summary` instead of `partial`.
+- `get_glucose_history`, `get_glucose_stats`, and `get_glucose_trends` use the requested window, up to each tool's maximum. When the stored readings span the whole window (the first within 15 minutes of its start and the last within 15 minutes of its end), `period_status` is `sample_summary` instead of `partial`. Interior gaps do not make a period partial; they are listed in `coverage.interior_gaps` and reflected in the time-weighted `coverage_percent`.
 - Each interior gap in `coverage` has a `cause`, the first of these that applies:
   1. `no_data_from_api`: the collector polled during the gap but got no readings for that span.
   2. `no_data_in_export`: the gap lies entirely within the span of [imported CSV](csv-import.md) rows, so the device's own history has nothing there, for example during a sensor change.

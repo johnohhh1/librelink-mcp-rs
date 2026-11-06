@@ -363,6 +363,10 @@ fn classify_gaps(coverage: &mut GraphCoverage, polls: &PollWindow) {
     }
 }
 
+/// The observed span may start or end this far inside the window and still
+/// count as covering it.
+const SPAN_EDGE_TOLERANCE_MINUTES: i64 = 15;
+
 fn coverage_with(
     items: &[GlucoseSample],
     hours: i64,
@@ -434,11 +438,11 @@ fn coverage_with(
     }
     let start_gap_seconds = first.signed_duration_since(cutoff).num_seconds().max(0);
     let end_gap_seconds = now.signed_duration_since(last).num_seconds().max(0);
-    let period_span_sufficient = cadence_seconds.is_some_and(|cadence| {
-        first <= cutoff + Duration::seconds(cadence)
-            && end_gap_seconds <= 15 * 60
-            && interior_gap_count == 0
-    });
+    // `partial` means the observed span does not reach both ends of the
+    // window. Interior gaps are reported in `interior_gaps` and in the
+    // time-weighted coverage instead.
+    let edge = Duration::minutes(SPAN_EDGE_TOLERANCE_MINUTES);
+    let period_span_sufficient = first <= cutoff + edge && last >= now - edge;
     GraphCoverage {
         source: options.source,
         requested_hours: hours,
@@ -1412,7 +1416,8 @@ mod tests {
             synthetic_item("2026-11-05T20:00:00Z"),
         ];
         let coverage = graph_coverage(&graph, 1, now);
-        assert!(!coverage.period_span_sufficient);
+        // The span reaches both ends; the gap is reported, not hidden.
+        assert!(coverage.period_span_sufficient);
         assert_eq!(coverage.interior_gap_count, 1);
         assert_eq!(coverage.actual_points_in_window, Some(4));
         assert_eq!(coverage.expected_points_estimate, Some(5));
@@ -2355,6 +2360,85 @@ mod tests {
             .map(|(minutes, cause)| (*minutes, (*cause).to_owned()))
             .collect();
         assert_eq!(gaps, expected);
+    }
+
+    #[tokio::test]
+    async fn interior_gaps_do_not_make_a_full_span_partial() {
+        // 14 days every 15 minutes, with a 3-hour gap 3 days ago and a
+        // 2-hour gap 12 hours ago.
+        let minutes: Vec<i64> = every_15_minutes(14 * 24 + 1)
+            .into_iter()
+            .filter(|m| !(4320 < *m && *m < 4500) && !(720 < *m && *m < 840))
+            .collect();
+        let fixture = local_fixture(&minutes, None, Some(10));
+        let (server, _) = store_server(&fixture.db);
+        let stats = server
+            .get_glucose_stats(Parameters(StatsArgs { days: Some(14) }))
+            .await;
+        let stats = body(&stats);
+        assert_eq!(stats["period_status"], "sample_summary");
+        assert_eq!(stats["coverage"]["interior_gap_count"], 2);
+        let coverage = stats["time_weighted"]["coverage_percent"].as_f64().unwrap();
+        assert!((95.0..99.0).contains(&coverage), "{coverage}");
+        assert!(stats["gmi_percent"].is_number());
+
+        let trends = server
+            .get_glucose_trends(Parameters(TrendsArgs {
+                period: Some(Period::Daily),
+            }))
+            .await;
+        let trends = body(&trends);
+        assert_eq!(trends["period_status"], "sample_summary");
+        assert_eq!(trends["coverage"]["interior_gap_count"], 1);
+    }
+
+    #[tokio::test]
+    async fn data_that_starts_late_is_partial() {
+        // 12 days of readings in a 14-day window: the span starts 2 days late.
+        let fixture = local_fixture(&every_15_minutes(12 * 24), None, Some(10));
+        let (server, _) = store_server(&fixture.db);
+        let stats = server
+            .get_glucose_stats(Parameters(StatsArgs { days: Some(14) }))
+            .await;
+        let stats = body(&stats);
+        assert_eq!(stats["period_status"], "partial");
+        assert_eq!(stats["coverage"]["interior_gap_count"], 0);
+        // GMI is gated on the window and coverage only: 12 of 14 days is
+        // above 70%, so the estimate is given even though the span is partial.
+        let coverage = stats["time_weighted"]["coverage_percent"].as_f64().unwrap();
+        assert!((85.0..86.0).contains(&coverage), "{coverage}");
+        assert!(stats["gmi_percent"].is_number());
+
+        // Data that stops early is partial too.
+        let minutes: Vec<i64> = every_15_minutes(24)
+            .into_iter()
+            .filter(|m| *m > 30)
+            .collect();
+        let fixture = local_fixture(&minutes, None, Some(10));
+        let (server, _) = store_server(&fixture.db);
+        let trends = server
+            .get_glucose_trends(Parameters(TrendsArgs {
+                period: Some(Period::Daily),
+            }))
+            .await;
+        assert_eq!(body(&trends)["period_status"], "partial");
+    }
+
+    #[test]
+    fn the_live_path_uses_the_same_span_rule() {
+        let now = DateTime::parse_from_rfc3339("2026-11-05T20:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        // A full day, with a 2-hour hole in the middle.
+        let graph: Vec<GlucoseSample> = (0..=96)
+            .filter(|step| !(40..48).contains(step))
+            .map(|step| synthetic_item(&(now - Duration::minutes(15 * step)).to_rfc3339()))
+            .collect();
+        let body = summarize_stats(&graph, 1, 70, 180, now).unwrap();
+        assert_eq!(body["period_status"], "sample_summary");
+        assert_eq!(body["coverage"]["interior_gap_count"], 1);
+        let trends = summarize_trends("daily", 24, &graph, graph_coverage(&graph, 24, now), now);
+        assert_eq!(trends["period_status"], "sample_summary");
     }
 
     #[tokio::test]
