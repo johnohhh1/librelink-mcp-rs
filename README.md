@@ -6,9 +6,9 @@
 [![Rust 1.89+](https://img.shields.io/badge/Rust-1.89%2B-DEA584?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![MCP stdio](https://img.shields.io/badge/MCP-stdio-7053C1)](https://modelcontextprotocol.io/)
 [![MIT license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
-[![Status: early prototype](https://img.shields.io/badge/status-early%20prototype-orange)](docs/roadmap.md)
+[![Status: 1.0](https://img.shields.io/badge/status-1.0-2E8B57)](CHANGELOG.md)
 
-[Quick start](#quick-start) · [Eight tools](#the-eight-tools) · [Data quality](#data-quality) · [Privacy](#privacy-and-local-data) · [Roadmap](docs/roadmap.md)
+[Install](docs/install.md) · [Eight tools](#the-eight-tools) · [Data quality](#data-quality) · [Privacy](docs/privacy.md) · [Troubleshooting](docs/troubleshooting.md) · [Compatibility](docs/compatibility.md)
 
 This independent port preserves the **eight MCP tool names** from [Amandeep Khurana's original LibreLink MCP Server](https://github.com/amansk/librelink-mcp-server). It uses Rust, `rmcp`, and a local OS credential store. Thank you to Amandeep and the original contributors for the project and tool design. Their TypeScript code is not included here.
 
@@ -20,42 +20,46 @@ This independent port preserves the **eight MCP tool names** from [Amandeep Khur
 | | Current state |
 | --- | --- |
 | **Transport** | Local MCP over stdio |
-| **Platforms** | Linux, macOS, and Windows CI builds and tests |
+| **Platforms** | Release binaries for Linux (x86_64, ARM64), macOS (Apple silicon, Intel), and Windows (x86_64), plus a Claude Desktop bundle |
+| **Validated** | One US follower account with a FreeStyle Libre 3; everything else is [unvalidated](docs/compatibility.md) |
 | **Secrets** | OS credential store; no plaintext fallback or MCP password arguments |
 | **Readings** | Source timestamps retained; factory UTC interpretation labeled as inferred |
 | **History** | About 12 hours from the live graph, or the requested window from the optional local collector; observed span, cadence, and labeled gaps |
 | **Analytics** | Sample statistics plus time-weighted coverage, consensus bands, and time in range; GMI as an estimate only for 14+ days at 70%+ coverage |
 
-## Quick start
+## Install
 
-You need **Rust 1.89 or newer** and an available OS credential store: macOS Keychain, Windows Credential Manager, or a Linux Secret Service session. On Debian or Ubuntu, install `libdbus-1-dev` and `pkg-config` to build the keyring backend. If `cargo` is not on your shell path after installing Rust, run `. "$HOME/.cargo/env"`.
+Download the archive for your platform from the [latest release](https://github.com/johnohhh1/librelink-mcp-rs/releases), check it against `SHA256SUMS`, and put the binary on your `PATH`. Or build it with Rust 1.89 or newer:
 
 ```sh
-git clone https://github.com/johnohhh1/librelink-mcp-rs.git
-cd librelink-mcp-rs
-cargo run -- setup
-cargo run -- check
+cargo install --locked --git https://github.com/johnohhh1/librelink-mcp-rs --tag v1.0.0
 ```
 
-`setup` prompts locally for the follower account email, a hidden password, and a region. It accepts `global` (the default), `us`, `eu`, `eu2`, `ae`, `ap`, `au`, `ca`, `de`, `fr`, `jp`, `la`, `ru`, and `cn`. If the account follows more than one person, run `cargo run -- select-patient` in a terminal and pick the person by number before `check`. The choice is stored as the connection's patient ID in the OS credential store and is never printed. With no choice stored, an account with several connections is rejected (`patient_selection_required`) instead of silently choosing one. If the chosen person later disappears from the account, reads stop with `patient_selection_changed` and never switch to someone else. A full-name selection saved by an earlier version is converted to the ID the first time it matches exactly one connection.
+The [install guide](docs/install.md) covers checksums, the Linux `libdbus` runtime need, macOS and Windows notes, Claude Desktop (bundle or configuration file), and running the collector as a service.
 
-`check` logs in, reads the followed person's graph, and prints a small connectivity report. Since v0.2 the server uses its own LibreLinkUp client instead of the `libre_link_up_api_client` crate; [ADR 0001](docs/adr/0001-owned-api-client.md) explains why. The owned client sends the same request headers as the crate did. It was checked against one live US follower account on 2026-11-05; other accounts, regions, and sensors still need validation.
+## Quick start
 
-`check` includes `display_minus_factory_minutes`, so you can inspect the clock relationship locally without sharing a response. The difference reflects the **sharer's** local clock, which may differ from your own timezone. To change the client version after an Abbott version requirement changes, run `cargo run -- set-api-version` locally and restart the MCP server.
+```sh
+librelink-mcp-rs setup            # follower account email, hidden password, region
+librelink-mcp-rs select-patient   # only if the account follows more than one person
+librelink-mcp-rs check            # logs in and prints a small connectivity report
+```
+
+`setup` stores the credentials in the OS credential store: macOS Keychain, Windows Credential Manager, or a Linux Secret Service session. It accepts the regions `global` (the default), `us`, `eu`, `eu2`, `ae`, `ap`, `au`, `ca`, `de`, `fr`, `jp`, `la`, `ru`, and `cn`.
+
+`select-patient` lists the people the account follows and stores your choice as a patient ID in the OS credential store; the ID is never printed. With no choice stored, an account with several connections is rejected (`patient_selection_required`) instead of silently choosing one. If the chosen person later disappears from the account, reads stop with `patient_selection_changed` and never switch to someone else. A full-name selection saved by an earlier version is converted to the ID the first time it matches exactly one connection.
+
+`check` includes `display_minus_factory_minutes`, so you can inspect the clock relationship locally without sharing a response. The difference reflects the **sharer's** local clock. If Abbott starts requiring a newer client version, run `librelink-mcp-rs set-api-version` and restart the server. The owned LibreLinkUp client is explained in [ADR 0001](docs/adr/0001-owned-api-client.md).
 
 ### Connect an MCP client
 
-Build the binary and point your MCP client at it:
-
-```sh
-cargo build --release
-```
+Open the release's `.mcpb` bundle with Claude Desktop, or point any MCP client at the binary:
 
 ```json
 {
   "mcpServers": {
-    "librelink-rs": {
-      "command": "/absolute/path/to/librelink-mcp-rs/target/release/librelink-mcp-rs",
+    "librelink": {
+      "command": "/absolute/path/to/librelink-mcp-rs",
       "args": ["serve"]
     }
   }
@@ -66,18 +70,18 @@ The server reuses its authenticated API client. Restart it after changing creden
 
 ## The eight tools
 
-| Tool | What it currently returns |
+| Tool | What it returns |
 | --- | --- |
 | `get_current_glucose` | Latest available reading, source time, and explicit freshness |
 | `get_glucose_history` | Readings in the requested hours (up to 2160 from the local store), each labeled with its source, oldest first and paged by `limit` and `before`; coverage over the whole window |
-| `get_glucose_stats` | Descriptive statistics over the returned graph, labeled `partial` when it covers less than the requested days |
+| `get_glucose_stats` | Sample statistics plus time-weighted coverage, consensus bands, time in range, and GMI (an estimate, only for 14+ days at 70%+ coverage) |
 | `get_glucose_trends` | Partial-period status, extrema, source arrows, and descriptive adjacent-point rates |
 | `get_sensor_info` | Masked serial and device ID (last four characters), interpreted activation epoch, warmup minutes, and product type code |
 | `configure_credentials` | Local setup instructions; accepts **no credentials** |
 | `configure_ranges` | Validates and saves local target bounds in mg/dL |
 | `validate_connection` | Connection and data-availability status without glucose values or secrets |
 
-Tool replies contain MCP `structuredContent` plus a JSON text block for clients that only display text. Errors set `isError: true` and use safe codes including `invalid_input`, `insufficient_data`, `rate_limited`, `timeout`, `session_expired`, `authentication_failed`, `account_action_required`, `client_version_rejected` (Abbott requires a newer client version; run `set-api-version`), `request_rejected` (the API refused this client's request headers; please report it as a bug), `api_changed`, `local_store_unavailable` (the collector's database could not be read), and `upstream_unavailable`. `api_changed` means a successful response was not JSON: the API may have changed or been retired, but it is not proof of either. After `authentication_failed`, `client_version_rejected`, or `request_rejected`, the server makes no further LibreLinkUp requests until it is restarted, so a wrong password cannot drive the account into an Abbott lockout. The client logs in only when it has no valid session or after a 401, and never because of throttling or other errors. Rate-limit replies include `retry_after_seconds`. Upstream response bodies and tokens are never included in error messages.
+Every tool has MCP annotations (the data tools are read-only and idempotent) and a published `outputSchema`; replies contain `structuredContent` that matches it, plus a JSON text block for clients that only display text. The resource `glucose://current` serves the same reply as `get_current_glucose`. History is paged: at most `limit` readings (default 500) per reply, with `next_before` to fetch older ones. Errors set `isError: true` and use safe codes including `invalid_input`, `insufficient_data`, `rate_limited`, `timeout`, `session_expired`, `authentication_failed`, `account_action_required`, `client_version_rejected` (Abbott requires a newer client version; run `set-api-version`), `patient_selection_required` and `patient_selection_changed` (run `select-patient`), `request_rejected` (the API refused this client's request headers; please report it as a bug), `api_changed`, `local_store_unavailable` (the collector's database could not be read), and `upstream_unavailable`. `api_changed` means a successful response was not JSON: the API may have changed or been retired, but it is not proof of either. After `authentication_failed`, `client_version_rejected`, `request_rejected`, or `patient_selection_changed`, the server makes no further LibreLinkUp requests until it is restarted, so a wrong password cannot drive the account into an Abbott lockout. The client logs in only when it has no valid session or after a 401, and never because of throttling or other errors. Rate-limit replies include `retry_after_seconds`. Upstream response bodies and tokens are never included in error messages. [Troubleshooting](docs/troubleshooting.md) explains each code.
 
 ## Data quality
 
@@ -90,7 +94,7 @@ When every graph point has a usable offset-aware or inferred UTC time, history, 
 The LibreLinkUp graph covers only about 12 hours. The opt-in `collect` command polls about once a minute (never more often than every 60 seconds) and keeps readings in a local SQLite database for 90 days by default:
 
 ```sh
-cargo run -- collect
+librelink-mcp-rs collect
 ```
 
 It runs in the foreground until Ctrl+C, allows one collector per database, and stops with exit status 78 on errors a retry cannot fix. While a collector is running (its heartbeat is under 3 minutes old), `serve` answers every data tool from the database and makes no LibreLinkUp requests; otherwise it uses the live API. Every data reply says which in `data_source` (`local_store` or `live_api`), and stored data is only as fresh as the collector. Both commands accept `--db <path>`. See the [collector guide](docs/collector.md) for options, what is and isn't stored, and a systemd user service example.
@@ -101,15 +105,24 @@ Upgrading from 0.3: stop the collector, install the new version, run `import-csv
 
 ## Privacy and local data
 
+See [privacy](docs/privacy.md) for everything stored, the network destinations, what the MCP client sees, and deletion.
+
 - Credentials live in the OS credential store. There is no plaintext file fallback, command-line password flag, or MCP secret input.
 - `serve` does not persist glucose history. The opt-in `collect` command stores readings in a local SQLite database: values and timestamps keyed by a salted patient pseudonym, with no credentials, tokens, names, or raw patient IDs. Nothing is uploaded. See [what the collector stores](docs/collector.md#privacy).
 - Successful graph reads are cached in memory for 60 seconds. Detected rate limits and account lockouts trigger a cooldown, using the server's retry time within 60 to 900 seconds; other upstream failures also pause calls for 60 seconds. Cached readings keep their original retrieval time.
-- `cargo run -- clear-local-data [--db <path>]` removes this project's credential and preference entries from the OS store, and the collector's database. It refuses while a collector holds that database's lock. Stop the server first; run `setup` again to reconnect.
+- `librelink-mcp-rs clear-local-data [--db <path>]` removes this project's credential and preference entries from the OS store, and the collector's database. It refuses while a collector or an import holds that database's lock. Stop the server first; run `setup` again to reconnect.
 - Network: the only destinations are LibreLinkUp's regional API hosts (`*.libreview.io`, `api.libreview.ru`, `api-cn.myfreestyle.cn`), contacted by `check`, `select-patient`, `collect`, and `serve` on the live path. There is no telemetry, update check, or other network use; `import-csv` and the store path never use the network.
 - Errors and logs carry fixed messages and public error codes, never credentials, tokens, account or patient IDs, names, serial numbers, glucose values, file contents, or upstream response bodies. A panic prints a fixed message; set `LIBRELINK_MCP_DEBUG=1` to see its details locally, and review them before sharing. `check` deliberately prints one reading in your own terminal.
 - The `.gitignore` excludes local configuration, data exports, databases, logs, and key files. Tests use synthetic fixtures only.
 
 On headless Linux systems without Secret Service, `setup` fails closed. If you used the original server, its `~/.librelink-mcp/config.json` may contain a plaintext password; this port does not read, migrate, or delete that file.
+
+## Documentation
+
+- [Install](docs/install.md), [troubleshooting](docs/troubleshooting.md), [privacy](docs/privacy.md), and [compatibility](docs/compatibility.md)
+- [Collector guide](docs/collector.md) and [importing a LibreView CSV export](docs/csv-import.md)
+- [Architecture and parity notes](docs/architecture.md), [roadmap](docs/roadmap.md), and [changelog](CHANGELOG.md)
+- Decision records: [ADR 0001: owned API client](docs/adr/0001-owned-api-client.md), [ADR 0002: local store and collector](docs/adr/0002-local-store-and-collector.md), [ADR 0003: time-weighted metrics and CSV import](docs/adr/0003-time-weighted-metrics-and-csv-import.md)
 
 ## Build and contribute
 
@@ -117,9 +130,10 @@ On headless Linux systems without Secret Service, `setup` fails closed. If you u
 cargo fmt --all -- --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
+cargo deny --locked check
 ```
 
-CI runs those checks on Linux, macOS, and Windows. A synthetic stdio test initializes the server, lists all eight tools, checks structured output, and confirms that a password argument is rejected without echoing it. Please keep real account responses, glucose readings, credentials, and tokens out of issues and test fixtures. Start with the [roadmap](docs/roadmap.md) and [architecture notes](docs/architecture.md).
+CI runs the first three on Linux, macOS, and Windows, the tests again on Rust 1.89, and `cargo deny` for advisories, licenses, and sources. Tests use synthetic data only: please keep real account responses, glucose readings, credentials, and tokens out of issues and test fixtures. Contributor conventions are in [AGENTS.md](AGENTS.md). Releases are built by `.github/workflows/release.yml` from a `v*` tag.
 
 ## License
 
