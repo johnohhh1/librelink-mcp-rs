@@ -1,0 +1,37 @@
+# Architecture and parity plan
+
+## Findings from the two upstream projects
+
+The original [TypeScript server](https://github.com/amansk/librelink-mcp-server) exposes exactly eight tools. Its `src/config.ts` writes the account password into `~/.librelink-mcp/config.json`. Its `src/librelink-client.ts` synthesizes sensor type, serial number, and activation time. Its `src/glucose-analytics.ts` infers dawn and meal phenomena without supporting context; missing overnight data can yield a zero variability score. Its credential tool accepts a password in MCP arguments. Those behaviors must not be ported.
+
+The [Rust API client](https://github.com/ItsXrgon/libre-link-up-api-client) has a published 0.3.3 API with `ClientConfig::new`, `LibreLinkUpClient::new`, `read_raw`, and `read`. Its README still shows dependency version 0.2.1. The 0.3.3 source handles login redirects and region mapping, but its error says credentials must be for **LibreLinkUp**, not a primary **LibreLink** account. The [original server's Node API dependency](https://github.com/DRFR0ST/libre-link-unofficial-api) also requires LibreLinkUp credentials, despite the original server README's wording. The original server stores a region preference but does not pass it to its Node client constructor. `read_raw` requires a followed patient and defaults to the first connection. The processed `read` maps unparseable timestamps to `Utc::now()` and missing or unknown trend arrows to `Flat`; the server should use raw measurements until those cases are preserved correctly. The crate's complete raw models also require many fields, so a successful login does not yet prove it can decode every account's graph response.
+
+Live account compatibility is not established by code inspection. The PoC's local `check` command is the validation step; no credentials are needed in this repository or chat.
+
+## Components
+
+1. **Local configuration CLI:** `setup` stores credentials in the OS credential store. Non-secret preferences such as target range and selected patient can later use a validated, atomic local config file. The MCP interface never receives credentials.
+2. **API adapter:** wrap the selected client behind a small `DataSource` trait. Convert raw API responses to internal reading and sensor models. Preserve source timestamps, units, trend unknowns, and explicit provenance. Map errors to safe public codes, without raw server response bodies.
+3. **Data quality:** represent `observed`, `estimated`, `missing`, and `stale` separately. A timestamp without a known timezone has unknown freshness. Caching must preserve source time and retrieval time separately; a cache hit cannot make an old reading current.
+4. **Analytics:** use descriptive summaries only. Reject unsupported windows, expose observed coverage and sample count, and return unavailable fields when data are insufficient. No meal or dawn diagnosis without the needed context. GMI, if offered, is an estimate with its input window and limitations.
+5. **MCP transport:** `rmcp` on stdio with `tokio`. Tool handlers return typed, serialized results and concise errors. `tracing` goes to stderr with secret and personal-data redaction. SQLite is optional for explicitly enabled local historical storage, never for passwords or tokens.
+
+## Original tool names
+
+| Tool | Planned safe behavior |
+| --- | --- |
+| `get_current_glucose` | Return latest *available* reading, source time, retrieval time, and freshness; never imply a stale value is live. |
+| `get_glucose_history` | Return observed readings within requested hours and actual coverage; do not pretend the API supplied the whole requested period. |
+| `get_glucose_stats` | Return descriptive statistics with sample count and coverage. Mark GMI estimated or unavailable when the window is inadequate. |
+| `get_glucose_trends` | Return descriptive changes and unavailable fields with reasons; no inferred meals, diagnoses, or treatment suggestions. |
+| `get_sensor_info` | Return only source-provided sensor fields. Unknown activation and lifetime remain missing; a derived date is labeled estimated. |
+| `configure_credentials` | Preserve the name but accept **no secret arguments**. Report local `setup` instructions and credential-store status only. |
+| `configure_ranges` | Validate ordered numeric bounds and save non-secret range preferences. |
+| `validate_connection` | Perform a safe API read and return connection/data status without credential or raw response leakage. |
+
+## Test gates
+
+- Synthetic fixtures for stale, missing, timezone-free, and future timestamps; unknown trend arrows; missing sensor metadata; short or sparse history; and invalid ranges.
+- MCP tool-list parity test for all eight names and a schema test proving `configure_credentials` has no password field.
+- API adapter tests with synthetic responses and sanitized error mapping. A local manual account check is separate and never recorded as a fixture.
+- CI on Linux, macOS, and Windows: `cargo fmt --check`, clippy with warnings denied, and tests. Add a lockfile when Cargo is available.

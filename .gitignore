@@ -1,0 +1,11 @@
+/target/
+/.env
+/.env.*
+!.env.example
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+config.json
+credentials.json
+*.log

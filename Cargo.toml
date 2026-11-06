@@ -1,0 +1,18 @@
+[package]
+name = "librelink-mcp-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "A privacy-conscious Rust MCP server for LibreLinkUp data (early prototype)"
+repository = "https://github.com/johnohhh1/librelink-mcp-rs"
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service"] }
+libre_link_up_api_client = "=0.3.3"
+rpassword = "7.5.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+zeroize = "1.9.1"
