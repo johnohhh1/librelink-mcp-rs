@@ -70,7 +70,7 @@ The server reuses its authenticated API client. Restart it after changing creden
 | `get_glucose_history` | Graph readings and whether requested-hour filtering was applied |
 | `get_glucose_stats` | Descriptive statistics for returned valid samples, with coverage limits stated |
 | `get_glucose_trends` | Observed extrema and trend-arrow counts, without meal or dawn inference |
-| `get_sensor_info` | Source-provided sensor fields; unknown details remain absent |
+| `get_sensor_info` | Source-provided sensor fields; unknown details are `null` |
 | `configure_credentials` | Local setup instructions; accepts **no credentials** |
 | `configure_ranges` | Validates and saves local target bounds in mg/dL |
 | `validate_connection` | Connection and data-availability status without glucose values or secrets |
