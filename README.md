@@ -48,7 +48,7 @@ Tool replies include both MCP `structuredContent` and a JSON text block for clie
 
 `rmcp` and `tokio` handle stdio. SQLite remains optional future work and will not store credentials. Tests use synthetic data and no account secrets.
 
-CI checks formatting, Clippy, and tests on Linux, macOS, and Windows. Only Linux has been compiled locally so far.
+CI checks formatting, Clippy, and tests on Linux, macOS, and Windows. The synthetic stdio test initializes the server, lists the eight tools, checks structured output, and verifies that a password argument is rejected without echoing its value. Only Linux has been compiled locally so far.
 
 This is an unofficial project and is not affiliated with Abbott. It is for inspecting shared data, not making medical decisions.
 
