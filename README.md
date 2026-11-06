@@ -12,7 +12,7 @@ The crate supports global routing plus US, EU, EU2, AE, AP, AU, CA, DE, FR, JP, 
 
 ## Local setup and connectivity check
 
-Requires Rust 1.89 or newer and an available OS credential store (macOS Keychain, Windows Credential Manager, or a Linux Secret Service session). There is no plaintext fallback.
+Requires Rust 1.89 or newer and an available OS credential store (macOS Keychain, Windows Credential Manager, or a Linux Secret Service session). Building on Debian or Ubuntu also needs `libdbus-1-dev` and `pkg-config` for the keyring backend. There is no plaintext fallback.
 If `cargo` is not on your shell path after installing Rust, run `. "$HOME/.cargo/env"` first.
 
 ```sh
