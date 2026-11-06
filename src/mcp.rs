@@ -2986,6 +2986,49 @@ mod tests {
         assert!(errors.is_empty(), "{tool}: {errors:?}\n{content}");
     }
 
+    /// The Claude Desktop bundle manifest (MCPB manifest 0.3) runs `serve`,
+    /// lists exactly this server's tools, matches the crate version, and
+    /// never collects configuration such as credentials.
+    #[test]
+    fn the_bundle_manifest_matches_the_server() {
+        let manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../packaging/mcpb/manifest.json")).unwrap();
+        assert_eq!(manifest["manifest_version"], "0.3");
+        assert_eq!(manifest["version"], env!("CARGO_PKG_VERSION"));
+        for required in ["name", "version", "description", "author", "server"] {
+            assert!(manifest.get(required).is_some(), "{required}");
+        }
+        assert!(manifest["author"]["name"].is_string());
+        assert_eq!(manifest["server"]["type"], "binary");
+        assert_eq!(
+            manifest["server"]["mcp_config"]["args"],
+            serde_json::json!(["serve"])
+        );
+        assert_eq!(
+            manifest["server"]["mcp_config"]["env"],
+            serde_json::json!({})
+        );
+        assert!(
+            manifest.get("user_config").is_none(),
+            "no bundle configuration"
+        );
+        assert!(!manifest.to_string().contains("user_config"));
+        let mut listed: Vec<&str> = manifest["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        let mut served: Vec<String> = LibreMcp::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect();
+        listed.sort_unstable();
+        served.sort_unstable();
+        assert_eq!(listed, served);
+    }
+
     #[test]
     fn every_tool_has_annotations_and_an_output_schema() {
         let tools = LibreMcp::tool_router().list_all();

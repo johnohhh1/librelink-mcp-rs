@@ -1,0 +1,146 @@
+name: Release
+
+# Tags `v*` build, package, and publish a GitHub Release. Pull requests and
+# manual runs build and package the same artifacts as a dry run, without
+# publishing anything.
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The official MCP bundle CLI, pinned.
+  MCPB_CLI: "@anthropic-ai/mcpb@2.1.2"
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            bundle: darwin
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            bundle: darwin
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            bundle: win32
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Linux Secret Service build dependency
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Check the tag matches the crate version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          crate="$(cargo metadata --no-deps --format-version 1 --locked | jq -r '.packages[0].version')"
+          if [ "v$crate" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match crate version $crate." >&2
+            exit 1
+          fi
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package archive
+        shell: bash
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 --locked | jq -r '.packages[0].version')"
+          name="librelink-mcp-rs-$version-${{ matrix.target }}"
+          exe="librelink-mcp-rs"
+          if [ "${{ runner.os }}" = "Windows" ]; then exe="librelink-mcp-rs.exe"; fi
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/$exe" README.md LICENSE CHANGELOG.md "dist/$name/"
+          cd dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a -tzip "$name.zip" "$name" > /dev/null
+          else
+            tar -czf "$name.tar.gz" "$name"
+          fi
+          rm -rf "$name"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Package MCP bundle
+        if: matrix.bundle != ''
+        shell: bash
+        run: |
+          stage="bundle-stage"
+          exe="librelink-mcp-rs"
+          if [ "${{ matrix.bundle }}" = "win32" ]; then exe="librelink-mcp-rs.exe"; fi
+          mkdir -p "$stage/server"
+          cp "target/${{ matrix.target }}/release/$exe" "$stage/server/"
+          cp README.md LICENSE CHANGELOG.md "$stage/"
+          # One platform per bundle; the Windows entry point names the .exe.
+          template="packaging/mcpb/manifest.json"
+          if [ "$(jq -r .version "$template")" != "$VERSION" ]; then
+            echo "$template version does not match crate version $VERSION." >&2
+            exit 1
+          fi
+          jq --arg platform "${{ matrix.bundle }}" --arg exe "$exe" '
+            .compatibility.platforms = [$platform]
+            | .server.entry_point = "server/" + $exe
+            | .server.mcp_config.command = "${__dirname}/server/" + $exe
+          ' "$template" > "$stage/manifest.json"
+          npx --yes "$MCPB_CLI" validate "$stage/manifest.json"
+          npx --yes "$MCPB_CLI" pack "$stage" "dist/librelink-mcp-rs-$VERSION-${{ matrix.target }}.mcpb"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS && cat SHA256SUMS
+
+      - name: Release notes from CHANGELOG.md
+        run: scripts/changelog-section.sh "${GITHUB_REF_NAME#v}" > notes.md
+
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file notes.md \
+            --verify-tag

@@ -1,0 +1,80 @@
+{
+  "manifest_version": "0.3",
+  "name": "librelink-mcp-rs",
+  "display_name": "LibreLinkUp (unofficial)",
+  "version": "0.4.0",
+  "description": "Read-only access to a LibreLinkUp follower account's glucose data, with honest freshness and coverage labels.",
+  "long_description": "An unofficial, local MCP server for the LibreLinkUp follower API. Credentials are never entered here: run `librelink-mcp-rs setup` in a terminal first, which stores them in the OS credential store. Results are descriptive only, with no diagnosis or treatment advice. Validated on one configuration; see the compatibility notes.",
+  "author": {
+    "name": "LibreLink MCP RS contributors"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/johnohhh1/librelink-mcp-rs.git"
+  },
+  "homepage": "https://github.com/johnohhh1/librelink-mcp-rs",
+  "documentation": "https://github.com/johnohhh1/librelink-mcp-rs/blob/main/docs/install.md",
+  "support": "https://github.com/johnohhh1/librelink-mcp-rs/issues",
+  "server": {
+    "type": "binary",
+    "entry_point": "server/librelink-mcp-rs",
+    "mcp_config": {
+      "command": "${__dirname}/server/librelink-mcp-rs",
+      "args": [
+        "serve"
+      ],
+      "env": {}
+    }
+  },
+  "tools": [
+    {
+      "name": "get_current_glucose",
+      "description": "Latest glucose reading with its source timestamp and freshness."
+    },
+    {
+      "name": "get_glucose_history",
+      "description": "Readings in a window, oldest first, paged, with coverage and gaps."
+    },
+    {
+      "name": "get_glucose_stats",
+      "description": "Sample and time-weighted statistics; GMI only when the window allows it."
+    },
+    {
+      "name": "get_glucose_trends",
+      "description": "Observed range, trend arrow counts, and adjacent-point rates."
+    },
+    {
+      "name": "get_sensor_info",
+      "description": "Masked sensor identifiers and source sensor fields."
+    },
+    {
+      "name": "configure_credentials",
+      "description": "Explains local setup; accepts no secrets."
+    },
+    {
+      "name": "configure_ranges",
+      "description": "Saves local target range bounds."
+    },
+    {
+      "name": "validate_connection",
+      "description": "Reports data-source availability without glucose values."
+    }
+  ],
+  "tools_generated": false,
+  "keywords": [
+    "glucose",
+    "cgm",
+    "librelinkup",
+    "freestyle-libre"
+  ],
+  "license": "MIT",
+  "privacy_policies": [
+    "https://github.com/johnohhh1/librelink-mcp-rs/blob/main/docs/privacy.md"
+  ],
+  "compatibility": {
+    "platforms": [
+      "darwin",
+      "win32"
+    ]
+  }
+}

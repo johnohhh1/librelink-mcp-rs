@@ -6,6 +6,8 @@
 .env.*
 !.env.example
 *.json
+# The bundle manifest is source, not local data.
+!packaging/mcpb/manifest.json
 *.jsonl
 *.ndjson
 *.csv
