@@ -1,6 +1,6 @@
 use crate::{
     FetchError, fetch_raw, load_settings, save_settings,
-    time::{STALE_AFTER_MINUTES, TimeAssessment, assess_time, assess_time_at},
+    time::{STALE_AFTER_MINUTES, TimeAssessment, TimeBasis, assess_time, assess_time_at},
 };
 use chrono::{DateTime, Duration, Utc};
 use libre_link_up_api_client::GlucoseItem;
@@ -258,25 +258,56 @@ fn trend(arrow: Option<i32>) -> Option<&'static str> {
     }
 }
 
-fn history_reading(
-    item: &GlucoseItem,
-    retrieved_at: DateTime<Utc>,
-    now: DateTime<Utc>,
-    cache_hit: bool,
-) -> Reading {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PointSource {
+    Graph,
+    CurrentMeasurement,
+}
+
+/// One historical sample. Freshness is deliberately absent: it describes how
+/// current the latest reading is, and every past sample would read as stale.
+#[derive(Serialize)]
+struct HistoryPoint {
+    glucose_mg_dl: Option<f64>,
+    value_quality: ValueQuality,
+    observed_at_utc: Option<DateTime<Utc>>,
+    time_basis: TimeBasis,
+    source_timestamp: Option<String>,
+    trend: Option<&'static str>,
+    source: PointSource,
+}
+
+fn history_point(item: &GlucoseItem, source: PointSource, now: DateTime<Utc>) -> HistoryPoint {
     let (glucose_mg_dl, value_quality) = value(item.value_in_mg_per_dl);
-    Reading {
+    let time = assess_time(Some(&item.timestamp), Some(&item.factory_timestamp), now);
+    HistoryPoint {
         glucose_mg_dl,
         value_quality,
-        time: assess_time_at(
-            Some(&item.timestamp),
-            Some(&item.factory_timestamp),
-            retrieved_at,
-            now,
-        ),
+        observed_at_utc: time.observed_at_utc,
+        time_basis: time.time_basis,
+        source_timestamp: time.source_timestamp,
         trend: trend(item.trend_arrow),
-        cache_hit,
+        source,
     }
+}
+
+/// The graph lags the live reading by several minutes, so append the current
+/// measurement when the graph does not already contain it. Returns the merged
+/// points and whether the current measurement was appended.
+fn points_with_current(graph: &[GlucoseItem], current: &GlucoseItem) -> (Vec<GlucoseItem>, bool) {
+    let usable = current.value_in_mg_per_dl.is_finite()
+        && current.value_in_mg_per_dl > 0.0
+        && !current.factory_timestamp.trim().is_empty();
+    let already_present = graph
+        .iter()
+        .any(|item| item.factory_timestamp == current.factory_timestamp);
+    let mut points = graph.to_vec();
+    let appended = usable && !already_present;
+    if appended {
+        points.push(current.clone());
+    }
+    (points, appended)
 }
 
 fn select_graph_window(
@@ -439,7 +470,7 @@ impl LibreMcp {
     }
 
     #[tool(
-        description = "Return graph readings within requested hours when each reading has an offset-aware or validated inferred UTC time. Report whether filtering applied and that coverage is unverified."
+        description = "Return glucose readings within the requested hours: the graph plus the current measurement, which the graph lags by several minutes. Each point carries its time and source; freshness applies only to get_current_glucose."
     )]
     async fn get_glucose_history(
         &self,
@@ -454,18 +485,29 @@ impl LibreMcp {
             Err(error) => return failure_fetch(error),
         };
         let now = Utc::now();
-        let coverage = graph_coverage(&raw.graph_data, i64::from(hours), now);
-        let (items, window_filter_applied) =
-            select_graph_window(&raw.graph_data, i64::from(hours), now);
-        let readings: Vec<Reading> = items
+        let current = &raw.connection.glucose_item;
+        let (points, current_appended) = points_with_current(&raw.graph_data, current);
+        let coverage = graph_coverage(&points, i64::from(hours), now);
+        let (items, window_filter_applied) = select_graph_window(&points, i64::from(hours), now);
+        let readings: Vec<HistoryPoint> = items
             .into_iter()
-            .map(|item| history_reading(item, raw.retrieved_at_utc, now, raw.cache_hit))
+            .map(|item| {
+                let source =
+                    if current_appended && item.factory_timestamp == current.factory_timestamp {
+                        PointSource::CurrentMeasurement
+                    } else {
+                        PointSource::Graph
+                    };
+                history_point(item, source, now)
+            })
             .collect();
         success(serde_json::json!({
             "requested_hours": hours,
             "window_verified": false,
             "window_filter_applied": window_filter_applied,
             "cache_hit": raw.cache_hit,
+            "retrieved_at_utc": raw.retrieved_at_utc,
+            "current_measurement_appended": current_appended,
             "coverage": coverage,
             "reason": if window_filter_applied {
                 "Readings were filtered by offset-aware or inferred factory UTC timestamps, but API graph coverage may be shorter than requested."
@@ -493,8 +535,9 @@ impl LibreMcp {
             Ok(settings) => settings,
             Err(message) => return failure(message),
         };
+        let (points, _) = points_with_current(&raw.graph_data, &raw.connection.glucose_item);
         match summarize_stats(
-            &raw.graph_data,
+            &points,
             days,
             settings.target_low,
             settings.target_high,
@@ -522,8 +565,9 @@ impl LibreMcp {
             Err(error) => return failure_fetch(error),
         };
         let now = Utc::now();
-        let coverage = graph_coverage(&raw.graph_data, hours, now);
-        let (items, window_filter_applied) = select_graph_window(&raw.graph_data, hours, now);
+        let (points, _) = points_with_current(&raw.graph_data, &raw.connection.glucose_item);
+        let coverage = graph_coverage(&points, hours, now);
+        let (items, window_filter_applied) = select_graph_window(&points, hours, now);
         let rates = observed_rates(&items, now);
         let values: Vec<f64> = items
             .iter()
@@ -848,6 +892,56 @@ mod tests {
         assert_eq!(rates.minimum_mg_dl_per_minute, Some(-1.0));
         assert_eq!(rates.maximum_mg_dl_per_minute, Some(1.0));
         assert_eq!(rates.average_mg_dl_per_minute, Some(0.0));
+    }
+
+    #[test]
+    fn current_measurement_closes_the_graph_lag_without_duplicating() {
+        let now = DateTime::parse_from_rfc3339("2026-11-05T20:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let graph = [
+            synthetic_item("2026-11-05T19:30:00Z"),
+            synthetic_item("2026-11-05T19:35:00Z"),
+        ];
+        let current = synthetic_item("2026-11-05T19:58:00Z");
+
+        let (points, appended) = points_with_current(&graph, &current);
+        assert!(appended);
+        assert_eq!(points.len(), 3);
+        let coverage = graph_coverage(&points, 1, now);
+        assert_eq!(
+            coverage.last_observed_at_utc.unwrap().to_rfc3339(),
+            "2026-11-05T19:58:00+00:00"
+        );
+        assert_eq!(coverage.end_gap_minutes, Some(2.0));
+
+        // Already in the graph: not added twice.
+        let (points, appended) = points_with_current(&graph, &graph[1]);
+        assert!(!appended);
+        assert_eq!(points.len(), 2);
+
+        // A missing current value is not appended.
+        let mut missing = current.clone();
+        missing.value_in_mg_per_dl = 0.0;
+        assert!(!points_with_current(&graph, &missing).1);
+    }
+
+    #[test]
+    fn history_points_omit_freshness_and_label_their_source() {
+        let now = DateTime::parse_from_rfc3339("2026-11-05T20:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let item = synthetic_item("2026-11-05T12:00:00Z");
+        let point = serde_json::to_value(history_point(&item, PointSource::Graph, now)).unwrap();
+        assert!(point.get("freshness").is_none());
+        assert!(point.get("retrieved_at_utc").is_none());
+        assert_eq!(point["source"], "graph");
+        assert_eq!(point["time_basis"], "offset_known");
+        assert_eq!(point["observed_at_utc"], "2026-11-05T12:00:00Z");
+        let current =
+            serde_json::to_value(history_point(&item, PointSource::CurrentMeasurement, now))
+                .unwrap();
+        assert_eq!(current["source"], "current_measurement");
     }
 
     #[test]
