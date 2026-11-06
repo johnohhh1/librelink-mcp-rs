@@ -50,7 +50,12 @@ Every data reply includes `data_source`. From the store:
 
 - `get_current_glucose` reports the newest stored reading. Its `retrieved_at_utc` is when the collector stored it, so freshness turns `stale` if the collector falls behind, for example during a long rate-limit cooldown.
 - `get_glucose_history`, `get_glucose_stats`, and `get_glucose_trends` use the requested window, up to each tool's maximum. When stored coverage spans the window without gaps, `period_status` is `sample_summary` instead of `partial`.
-- Each interior gap in `coverage` has a `cause`: `collector_not_running` (no poll attempts were recorded in it) or `no_data_from_api` (the collector polled but got no readings for that span). The gap threshold uses the graph's cadence (normally 15 minutes), so minute-by-minute current readings do not hide or create gaps.
+- Each interior gap in `coverage` has a `cause`:
+  - `before_collection`: the gap ends before the first recorded poll. For that period the database holds only the graph LibreLinkUp returned when collection began, so the cause is unknown. Once retention prunes the oldest poll records, older gaps are labeled this way too.
+  - `collector_not_running`: after collection began, no poll attempt was recorded in the gap.
+  - `no_data_from_api`: the collector polled during the gap but got no readings for that span.
+
+  The gap threshold uses the graph's cadence (normally 15 minutes), so minute-by-minute current readings do not hide or create gaps.
 - `get_sensor_info` reads the latest snapshot's sensors, which the database holds only in masked form.
 - `validate_connection` reports the collector heartbeat age, the last poll outcome and time, and the number of stored readings.
 

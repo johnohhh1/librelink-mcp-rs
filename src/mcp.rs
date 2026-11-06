@@ -73,19 +73,22 @@ impl LocalStore {
         result.map_err(|message| failure_code("local_store_unavailable", message))
     }
 
-    /// Readings in the window and the poll times inside it.
+    /// Readings in the window, plus the poll record needed to explain gaps.
     async fn window(
         &self,
         hours: i64,
         now: DateTime<Utc>,
-    ) -> Result<(Vec<StoredReading>, Vec<DateTime<Utc>>), CallToolResult> {
+    ) -> Result<(Vec<StoredReading>, PollWindow), CallToolResult> {
         let from = now - Duration::hours(hours);
-        self.query(move |store, key| match key {
-            Some(key) => Ok((
-                store.readings_for_key(key, from, now)?,
-                store.poll_times(from, now)?,
-            )),
-            None => Ok((vec![], vec![])),
+        self.query(move |store, key| {
+            let polls = PollWindow {
+                times: store.poll_times(from, now)?,
+                first_ever: store.first_poll_time()?,
+            };
+            match key {
+                Some(key) => Ok((store.readings_for_key(key, from, now)?, polls)),
+                None => Ok((vec![], polls)),
+            }
         })
         .await
     }
@@ -320,15 +323,30 @@ fn local_coverage(readings: &[StoredReading], now: DateTime<Utc>) -> CoverageOpt
     }
 }
 
-/// Labels each listed interior gap: no poll attempt inside it means the
-/// collector was not running; attempts without readings mean the API had
-/// no data for that span.
-fn classify_gaps(coverage: &mut GraphCoverage, poll_times: &[DateTime<Utc>]) {
+/// Poll attempts inside a window, and the oldest attempt still recorded.
+struct PollWindow {
+    times: Vec<DateTime<Utc>>,
+    first_ever: Option<DateTime<Utc>>,
+}
+
+/// Labels each listed interior gap:
+/// - `before_collection`: the gap ends before the first recorded poll. The
+///   store holds only the API's backfilled graph for that period, so the
+///   cause is unknown.
+/// - `no_data_from_api`: the collector polled during the gap but got no
+///   readings for it.
+/// - `collector_not_running`: the gap is after collection began and no poll
+///   attempt was recorded inside it.
+fn classify_gaps(coverage: &mut GraphCoverage, polls: &PollWindow) {
     for gap in &mut coverage.interior_gaps {
-        let polled = poll_times
+        let before_collection = polls.first_ever.is_none_or(|first| gap.to_utc < first);
+        let polled = polls
+            .times
             .iter()
             .any(|time| *time > gap.from_utc && *time < gap.to_utc);
-        gap.cause = Some(if polled {
+        gap.cause = Some(if before_collection {
+            "before_collection"
+        } else if polled {
             "no_data_from_api"
         } else {
             "collector_not_running"
@@ -1906,9 +1924,14 @@ mod tests {
             .filter(|m| !(300 < *m && *m < 420) && !(120 < *m && *m < 180))
             .collect();
         let fixture = local_fixture(&minutes, None, Some(10));
-        // The collector polled during the newer gap but got no readings.
+        // Collection began before both gaps. The collector polled during the
+        // newer gap but got no readings, and recorded nothing in the older.
+        let first_poll = Utc::now() - Duration::minutes(590);
         let polled_at = Utc::now() - Duration::minutes(150);
-        fixture.with_store(|store| store.record_poll("ok", 0, polled_at).unwrap());
+        fixture.with_store(|store| {
+            store.record_poll("ok", 40, first_poll).unwrap();
+            store.record_poll("ok", 0, polled_at).unwrap();
+        });
         let (server, _) = store_server(&fixture.db);
         let reply = server
             .get_glucose_history(Parameters(HistoryArgs { hours: Some(10) }))
@@ -1932,6 +1955,53 @@ mod tests {
         let coverage = serde_json::to_value(graph_coverage(&graph, 1, now)).unwrap();
         assert!(coverage["interior_gaps"][0].get("cause").is_none());
         assert_eq!(coverage["source"], "librelinkup_graph");
+    }
+
+    #[tokio::test]
+    async fn gaps_in_backfill_before_the_first_poll_have_an_unknown_cause() {
+        // Readings every 15 minutes for 10 hours, with a gap in the API's
+        // backfilled graph (about 7 to 5 hours ago) and a real outage after
+        // collection began (about 3 to 2 hours ago).
+        let minutes: Vec<i64> = every_15_minutes(10)
+            .into_iter()
+            .filter(|m| !(300 < *m && *m < 420) && !(120 < *m && *m < 180))
+            .collect();
+        let fixture = local_fixture(&minutes, None, Some(10));
+        // The collector first polled 4 hours ago, backfilling the graph,
+        // then stopped until 2 hours ago.
+        fixture.with_store(|store| {
+            store
+                .record_poll("ok", 40, Utc::now() - Duration::minutes(240))
+                .unwrap();
+            store
+                .record_poll("ok", 4, Utc::now() - Duration::minutes(110))
+                .unwrap();
+        });
+        let (server, _) = store_server(&fixture.db);
+        let reply = server
+            .get_glucose_history(Parameters(HistoryArgs { hours: Some(10) }))
+            .await;
+        let causes: Vec<_> = body(&reply)["coverage"]["interior_gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|gap| gap["cause"].as_str().unwrap())
+            .collect();
+        assert_eq!(causes, ["before_collection", "collector_not_running"]);
+
+        // With no polls recorded at all, every gap's cause is unknown.
+        let unpolled = local_fixture(&minutes, None, Some(10));
+        let (server, _) = store_server(&unpolled.db);
+        let reply = server
+            .get_glucose_history(Parameters(HistoryArgs { hours: Some(10) }))
+            .await;
+        let causes: Vec<_> = body(&reply)["coverage"]["interior_gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|gap| gap["cause"].as_str().unwrap())
+            .collect();
+        assert_eq!(causes, ["before_collection", "before_collection"]);
     }
 
     #[tokio::test]

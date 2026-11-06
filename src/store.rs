@@ -471,6 +471,15 @@ impl Store {
         }))
     }
 
+    /// The oldest poll attempt still recorded, if any.
+    pub(crate) fn first_poll_time(&self) -> StoreResult<Option<DateTime<Utc>>> {
+        let seconds: Option<i64> = self
+            .conn
+            .query_row("SELECT MIN(polled_at_utc) FROM polls", [], |row| row.get(0))
+            .map_err(db_error)?;
+        Ok(seconds.and_then(|seconds| DateTime::from_timestamp(seconds, 0)))
+    }
+
     /// Times of all poll attempts with `from <= polled_at_utc <= to`.
     pub(crate) fn poll_times(
         &self,
@@ -1160,6 +1169,7 @@ mod tests {
         let key = store.patient_key(PATIENT);
         assert_eq!(store.latest_reading(&key).unwrap(), None);
         assert_eq!(store.last_poll().unwrap(), None);
+        assert_eq!(store.first_poll_time().unwrap(), None);
         store
             .insert_snapshot(
                 PATIENT,
@@ -1178,6 +1188,10 @@ mod tests {
             .record_poll("ok", 3, at("2026-11-05T19:59:00Z"))
             .unwrap();
         store.record_poll("rate_limited", 0, now).unwrap();
+        assert_eq!(
+            store.first_poll_time().unwrap(),
+            Some(at("2026-11-05T19:59:00Z"))
+        );
         let last = store.last_poll().unwrap().unwrap();
         assert_eq!(
             (last.outcome.as_str(), last.readings_added, last.at),
