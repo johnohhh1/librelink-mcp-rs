@@ -40,10 +40,19 @@ The borrowed `libre_link_up_api_client` crate retries login after any request er
 
 The graph endpoint takes no date range, so it cannot supply 7-, 30-, or 90-day history on its own. See [Nightscout Connect's LibreLinkUp notes](https://github.com/nightscout/nightscout-connect/blob/main/README.md).
 
-- A separate, explicitly started `collect` command polls through the v0.2 client and writes to a local SQLite file. The poll interval defaults to 60 seconds, and 60 seconds is a minimum enforced in code that configuration cannot lower. Each cycle adds a small random jitter of a few seconds. `serve` never polls on its own and reads history from the database when one exists.
-- No credentials or tokens in SQLite. Scope records to one selected patient. Restrictive file permissions. Deduplicate overlapping graph responses by source timestamp, keep source and time basis per row, and record collection gaps explicitly.
-- Retention controls; `clear-local-data` also removes the database.
-- Throttling and lockout handling come from the v0.2 client; the collector backs off and never causes login storms.
+The design is fixed in [ADR 0002](adr/0002-local-store-and-collector.md). In short:
+
+- `collect` is a separate foreground command that polls through the v0.2 client and writes to a local SQLite file (`rusqlite`, bundled, WAL). The interval has a 60-second floor enforced in code, plus 0–5 seconds of jitter. `serve` uses the store while the collector heartbeat is under 3 minutes old and the live API otherwise, and every data reply states `data_source`. While a collector runs, only one process talks to Abbott.
+- No credentials, tokens, or raw patient IDs in SQLite; records are keyed by a SHA-256 of the patient ID. The directory is `0700` and the file `0600` on Unix. Readings deduplicate on factory timestamp, and every poll attempt is recorded so collector downtime and API gaps can be told apart.
+- Retention defaults to 90 days (1–3650); `clear-local-data` also removes the database and its WAL files.
+- Throttling and lockouts use the v0.2 client's cooldowns. A latched error stops the collector with a non-zero exit instead of retrying.
+
+Steps:
+
+0. **CI fix and design record.** Bump `actions/checkout`; write ADR 0002.
+1. **Store module.** Schema and migrations, permissions, deduplicating inserts, poll records, heartbeat, retention, and deletion, all tested with synthetic data.
+2. **`collect` command.** Poll loop with floor and jitter, cooldowns, latched-error exit, single-instance check, clean shutdown, and a systemd user unit example.
+3. **`serve` source selection and tool reads.** The `data_source` field and store-backed history, stats, and trends, followed by a live check by the PM.
 
 **Gate:** `get_glucose_history(hours)` returns stored readings for the requested window with source labels, real first and last observations, expected and observed samples, and gaps. A window the database does not cover returns `partial` coverage, never a claim of completeness. Statistics over a short window stay labeled `partial`; `insufficient_data` still means no valid values.
 
