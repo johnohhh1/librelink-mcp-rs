@@ -1,6 +1,6 @@
 # ADR 0001: Replace the borrowed LibreLinkUp client with an owned one
 
-- **Status:** implemented in v0.2 (accepted 2026-11-05); live validation pending
+- **Status:** implemented and live-validated 2026-11-05 (released in 0.2.0)
 - **Date:** 2026-11-05
 - **Milestone:** v0.2 (see [roadmap](../roadmap.md#v02-owned-api-client-behind-a-datasource-trait))
 

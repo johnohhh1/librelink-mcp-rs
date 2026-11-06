@@ -23,7 +23,7 @@ Each milestone has a gate. A milestone is not done until its gate passes on Linu
 
 ## v0.2: owned API client behind a `DataSource` trait
 
-**Status:** done except live validation. The crate is removed; the owned client has not yet been run against a live account. The version stays 0.1.0 until a live smoke test passes.
+**Status:** done; released as 0.2.0. The crate is removed and the owned client passed a live smoke test on 2026-11-05.
 
 The borrowed `libre_link_up_api_client` crate retries login after any request error, including throttling. Its base URL is fixed, so it cannot be tested against a mock server. It keeps its own copy of the password, and its sensor model mislabels epoch fields. v0.2 replaces it. This is a prerequisite for any polling in v0.3.
 
@@ -32,7 +32,7 @@ The borrowed `libre_link_up_api_client` crate retries login after any request er
 2. **Owned `reqwest` client. Done.** Configurable base URL, region redirect handling, bounded session refresh, and no blind login retry after 429/430. Credentials are read once and not duplicated into long-lived strings. `wiremock` tests with synthetic bodies cover redirect, lockout, status 2 and 4 account actions, 401, 429/430, 403/920 minimum version, and account-ID mismatch, plus missing fields and unknown trend codes.
    - Done as two parts: session handling, then error mapping. Status 2 maps to `authentication_failed`, status 4 to `account_action_required`, a lockout body and HTTP 429/430 to `rate_limited` (retry time clamped to 60–900 seconds), 403 with status 920 to `client_version_rejected`, `AccountIdMismatch` / `RequiredHeaderMissing` to `request_rejected`, 5xx to `upstream_unavailable`, and a successful non-JSON body to `api_changed`. `authentication_failed`, `client_version_rejected`, and `request_rejected` latch until restart.
 3. **Switch over and remove the crate. Done.** `check` and `serve` use the owned client, with the same request headers the crate sent. `api_changed` is the candidate retirement signal; `api_retired` stays reserved for a confirmed retirement (see [API retirement risk](#api-retirement-risk)). Patient selection keeps its current name-based behavior.
-4. **Live validation. Pending.** A manual smoke test against a real follower account, with nothing recorded. The version becomes 0.2.0 only if it passes.
+4. **Live validation. Done 2026-11-05.** A manual smoke test against one US follower account, with no values or account details recorded. It checked login, patient selection, all six data tools, factory-UTC inference, the current reading appended to history, masked sensor IDs, and that one upstream fetch served six tool calls from the cache. No errors. Other regions and accounts remain a v1.0 item.
 
 **Gate:** no crate dependency remains; every upstream error path has a synthetic HTTP fixture; no login is caused by throttling, server errors, or parse errors, and a 401 causes at most one re-login per read; tool output is unchanged except for the single current reading and the new error codes.
 

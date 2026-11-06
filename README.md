@@ -39,7 +39,7 @@ cargo run -- check
 
 `setup` prompts locally for the follower account email, a hidden password, and a region. It accepts `global` (the default), `us`, `eu`, `eu2`, `ae`, `ap`, `au`, `ca`, `de`, `fr`, `jp`, `la`, `ru`, and `cn`. If the account follows multiple people, run `cargo run -- select-patient` and enter the followed person's full name before `check`. An ambiguous account is rejected instead of silently choosing the first connection.
 
-`check` logs in, reads the followed person's graph, and prints a small connectivity report. Since v0.2 the server uses its own LibreLinkUp client instead of the `libre_link_up_api_client` crate; [ADR 0001](docs/adr/0001-owned-api-client.md) explains why. An earlier local check confirmed that the crate returned values matching the user's phone. The owned client sends the same request headers but has not yet been checked against a live account, and other accounts, regions, and sensors still need validation.
+`check` logs in, reads the followed person's graph, and prints a small connectivity report. Since v0.2 the server uses its own LibreLinkUp client instead of the `libre_link_up_api_client` crate; [ADR 0001](docs/adr/0001-owned-api-client.md) explains why. The owned client sends the same request headers as the crate did. It was checked against one live US follower account on 2026-11-05; other accounts, regions, and sensors still need validation.
 
 `check` includes `display_minus_factory_minutes`, so you can inspect the clock relationship locally without sharing a response. The difference reflects the **sharer's** local clock, which may differ from your own timezone. To change the client version after an Abbott version requirement changes, run `cargo run -- set-api-version` locally and restart the MCP server.
 
