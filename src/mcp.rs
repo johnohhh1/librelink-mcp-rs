@@ -1,6 +1,8 @@
 use crate::{
     fetch::{FetchError, Fetcher},
-    load_settings, save_settings,
+    load_settings,
+    metrics::{self, Gmi},
+    save_settings,
     source::{GlucoseSample, SensorSummary, sensor_activation_time},
     store::{CollectorStatus, Origin, Store, StoreResult, StoredReading},
     time::{STALE_AFTER_MINUTES, TimeAssessment, TimeBasis, assess_time, assess_time_at},
@@ -460,7 +462,10 @@ the requested period. Results are descriptive only: do not diagnose, recommend t
 infer meals. Credentials are never accepted through MCP; direct users to the local `setup` command. \
 Every data reply has `data_source`: `live_api` (read from LibreLinkUp now) or `local_store` (read \
 from the local collector's database). `local_store` data is only as fresh as the collector's last \
-successful poll; check freshness and coverage before calling a reading current.";
+successful poll; check freshness and coverage before calling a reading current. \
+get_glucose_stats reports sample statistics and time-weighted figures separately; \
+`time_in_range_percent` is time-weighted (70-180 mg/dL). `gmi_percent` is an estimate, and null \
+with `gmi_unavailable_reason` unless the window is at least 14 days with at least 70% coverage.";
 
 /// The tool form of one sensor, from either data source.
 fn sensor_json(sensor: &SensorSummary, now: DateTime<Utc>) -> serde_json::Value {
@@ -665,7 +670,7 @@ fn summarize_stats_with(
     } else {
         "partial"
     };
-    Ok(serde_json::json!({
+    let mut body = serde_json::json!({
         "requested_days": days,
         "period_status": period_status,
         "window_verified": false,
@@ -681,14 +686,66 @@ fn summarize_stats_with(
             "above_range": above as f64 / count as f64 * 100.0,
         },
         "target_range_mg_dl": { "low": target_low, "high": target_high },
-        "time_in_range_percent": null,
-        "gmi_percent": null,
         "reason": if period_status == "partial" {
-            "These statistics describe only the returned graph, which covers less than the requested period; see coverage for the observed span. They are not a summary of the requested days. Time-weighted range and GMI are unavailable."
+            "The sample statistics describe only the returned graph, which covers less than the requested period; see coverage for the observed span. They are not a summary of the requested days. time_weighted reports how much of the requested window the readings cover."
         } else {
-            "These statistics describe selected graph samples only. Time-weighted range and a valid GMI window are unverified."
+            "The sample statistics count each selected graph sample once. time_weighted weights each reading by the time it covers."
         },
-    }))
+    });
+    let weighted = time_weighted_stats(graph, hours, (low, high), now);
+    if let (Some(body), Some(extra)) = (body.as_object_mut(), weighted.as_object()) {
+        body.extend(extra.clone());
+    }
+    Ok(body)
+}
+
+const GMI_METHOD: &str = "An estimate: 3.31 + 0.02392 × time-weighted mean glucose (mg/dL), \
+reported only for a requested window of at least 14 days with at least 70% of it covered. \
+Method from the international consensus on CGM time in range: \
+https://pmc.ncbi.nlm.nih.gov/articles/PMC6973648/";
+
+/// Time-weighted figures over the requested window (ADR 0003), shared by the
+/// live and store paths. Each reading stands for the time until the next, at
+/// most 15 minutes; readings without a usable UTC time are excluded.
+fn time_weighted_stats(
+    graph: &[GlucoseSample],
+    hours: i64,
+    target: (f64, f64),
+    now: DateTime<Utc>,
+) -> serde_json::Value {
+    let samples: Vec<metrics::Sample> = graph
+        .iter()
+        .map(|item| metrics::Sample {
+            at: assess_time(Some(&item.timestamp), Some(&item.factory_timestamp), now)
+                .observed_at_utc,
+            mg_dl: item.value_in_mg_per_dl,
+        })
+        .collect();
+    let weighted = metrics::time_weighted(&samples, now - Duration::hours(hours), now, target);
+    let (gmi_percent, gmi_unavailable_reason) = match weighted.gmi {
+        Gmi::Estimate(value) => (Some(value), None),
+        Gmi::Unavailable(reason) => (None, Some(reason)),
+    };
+    serde_json::json!({
+        "time_weighted": {
+            "status": if weighted.summary.is_some() { "ok" } else { "insufficient_data" },
+            "window_start_utc": weighted.from,
+            "window_end_utc": weighted.to,
+            "max_minutes_per_reading": metrics::MAX_SAMPLE_MINUTES,
+            "covered_minutes": weighted.covered_seconds as f64 / 60.0,
+            "coverage_percent": weighted.coverage_percent,
+            "readings_used": weighted.samples_used,
+            "readings_without_utc": weighted.samples_without_utc,
+            "summary": weighted.summary,
+            "consensus_reference": metrics::CONSENSUS_REFERENCE,
+        },
+        "time_in_range_percent": weighted
+            .summary
+            .map(|summary| summary.consensus_bands_percent.target),
+        "gmi_percent": gmi_percent,
+        "gmi_unavailable_reason": gmi_unavailable_reason,
+        "gmi_method": GMI_METHOD,
+    })
 }
 
 fn summarize_trends(
@@ -847,9 +904,9 @@ async fn local_stats(local: &LocalStore, days: u8, range: (u16, u16)) -> CallToo
     match summarize_stats_with(&points, days, range, now, coverage) {
         Ok(mut body) => {
             body["reason"] = if body["period_status"] == "partial" {
-                "These statistics describe only the stored readings, which cover less than the requested period; see coverage for the observed span and gaps. Time-weighted range and GMI are unavailable."
+                "The sample statistics describe only the stored readings, which cover less than the requested period; see coverage for the observed span and gaps. time_weighted reports how much of the requested window the readings cover."
             } else {
-                "These statistics describe stored samples only; samples are not weighted by time. Time-weighted range and GMI are unavailable."
+                "The sample statistics count each stored reading once. time_weighted weights each reading by the time it covers."
             }
             .into();
             body["cache_hit"] = false.into();
@@ -1023,7 +1080,7 @@ impl LibreMcp {
     }
 
     #[tool(
-        description = "Calculate descriptive statistics for graph points. The LibreLinkUp graph covers about 12 hours, so longer requests return statistics labeled partial with the observed span in coverage."
+        description = "Calculate descriptive statistics: sample statistics, plus time-weighted coverage, consensus bands, and time in range. GMI is an estimate, given only for 14 or more days with at least 70% coverage. The LibreLinkUp graph covers about 12 hours, so longer live requests are labeled partial."
     )]
     async fn get_glucose_stats(&self, Parameters(args): Parameters<StatsArgs>) -> CallToolResult {
         let days = args.days.unwrap_or(7);
@@ -1480,6 +1537,66 @@ mod tests {
     }
 
     #[test]
+    fn stats_weight_dense_readings_by_the_time_they_cover() {
+        let now = DateTime::parse_from_rfc3339("2026-11-05T20:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let start = now - Duration::hours(13);
+        let at = |minutes: i64, value: f64| {
+            let mut item = synthetic_item(&(start + Duration::minutes(minutes)).to_rfc3339());
+            item.value_in_mg_per_dl = value;
+            item
+        };
+        // 12 hours every 15 minutes in range, then 1 hour every minute high.
+        let mut graph: Vec<GlucoseSample> = (0..48).map(|step| at(15 * step, 120.0)).collect();
+        graph.extend((720..780).map(|minute| at(minute, 220.0)));
+
+        let body = summarize_stats(&graph, 1, 70, 180, now).unwrap();
+        let sample_above = body["sample_percentages"]["above_range"].as_f64().unwrap();
+        assert!((sample_above - 60.0 / 108.0 * 100.0).abs() < 1e-9);
+        let weighted = &body["time_weighted"];
+        assert_eq!(weighted["status"], "ok");
+        assert_eq!(weighted["covered_minutes"], 780.0);
+        let coverage = weighted["coverage_percent"].as_f64().unwrap();
+        assert!((coverage - 13.0 / 24.0 * 100.0).abs() < 1e-9);
+        let high = weighted["summary"]["consensus_bands_percent"]["high"]
+            .as_f64()
+            .unwrap();
+        assert!((high - 100.0 / 13.0).abs() < 1e-9);
+        let in_range = body["time_in_range_percent"].as_f64().unwrap();
+        assert!((in_range - 1200.0 / 13.0).abs() < 1e-9);
+        // A one-day window cannot carry GMI.
+        assert_eq!(body["gmi_percent"], serde_json::Value::Null);
+        assert_eq!(body["gmi_unavailable_reason"], "window_too_short");
+        assert!(body["gmi_method"].as_str().unwrap().contains("PMC6973648"));
+    }
+
+    #[test]
+    fn stats_without_utc_times_report_no_time_weighted_figures() {
+        let now = DateTime::parse_from_rfc3339("2026-11-05T20:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        // Naive clocks that cannot be paired: no usable UTC time.
+        let graph: Vec<GlucoseSample> = (0..4)
+            .map(|step| {
+                let mut item = synthetic_item(&format!("11/5/2026 7:{:02}:00 PM", 15 * step));
+                item.factory_timestamp = "not a time".to_owned();
+                item
+            })
+            .collect();
+        let body = summarize_stats(&graph, 1, 70, 180, now).unwrap();
+        assert_eq!(body["sample_count"], 4);
+        let weighted = &body["time_weighted"];
+        assert_eq!(weighted["status"], "insufficient_data");
+        assert_eq!(weighted["readings_used"], 0);
+        assert_eq!(weighted["readings_without_utc"], 4);
+        assert_eq!(weighted["covered_minutes"], 0.0);
+        assert_eq!(weighted["summary"], serde_json::Value::Null);
+        assert_eq!(body["time_in_range_percent"], serde_json::Value::Null);
+        assert_eq!(body["gmi_percent"], serde_json::Value::Null);
+    }
+
+    #[test]
     fn tool_result_has_structured_and_text_forms() {
         let result = success(serde_json::json!({ "sample_count": 2 }));
         assert_eq!(
@@ -1932,6 +2049,33 @@ mod tests {
             .get_glucose_stats(Parameters(StatsArgs { days: Some(7) }))
             .await;
         assert_eq!(body(&week)["period_status"], "partial");
+    }
+
+    #[tokio::test]
+    async fn store_stats_give_gmi_for_14_covered_days() {
+        let fixture = local_fixture(&every_15_minutes(14 * 24 + 1), None, Some(10));
+        let (server, reads) = store_server(&fixture.db);
+        let stats = server
+            .get_glucose_stats(Parameters(StatsArgs { days: Some(14) }))
+            .await;
+        let stats = body(&stats);
+        assert_eq!(stats["data_source"], "local_store");
+        let coverage = stats["time_weighted"]["coverage_percent"].as_f64().unwrap();
+        assert!(coverage > 99.0, "{coverage}");
+        assert_eq!(stats["time_in_range_percent"], 100.0);
+        // Every synthetic reading is 110 mg/dL.
+        let gmi = stats["gmi_percent"].as_f64().unwrap();
+        assert!((gmi - (3.31 + 0.02392 * 110.0)).abs() < 1e-9, "{gmi}");
+        assert_eq!(stats["gmi_unavailable_reason"], serde_json::Value::Null);
+
+        // Thirteen days of the same data is too short a window.
+        let stats = server
+            .get_glucose_stats(Parameters(StatsArgs { days: Some(13) }))
+            .await;
+        let stats = body(&stats);
+        assert_eq!(stats["gmi_percent"], serde_json::Value::Null);
+        assert_eq!(stats["gmi_unavailable_reason"], "window_too_short");
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

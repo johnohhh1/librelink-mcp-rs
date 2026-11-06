@@ -71,7 +71,7 @@ Steps:
 Steps:
 
 0. **Design record. Done.** Write ADR 0003.
-1. **Metrics module, wired into stats.** Duration-weighted samples capped at 15 minutes, `coverage_percent`, the fixed consensus bands and the configured target range, time-weighted mean, SD, and CV next to the sample statistics, and GMI gated on 14 days and 70% coverage. One implementation for the live and store paths.
+1. **Metrics module, wired into stats. Done.** Duration-weighted samples capped at 15 minutes, `coverage_percent`, the fixed consensus bands and the configured target range, time-weighted mean, SD, and CV next to the sample statistics, and GMI gated on 14 days and 70% coverage. One implementation for the live and store paths.
 2. **CSV parser and `import-csv`.** `import-csv <file> --timezone <IANA> [--date-format mdy|dmy] [--db <path>]` reads only the timestamp, record type, and glucose columns. DST-ambiguous or nonexistent times are skipped and counted. Rows attach to the collector's patient key, and the output is counts only. Tested on synthetic fixtures.
 3. **Overlap, docs, release, and live check.** A CSV row within ±90 seconds of a collected reading is dropped at read time. Then the docs and the release, followed by a PM check with a real export. Only the PM inspects its header row, and the real file never enters the repo.
 

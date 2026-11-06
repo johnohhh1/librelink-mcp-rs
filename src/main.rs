@@ -10,6 +10,7 @@ mod collect;
 mod fetch;
 mod llu_client;
 mod mcp;
+mod metrics;
 mod region;
 mod source;
 mod store;
