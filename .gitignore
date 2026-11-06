@@ -1,11 +1,30 @@
 /target/
-/.env
-/.env.*
+
+# Local account configuration and API captures. Force-add reviewed synthetic
+# fixtures only when a test needs them.
+.env
+.env.*
 !.env.example
+*.json
+*.jsonl
+*.ndjson
+*.csv
+*.tsv
+*.parquet
 *.db
 *.db-*
 *.sqlite
 *.sqlite-*
-config.json
-credentials.json
+*.sqlite3
+*.sqlite3-*
+*.dump
 *.log
+data/
+exports/
+private/
+
+# Keys and certificates must stay out of the repository.
+*.pem
+*.key
+*.p12
+*.pfx
