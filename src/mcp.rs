@@ -1532,13 +1532,17 @@ mod tests {
         }
     }
 
-    fn minutes_ago(minutes: i64) -> String {
-        (Utc::now() - Duration::minutes(minutes)).to_rfc3339_opts(SecondsFormat::Secs, true)
+    /// `minutes` before `now`, as a source timestamp. Tests read the clock
+    /// once and build every timestamp from it, so a slow test cannot cross a
+    /// second boundary between building data and checking it.
+    fn minutes_before(now: DateTime<Utc>, minutes: i64) -> String {
+        (now - Duration::minutes(minutes)).to_rfc3339_opts(SecondsFormat::Secs, true)
     }
 
     /// Synthetic values: a lagging graph and a newer current reading.
     fn live_snapshot() -> Snapshot {
-        let mut current = synthetic_item(&minutes_ago(2));
+        let now = Utc::now();
+        let mut current = synthetic_item(&minutes_before(now, 2));
         current.value_in_mg_per_dl = 142.0;
         current.trend_arrow = Some(4);
         Snapshot {
@@ -1546,7 +1550,7 @@ mod tests {
             current,
             graph: [30, 25, 20, 15]
                 .into_iter()
-                .map(|minutes| synthetic_item(&minutes_ago(minutes)))
+                .map(|minutes| synthetic_item(&minutes_before(now, minutes)))
                 .collect(),
             active_sensors: vec![SensorRecord {
                 device_id: "synthetic-device-0042".to_owned(),
@@ -1681,16 +1685,24 @@ mod tests {
     const RAW_SERIAL: &str = "SYNTHSERIAL-RAW-0001";
     const RAW_DEVICE: &str = "synthetic-device-raw-7777";
 
-    fn ago(minutes: i64) -> String {
-        minutes_ago(minutes)
-    }
-
     struct LocalFixture {
         _dir: tempfile::TempDir,
         db: PathBuf,
+        /// The one clock reading every fixture timestamp is built from.
+        now: DateTime<Utc>,
     }
 
     impl LocalFixture {
+        /// `minutes` before the fixture's clock reading.
+        fn at(&self, minutes: i64) -> DateTime<Utc> {
+            self.now - Duration::minutes(minutes)
+        }
+
+        /// `minutes` before the fixture's clock reading, as a source timestamp.
+        fn ago(&self, minutes: i64) -> String {
+            minutes_before(self.now, minutes)
+        }
+
         fn with_store<T>(&self, operation: impl FnOnce(&mut Store) -> T) -> T {
             operation(&mut Store::open(&self.db).unwrap())
         }
@@ -1706,13 +1718,18 @@ mod tests {
     ) -> LocalFixture {
         let dir = tempfile::TempDir::new().unwrap();
         let db = dir.path().join("readings.sqlite3");
-        let fixture = LocalFixture { _dir: dir, db };
+        let fixture = LocalFixture {
+            _dir: dir,
+            db,
+            now: Utc::now(),
+        };
+        let current = current_minutes_ago.map(|m| fixture.ago(m));
         let snapshot = Snapshot {
             patient_id: STORE_PATIENT_ID.to_owned(),
-            current: synthetic_item(&current_minutes_ago.map(ago).unwrap_or_default()),
+            current: synthetic_item(&current.unwrap_or_default()),
             graph: graph_minutes_ago
                 .iter()
-                .map(|m| synthetic_item(&ago(*m)))
+                .map(|m| synthetic_item(&fixture.ago(*m)))
                 .collect(),
             active_sensors: vec![SensorRecord {
                 device_id: RAW_DEVICE.to_owned(),
@@ -1724,12 +1741,12 @@ mod tests {
         };
         fixture.with_store(|store| {
             store
-                .insert_snapshot(STORE_PATIENT_ID, &snapshot, Utc::now())
+                .insert_snapshot(STORE_PATIENT_ID, &snapshot, fixture.now)
                 .unwrap();
             if let Some(age) = heartbeat_age {
                 store
                     .write_heartbeat(&Heartbeat {
-                        at: Utc::now() - Duration::seconds(age),
+                        at: fixture.now - Duration::seconds(age),
                         pid: 4242,
                         version: "0.0.0-synthetic".to_owned(),
                     })
@@ -1829,7 +1846,7 @@ mod tests {
     #[tokio::test]
     async fn sensors_and_status_come_from_the_store() {
         let fixture = local_fixture(&[20, 5], Some(2), Some(10));
-        fixture.with_store(|store| store.record_poll("ok", 3, Utc::now()).unwrap());
+        fixture.with_store(|store| store.record_poll("ok", 3, fixture.now).unwrap());
         let (server, reads) = store_server(&fixture.db);
 
         let sensors = server.get_sensor_info(Parameters(EmptyArgs {})).await;
@@ -1864,7 +1881,7 @@ mod tests {
         assert_eq!(reply["glucose_mg_dl"], 110.0);
         assert_eq!(reply["freshness"], "stale");
         assert_eq!(reply["cache_hit"], false);
-        assert_eq!(reply["source_timestamp"], ago(30));
+        assert_eq!(reply["source_timestamp"], fixture.ago(30));
 
         // A fresh newest reading is recent.
         let fixture = local_fixture(&[30, 15], Some(2), Some(10));
@@ -1926,8 +1943,7 @@ mod tests {
         let fixture = local_fixture(&minutes, None, Some(10));
         // Collection began before both gaps. The collector polled during the
         // newer gap but got no readings, and recorded nothing in the older.
-        let first_poll = Utc::now() - Duration::minutes(590);
-        let polled_at = Utc::now() - Duration::minutes(150);
+        let (first_poll, polled_at) = (fixture.at(590), fixture.at(150));
         fixture.with_store(|store| {
             store.record_poll("ok", 40, first_poll).unwrap();
             store.record_poll("ok", 0, polled_at).unwrap();
@@ -1947,11 +1963,7 @@ mod tests {
 
         // The live path never labels gaps.
         let now = Utc::now();
-        let graph = [
-            synthetic_item(&ago(60)),
-            synthetic_item(&ago(45)),
-            synthetic_item(&ago(5)),
-        ];
+        let graph = [60, 45, 5].map(|m| synthetic_item(&minutes_before(now, m)));
         let coverage = serde_json::to_value(graph_coverage(&graph, 1, now)).unwrap();
         assert!(coverage["interior_gaps"][0].get("cause").is_none());
         assert_eq!(coverage["source"], "librelinkup_graph");
@@ -1970,12 +1982,8 @@ mod tests {
         // The collector first polled 4 hours ago, backfilling the graph,
         // then stopped until 2 hours ago.
         fixture.with_store(|store| {
-            store
-                .record_poll("ok", 40, Utc::now() - Duration::minutes(240))
-                .unwrap();
-            store
-                .record_poll("ok", 4, Utc::now() - Duration::minutes(110))
-                .unwrap();
+            store.record_poll("ok", 40, fixture.at(240)).unwrap();
+            store.record_poll("ok", 4, fixture.at(110)).unwrap();
         });
         let (server, _) = store_server(&fixture.db);
         let reply = server
