@@ -1,47 +1,71 @@
-# Roadmap to a reliable release
+# Roadmap
 
-The current server proves connectivity and MCP interoperability. It exposes the eight original tool names but is not yet feature complete. `hours`, `days`, and `period` filter graph points with offset-aware or conservatively inferred UTC times. A short graph yields coverage diagnostics and statistics labeled `partial`; no API completeness claim is made. This document defines the remaining release gates for claiming parity.
+The server connects to a LibreLinkUp follower account, exposes the eight original tool names over MCP stdio, and labels what it cannot know. It is not yet at parity: the LibreLinkUp graph covers about 12 hours, so multi-day history and standardized analytics need local data. This document records what is done and the versioned milestones that remain.
 
-## 1. Establish a trustworthy time and data contract
+Each milestone has a gate. A milestone is not done until its gate passes on Linux, macOS, and Windows CI.
 
-- Keep source timestamp text, fetch time, unit, trend code, sensor identifiers, and provenance separate in a typed reading model.
-- Continue validating the `FactoryTimestamp` UTC interpretation across accounts, regions, time zones, and daylight-saving transitions. Keep the inferred basis explicit and reject inconsistent clock pairs.
-- Mark value state (`observed`, `missing`, `estimated`) and freshness (`recent`, `stale`, `unknown`, `missing`) independently. Never replace a bad timestamp with fetch time.
-- Reject impossible values, deduplicate overlapping graph responses, and retain gaps explicitly.
+## Done (v0.1)
 
-**Gate:** `get_current_glucose` never calls an unknown or stale reading real-time. Tests cover malformed, missing, future, delayed, and daylight-saving timestamps.
+- **Eight tools over MCP stdio.** `configure_credentials` accepts no secret arguments. Replies carry `structuredContent` and a JSON text block; errors carry safe public codes. A synthetic stdio test checks the handshake, the tool list, structured output, and secret rejection.
+- **Server identity and instructions.** The server reports its name and version, and its instructions explain freshness, `factory_utc_inferred`, `partial` periods, and the no-advice boundary.
+- **Time contract.** Source timestamp text, factory text, retrieval time, interpreted UTC time, time basis, and freshness are kept separate. Malformed, missing, future, conflicting, DST-ambiguous, and cached-then-aged timestamps have synthetic tests. A bad timestamp is never replaced with fetch time.
+- **Factory-UTC inference with live validation.** `FactoryTimestamp` is read as UTC only when both clocks parse, their gap is quarter-hour aligned and within ±14 hours, and the factory time is not in the future. The basis is labeled `factory_utc_inferred`. One live US follower account confirmed the interpretation on 2026-11-05; see [architecture notes](architecture.md#factory-clock-validation).
+- **Fetch cache and failure cooldown.** Successful reads are cached in memory for 60 seconds with their original retrieval time. Rate limits and lockouts cool down for the upstream-indicated time; other failures pause calls for 60 seconds.
+- **Rejected-credential latch.** After `authentication_failed`, the server makes no further login attempts until it restarts.
+- **Window filtering and coverage.** `hours`, `days`, and `period` filter graph points when every point has a usable UTC time. Coverage reports first and last observations, span, estimated cadence and expected points, gaps, and `window_verified: false`.
+- **Partial statistics.** A graph shorter than the requested period returns statistics labeled `period_status: partial` with the observed span in `coverage`. `insufficient_data` means no valid values were returned. Sample percentages are not called time in range; GMI, time-weighted range, and meal or dawn fields are `null`.
+- **Current reading appended to history.** The graph lags the live reading, so history, stats, and trends append the current measurement when the graph lacks it, labeled `source: current_measurement`. History points carry no per-point freshness.
+- **Masked sensor IDs.** Serial numbers and device IDs are reduced to their last four characters. Activation time is shown only when the source epoch is plausible and not in the future.
+- **Configurable API version.** `set-api-version` stores a validated three-part version locally.
+- **D-Bus session fallback.** On Linux, a missing `DBUS_SESSION_BUS_ADDRESS` falls back to the user's own `/run/user/<uid>/bus` socket, so MCP clients started outside a desktop session can reach Secret Service.
+- **Local data deletion.** `clear-local-data` removes this project's credential and preference entries.
+- **CI.** Formatting, Clippy with warnings denied, and tests on Linux, macOS, and Windows, plus an MSRV job that runs the tests on Rust 1.89.
 
-## 2. Make historical windows real
+## v0.2: owned API client behind a `DataSource` trait
 
-The LibreLinkUp graph endpoint does not accept a requested date range, so it cannot on its own guarantee 7-, 30-, or 90-day history. See [Nightscout Connect's LibreLinkUp integration notes](https://github.com/nightscout/nightscout-connect/blob/main/README.md). Add an **opt-in** local SQLite collector or a verified import source. Store no credentials or tokens in SQLite. Scope records to one selected patient, set restrictive file permissions, allow deletion and retention controls, and record collection gaps. Poll conservatively and handle 429/backoff without repeated login storms.
+The borrowed `libre_link_up_api_client` crate retries login after any request error, including throttling. Its base URL is fixed, so it cannot be tested against a mock server. It keeps its own copy of the password, and its sensor model mislabels epoch fields. v0.2 replaces it. This is a prerequisite for any polling in v0.3.
 
-**Gate:** `get_glucose_history(hours)` filters to the requested window when timestamps are trusted and reports actual first/last observations, expected and observed samples, gaps, and source. If a window is unavailable, return `insufficient_data` instead of pretending the graph covered it.
+1. **Adapter seam, no behavior change.** Record the decision in `docs/adr/0001-owned-api-client.md`. Introduce a `DataSource` trait that returns the current item, graph items, and active sensors. Move all crate use behind one implementation. Tools and the fetch cache and cooldown depend only on the trait. A fake `DataSource` test proves a tool runs without the network.
+2. **Owned `reqwest` client.** Configurable base URL, region redirect handling, bounded session refresh, and no blind login retry after 429/430. Credentials are read once and not duplicated into long-lived strings. `wiremock` tests with synthetic bodies cover redirect, lockout, status 2 and 4 account actions, 401, 429/430, 403/920 minimum version, and account-ID mismatch, plus missing fields and unknown trend codes.
+3. **Switch over and remove the crate.** Map structured status to `client_version_rejected` and `api_retired` (see [API retirement risk](#api-retirement-risk)) as distinct from `upstream_unavailable`. Replace name-based patient selection with a local, stable-ID chooser that refuses ambiguous or changed connections without exposing patient IDs.
 
-## 3. Build defensible analytics
+**Gate:** no crate dependency remains; every upstream error path has a synthetic HTTP fixture; one failed request causes at most one login attempt; tool output is unchanged except for the new error codes.
 
-- Make `days` and `period` affect the data selection, with tests at window boundaries and during sparse coverage.
-- Separate percentages of returned samples from time-weighted time in range. Include sample count, coverage, data source, and the chosen target bounds with every summary.
-- Report GMI as an estimate only with an eligible data window. The [international CGM time-in-range consensus](https://pmc.ncbi.nlm.nih.gov/articles/PMC6973648/) recommends 14 days and at least 70% data availability for a representative standardized report; this is a useful default quality gate, not a diagnosis.
-- Remove meal and dawn labels unless corresponding context and validated methods exist. Keep descriptive patterns and avoid treatment recommendations.
+## v0.3: opt-in `collect` command and SQLite
 
-**Gate:** no metric silently treats missing values as zero, irregular samples as equal durations, or a short graph as a full requested period.
+The graph endpoint takes no date range, so it cannot supply 7-, 30-, or 90-day history on its own. See [Nightscout Connect's LibreLinkUp notes](https://github.com/nightscout/nightscout-connect/blob/main/README.md).
 
-## 4. Harden the API and privacy boundary
+- A separate, explicitly started `collect` command polls through the v0.2 client on a conservative interval and writes to a local SQLite file. `serve` never polls on its own and reads history from the database when one exists.
+- No credentials or tokens in SQLite. Scope records to one selected patient. Restrictive file permissions. Deduplicate overlapping graph responses by source timestamp, keep source and time basis per row, and record collection gaps explicitly.
+- Retention controls; `clear-local-data` also removes the database.
+- Throttling and lockout handling come from the v0.2 client; the collector backs off and never causes login storms.
 
-- Keep the eight tool names. `configure_credentials` must continue to reject secret arguments. Test the serialized MCP schemas and real stdio calls.
-- Replace first-person selection by a local, stable-ID chooser that refuses ambiguous or changed connections. Never expose patient IDs through setup prompts or logs unless the user explicitly requests local display.
-- Replace the unofficial API client behind a `DataSource` adapter so the first 429/430 response cannot trigger a blind login retry. Use a configurable test base URL, bound session refreshes, and keep credentials out of long-lived duplicate strings. Add synthetic HTTP fixtures for redirects, expired tokens, 401s, account actions, lockouts, 429/430s, 403/920 minimum-version responses, account-ID mismatches, missing fields, changed trend codes, and sensor metadata conflicts.
-- Distinguish `client_version_rejected` and `api_retired` from generic upstream failures when the owned adapter can inspect structured response status safely. Keep the API version configurable through the local CLI.
-- Audit error paths, panic paths, traces, and debug output for passwords, tokens, account identifiers, and personal readings. Keep telemetry off by default.
+**Gate:** `get_glucose_history(hours)` returns stored readings for the requested window with source labels, real first and last observations, expected and observed samples, and gaps. A window the database does not cover returns `partial` coverage, never a claim of completeness. Statistics over a short window stay labeled `partial`; `insufficient_data` still means no valid values.
 
-**Gate:** no secrets in MCP inputs, stdout logs, test fixtures, or repository history; errors are actionable without echoing upstream response bodies.
+## v0.4: LibreView CSV import and defensible analytics
 
-## 5. Ship and maintain it across platforms
+- Import a locally saved LibreView CSV export into the same database, with `source: libreview_csv` provenance and deduplication against collected rows. Import is offline and uploads nothing.
+- Time-weighted time in range, kept separate from sample percentages. Irregular samples are weighted by duration, gaps are excluded rather than counted as zero, and long gaps are not bridged.
+- GMI reported as an estimate only when the window has at least 14 days and at least 70% data coverage, following the [international CGM time-in-range consensus](https://pmc.ncbi.nlm.nih.gov/articles/PMC6973648/). Otherwise `gmi_percent` stays `null` with a reason. This is a data-quality gate, not a diagnosis.
+- Every summary includes sample count, coverage, data source, and the target bounds used. Meal, dawn, and overnight fields stay `null` unless validated context exists.
 
-- Add MCP tool annotations, typed output schemas, server instructions for freshness, and a current-reading resource. Cap or paginate large history responses.
-- Keep Linux, macOS, and Windows CI green for formatting, Clippy, tests, and a stdio handshake/tool-list smoke test.
-- Keep the declared Rust 1.89 minimum version green in CI and add a dependency advisory/license gate. Publish binaries and a Claude Desktop bundle only after the correctness and privacy gates pass.
-- Add installation, keyring troubleshooting, data deletion, privacy, and compatibility docs. Publish versioned binaries and a changelog only after the release gates pass.
-- Validate manually on multiple account/region/sensor combinations without collecting anyone's private responses in issues or fixtures.
+**Gate:** no metric treats missing values as zero, irregular samples as equal durations, or a short window as the full requested period. Tests cover the 14-day and 70% boundaries.
 
-**Release bar:** all eight tools have honest parameter semantics or explicit unavailable results, all privacy and data-quality gates pass, and the public docs state the remaining API limitations.
+## v1.0: release
+
+- MCP tool annotations and typed output schemas for all eight tools. A current-reading resource. Cap or paginate large history responses.
+- Error paths, panics, traces, and debug output audited for passwords, tokens, account identifiers, and readings. Telemetry stays off.
+- Dependency advisory and license gate in CI.
+- Versioned release binaries, a changelog, and a Claude Desktop bundle.
+- Installation, keyring troubleshooting, data deletion, privacy, and compatibility docs.
+- Manual validation on multiple account, region, and sensor combinations, including factory-UTC inference outside the US, without recording anyone's responses in issues or fixtures.
+
+**Release bar:** all eight tools have honest parameter semantics or explicit unavailable results, every gate above passes, and the public docs state the remaining API limitations.
+
+## API retirement risk
+
+Abbott's LibreLinkUp 5.x API encrypts its responses. The v4 plain-JSON endpoints this project uses may be shut off.
+
+- **Detect and report.** The owned client in v0.2 will recognize retirement signals and return `api_retired` instead of a generic upstream failure. The exact signals will be pinned with synthetic fixtures once observed; candidates are a minimum-version rejection that no v4 version satisfies and responses that are no longer plain JSON.
+- **No circumvention.** The project will not decrypt, emulate, or otherwise work around v5 encryption.
+- **Stay useful afterward.** Data already collected in SQLite (v0.3) and LibreView CSV import (v0.4) do not depend on the live API. After retirement, history, statistics, and trends keep working from local data, while live-only tools report `api_retired`.
