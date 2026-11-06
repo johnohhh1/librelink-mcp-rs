@@ -19,6 +19,7 @@ pub(crate) enum Freshness {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TimeBasis {
     OffsetKnown,
+    FactoryUtcInferred,
     OffsetMissing,
     Conflicting,
     Invalid,
@@ -62,22 +63,47 @@ fn freshness_at(observed: DateTime<Utc>, now: DateTime<Utc>) -> Freshness {
     }
 }
 
+fn infer_factory_utc(
+    display: NaiveDateTime,
+    factory: NaiveDateTime,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let gap_seconds = display.signed_duration_since(factory).num_seconds();
+    // Real timezone offsets are quarter-hour aligned and within this range.
+    // This is a consistency check, not a timezone assertion from the API.
+    if gap_seconds % (15 * 60) != 0 || gap_seconds.abs() > 14 * 60 * 60 {
+        return None;
+    }
+    let observed = DateTime::<Utc>::from_naive_utc_and_offset(factory, Utc);
+    (observed <= now).then_some(observed)
+}
+
 pub(crate) fn assess_time(
     display_raw: Option<&str>,
     factory_raw: Option<&str>,
+    now: DateTime<Utc>,
+) -> TimeAssessment {
+    assess_time_at(display_raw, factory_raw, now, now)
+}
+
+pub(crate) fn assess_time_at(
+    display_raw: Option<&str>,
+    factory_raw: Option<&str>,
+    retrieved_at: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> TimeAssessment {
     let display = present(display_raw);
     let factory = present(factory_raw);
     let display_offset = display.and_then(parse_offset);
     let factory_offset = factory.and_then(parse_offset);
-    let display_minus_factory_minutes =
-        match (display.and_then(parse_naive), factory.and_then(parse_naive)) {
-            (Some(display), Some(factory)) => {
-                Some(display.signed_duration_since(factory).num_minutes())
-            }
-            _ => None,
-        };
+    let display_naive = display.and_then(parse_naive);
+    let factory_naive = factory.and_then(parse_naive);
+    let display_minus_factory_minutes = match (display_naive, factory_naive) {
+        (Some(display), Some(factory)) => {
+            Some(display.signed_duration_since(factory).num_minutes())
+        }
+        _ => None,
+    };
 
     let (observed_at_utc, time_basis, freshness) = match (display_offset, factory_offset) {
         (Some(display), Some(factory))
@@ -99,10 +125,18 @@ pub(crate) fn assess_time(
         (None, None) if display.is_none() && factory.is_none() => {
             (None, TimeBasis::Missing, Freshness::Missing)
         }
-        (None, None)
-            if display.and_then(parse_naive).is_some()
-                || factory.and_then(parse_naive).is_some() =>
-        {
+        (None, None) if display_naive.is_some() && factory_naive.is_some() => {
+            let inferred = infer_factory_utc(display_naive.unwrap(), factory_naive.unwrap(), now);
+            match inferred {
+                Some(observed) => (
+                    Some(observed),
+                    TimeBasis::FactoryUtcInferred,
+                    freshness_at(observed, now),
+                ),
+                None => (None, TimeBasis::OffsetMissing, Freshness::Unknown),
+            }
+        }
+        (None, None) if display_naive.is_some() || factory_naive.is_some() => {
             (None, TimeBasis::OffsetMissing, Freshness::Unknown)
         }
         (None, None) => (None, TimeBasis::Invalid, Freshness::Unknown),
@@ -111,7 +145,7 @@ pub(crate) fn assess_time(
     TimeAssessment {
         source_timestamp: display.map(str::to_owned),
         factory_timestamp: factory.map(str::to_owned),
-        retrieved_at_utc: now,
+        retrieved_at_utc: retrieved_at,
         observed_at_utc,
         time_basis,
         freshness,
@@ -130,16 +164,69 @@ mod tests {
     }
 
     #[test]
-    fn offsetless_api_clocks_do_not_claim_freshness() {
+    fn matching_api_clocks_infer_factory_utc() {
         let time = assess_time(
-            Some("11/05/2026 03:58:00 PM"),
+            Some("11/05/2026 02:58:00 PM"),
             Some("11/05/2026 07:58:00 PM"),
             now(),
         );
-        assert_eq!(time.time_basis, TimeBasis::OffsetMissing);
-        assert_eq!(time.freshness, Freshness::Unknown);
-        assert_eq!(time.display_minus_factory_minutes, Some(-240));
-        assert!(time.observed_at_utc.is_none());
+        assert_eq!(time.time_basis, TimeBasis::FactoryUtcInferred);
+        assert_eq!(time.freshness, Freshness::Recent);
+        assert_eq!(time.display_minus_factory_minutes, Some(-300));
+        assert_eq!(
+            time.observed_at_utc.unwrap().to_rfc3339(),
+            "2026-11-05T19:58:00+00:00"
+        );
+    }
+
+    #[test]
+    fn summer_offset_and_dst_fallback_remain_unambiguous_via_factory_clock() {
+        let summer_now = DateTime::parse_from_rfc3339("2026-05-20T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let summer = assess_time(
+            Some("05/20/2026 11:58:00 AM"),
+            Some("05/20/2026 09:58:00 AM"),
+            summer_now,
+        );
+        assert_eq!(summer.time_basis, TimeBasis::FactoryUtcInferred);
+        assert_eq!(summer.display_minus_factory_minutes, Some(120));
+
+        let fallback_now = DateTime::parse_from_rfc3339("2026-11-01T07:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        for factory in ["11/01/2026 05:30:00 AM", "11/01/2026 06:30:00 AM"] {
+            let time = assess_time(Some("11/01/2026 01:30:00 AM"), Some(factory), fallback_now);
+            assert_eq!(time.time_basis, TimeBasis::FactoryUtcInferred);
+        }
+    }
+
+    #[test]
+    fn invalid_offsets_and_future_factory_clock_are_not_inferred() {
+        for (display, factory) in [
+            ("11/05/2026 08:17:00 PM", "11/05/2026 08:00:00 PM"),
+            ("11/06/2026 11:00:00 AM", "11/05/2026 08:00:00 PM"),
+            ("11/05/2026 08:15:00 PM", "11/05/2026 08:15:00 PM"),
+        ] {
+            let time = assess_time(Some(display), Some(factory), now());
+            assert_eq!(time.time_basis, TimeBasis::OffsetMissing);
+            assert_eq!(time.freshness, Freshness::Unknown);
+            assert!(time.observed_at_utc.is_none());
+        }
+    }
+
+    #[test]
+    fn cached_retrieval_time_does_not_refresh_freshness() {
+        let retrieved = now();
+        let later = retrieved + Duration::minutes(30);
+        let time = assess_time_at(
+            Some("11/05/2026 02:58:00 PM"),
+            Some("11/05/2026 07:58:00 PM"),
+            retrieved,
+            later,
+        );
+        assert_eq!(time.retrieved_at_utc, retrieved);
+        assert_eq!(time.freshness, Freshness::Stale);
     }
 
     #[test]

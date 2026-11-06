@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use keyring::{Entry, Error as KeyringError};
 use libre_link_up_api_client::{
     ClientConfig, ConnectionIdentifier, LibreLinkUpClient, LibreLinkUpError, ReadRawResponse,
@@ -6,21 +6,27 @@ use libre_link_up_api_client::{
 };
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
+use std::ops::Deref;
 use std::sync::Arc;
-use std::time::Duration as StdDuration;
+use std::time::{Duration as StdDuration, Instant};
 use tokio::sync::{Mutex, OnceCell};
 use zeroize::{Zeroize, Zeroizing};
 
 mod mcp;
 mod time;
 
-use time::{TimeAssessment, assess_time};
+use time::{TimeAssessment, assess_time_at};
 
 const KEYRING_SERVICE: &str = "org.librelink-mcp-rs";
 const KEYRING_USER: &str = "librelinkup-account";
 const SETTINGS_USER: &str = "local-settings";
 static CLIENT: OnceCell<LibreLinkUpClient> = OnceCell::const_new();
-static API_CALL_LOCK: Mutex<()> = Mutex::const_new(());
+static FETCH_STATE: Mutex<FetchState> = Mutex::const_new(FetchState {
+    cached: None,
+    cooldown: None,
+});
+const CACHE_TTL: StdDuration = StdDuration::from_secs(60);
+const FAILURE_COOLDOWN: StdDuration = StdDuration::from_secs(60);
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -36,6 +42,12 @@ struct Settings {
     target_low: u16,
     target_high: u16,
     patient_name: Option<String>,
+    #[serde(default = "default_api_version")]
+    api_version: String,
+}
+
+fn default_api_version() -> String {
+    "4.16.0".to_owned()
 }
 
 impl Default for Settings {
@@ -44,6 +56,7 @@ impl Default for Settings {
             target_low: 70,
             target_high: 180,
             patient_name: None,
+            api_version: default_api_version(),
         }
     }
 }
@@ -69,6 +82,117 @@ struct ConnectivityReport {
     reading: ReadingSnapshot,
     graph_points_returned: usize,
     active_sensors_returned: usize,
+    cache_hit: bool,
+}
+
+#[derive(Clone)]
+struct FetchedRaw {
+    response: ReadRawResponse,
+    retrieved_at_utc: DateTime<Utc>,
+    cache_hit: bool,
+}
+
+impl Deref for FetchedRaw {
+    type Target = ReadRawResponse;
+
+    fn deref(&self) -> &Self::Target {
+        &self.response
+    }
+}
+
+struct CacheEntry {
+    response: ReadRawResponse,
+    retrieved_at_utc: DateTime<Utc>,
+    expires_at: Instant,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct FetchError {
+    code: &'static str,
+    message: &'static str,
+    retry_after_seconds: Option<u64>,
+}
+
+struct Cooldown {
+    until: Instant,
+    error: FetchError,
+}
+
+struct FetchState {
+    cached: Option<CacheEntry>,
+    cooldown: Option<Cooldown>,
+}
+
+fn http_status_from_invalid(message: &str) -> Option<u16> {
+    let suffix = message
+        .split_once("failed - HTTP ")
+        .map(|(_, suffix)| suffix)?;
+    let digits = suffix.get(..3)?;
+    (digits.bytes().all(|byte| byte.is_ascii_digit())
+        && matches!(suffix.as_bytes().get(3), Some(b' ' | b':')))
+    .then(|| digits.parse().ok())
+    .flatten()
+}
+
+fn classify_fetch_error(error: LibreLinkUpError) -> FetchError {
+    let (code, message, retry_after_seconds) = match error {
+        LibreLinkUpError::AccountLocked(seconds) => (
+            "rate_limited",
+            "LibreLinkUp account is temporarily locked; retry later.",
+            Some(u64::try_from(seconds).unwrap_or(60).clamp(60, 900)),
+        ),
+        LibreLinkUpError::InvalidResponse(body)
+            if matches!(http_status_from_invalid(&body), Some(429 | 430)) =>
+        {
+            (
+                "rate_limited",
+                "LibreLinkUp is rate limiting requests; retry later.",
+                Some(60),
+            )
+        }
+        LibreLinkUpError::InvalidResponse(body) if http_status_from_invalid(&body) == Some(401) => {
+            (
+                "session_expired",
+                "LibreLinkUp rejected the current session; retry later.",
+                Some(60),
+            )
+        }
+        LibreLinkUpError::Http(error) if error.is_timeout() => (
+            "timeout",
+            "LibreLinkUp request timed out; retry later.",
+            Some(60),
+        ),
+        LibreLinkUpError::BadCredentials => (
+            "authentication_failed",
+            "LibreLinkUp rejected the account credentials.",
+            Some(60),
+        ),
+        LibreLinkUpError::AdditionalActionRequired(_) => (
+            "account_action_required",
+            "LibreLinkUp requires an action in its app before API access.",
+            Some(60),
+        ),
+        LibreLinkUpError::NoConnections => (
+            "no_connection",
+            "Account authenticated but follows no patients in LibreLinkUp.",
+            Some(60),
+        ),
+        LibreLinkUpError::ConnectionNotFound(_) | LibreLinkUpError::ConnectionFunctionFailed => (
+            "patient_selection_required",
+            "No unique followed person was selected. Run `select-patient` locally.",
+            Some(60),
+        ),
+        _ => (
+            "upstream_unavailable",
+            "LibreLinkUp request failed; retry later.",
+            Some(60),
+        ),
+    };
+    FetchError {
+        code,
+        message,
+        retry_after_seconds,
+    }
 }
 
 fn parse_region(input: &str) -> Option<Region> {
@@ -89,6 +213,15 @@ fn parse_region(input: &str) -> Option<Region> {
         "cn" => Some(Region::CN),
         _ => None,
     }
+}
+
+fn valid_api_version(version: &str) -> bool {
+    let parts: Vec<_> = version.split('.').collect();
+    parts.len() == 3
+        && version.len() <= 20
+        && parts.iter().all(|part| {
+            !part.is_empty() && part.len() <= 5 && part.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
 fn keyring_entry() -> Result<Entry, &'static str> {
@@ -164,6 +297,18 @@ fn select_patient() -> Result<(), &'static str> {
     Ok(())
 }
 
+fn set_api_version() -> Result<(), &'static str> {
+    let input = prompt("LibreLinkUp API version (for example 4.16.0): ")?;
+    if !valid_api_version(&input) {
+        return Err("Version must have three numeric components, such as 4.16.0.");
+    }
+    let mut settings = load_settings()?;
+    settings.api_version = input;
+    save_settings(&settings)?;
+    println!("API version saved locally. Restart the MCP server to use it.");
+    Ok(())
+}
+
 fn delete_entry_if_present(entry: Entry) -> Result<(), &'static str> {
     match entry.delete_credential() {
         Ok(()) | Err(KeyringError::NoEntry) => Ok(()),
@@ -217,6 +362,10 @@ fn build_client() -> Result<LibreLinkUpClient, &'static str> {
     let credentials = load_credentials()?;
     let settings = load_settings()?;
     let region = parse_region(&credentials.region).ok_or("Stored region is invalid.")?;
+    if !valid_api_version(&settings.api_version) {
+        return Err("Stored API version is invalid. Run `set-api-version` locally.");
+    }
+    let api_version = settings.api_version.clone();
     let selected_name = settings.patient_name.map(|name| name.to_lowercase());
     let identifier = ConnectionIdentifier::ByFunction(Arc::new(move |connections| {
         unique_match(connections, |connection| {
@@ -229,27 +378,83 @@ fn build_client() -> Result<LibreLinkUpClient, &'static str> {
     }));
     let config = ClientConfig::new(credentials.email.clone(), credentials.password.clone())
         .with_connection_identifier(identifier)
+        .with_api_version(api_version)
         .with_region(region);
     LibreLinkUpClient::new(config).map_err(client_error)
 }
 
-async fn fetch_raw() -> Result<ReadRawResponse, &'static str> {
-    let client = CLIENT.get_or_try_init(|| async { build_client() }).await?;
-    let _guard = API_CALL_LOCK.lock().await;
+async fn fetch_raw() -> Result<FetchedRaw, FetchError> {
+    let mut state = FETCH_STATE.lock().await;
+    let now = Instant::now();
+    if let Some(cached) = state.cached.as_ref().filter(|entry| now < entry.expires_at) {
+        return Ok(FetchedRaw {
+            response: cached.response.clone(),
+            retrieved_at_utc: cached.retrieved_at_utc,
+            cache_hit: true,
+        });
+    }
+    if let Some(cooldown) = state.cooldown.as_ref().filter(|entry| now < entry.until) {
+        let mut error = cooldown.error;
+        error.retry_after_seconds = Some(cooldown.until.duration_since(now).as_secs().max(1));
+        return Err(error);
+    }
+    let client = CLIENT
+        .get_or_try_init(|| async { build_client() })
+        .await
+        .map_err(|message| FetchError {
+            code: "configuration_error",
+            message,
+            retry_after_seconds: None,
+        })?;
     // read_raw preserves the source timestamp. The client's processed read()
     // currently replaces an unparseable timestamp with Utc::now().
-    tokio::time::timeout(StdDuration::from_secs(30), client.read_raw())
-        .await
-        .map_err(|_| "LibreLinkUp request timed out.")?
-        .map_err(client_error)
+    let response = match tokio::time::timeout(StdDuration::from_secs(30), client.read_raw()).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            let error = classify_fetch_error(error);
+            let seconds = error
+                .retry_after_seconds
+                .unwrap_or(FAILURE_COOLDOWN.as_secs());
+            state.cooldown = Some(Cooldown {
+                until: Instant::now() + StdDuration::from_secs(seconds),
+                error,
+            });
+            return Err(error);
+        }
+        Err(_) => {
+            let error = FetchError {
+                code: "timeout",
+                message: "LibreLinkUp request timed out; retry later.",
+                retry_after_seconds: Some(FAILURE_COOLDOWN.as_secs()),
+            };
+            state.cooldown = Some(Cooldown {
+                until: Instant::now() + FAILURE_COOLDOWN,
+                error,
+            });
+            return Err(error);
+        }
+    };
+    let retrieved_at_utc = Utc::now();
+    state.cached = Some(CacheEntry {
+        response: response.clone(),
+        retrieved_at_utc,
+        expires_at: Instant::now() + CACHE_TTL,
+    });
+    state.cooldown = None;
+    Ok(FetchedRaw {
+        response,
+        retrieved_at_utc,
+        cache_hit: false,
+    })
 }
 
 async fn check() -> Result<(), &'static str> {
-    let raw = fetch_raw().await?;
+    let raw = fetch_raw().await.map_err(|error| error.message)?;
     let measurement = &raw.connection.glucose_measurement;
-    let time = assess_time(
+    let time = assess_time_at(
         Some(&measurement.timestamp),
         Some(&measurement.factory_timestamp),
+        raw.retrieved_at_utc,
         Utc::now(),
     );
     let report = ConnectivityReport {
@@ -270,6 +475,7 @@ async fn check() -> Result<(), &'static str> {
         },
         graph_points_returned: raw.graph_data.len(),
         active_sensors_returned: raw.active_sensors.len(),
+        cache_hit: raw.cache_hit,
     };
     let output = serde_json::to_string_pretty(&report).map_err(|_| "Unable to format result.")?;
     println!("{output}");
@@ -283,9 +489,12 @@ async fn main() {
         [_, command] if command == "setup" => setup(),
         [_, command] if command == "check" => check().await,
         [_, command] if command == "select-patient" => select_patient(),
+        [_, command] if command == "set-api-version" => set_api_version(),
         [_, command] if command == "clear-local-data" => clear_local_data(),
         [_, command] if command == "serve" => mcp::serve().await,
-        _ => Err("Usage: librelink-mcp-rs <setup|select-patient|check|clear-local-data|serve>"),
+        _ => Err(
+            "Usage: librelink-mcp-rs <setup|select-patient|set-api-version|check|clear-local-data|serve>",
+        ),
     };
     if let Err(message) = result {
         eprintln!("{message}");
@@ -302,6 +511,13 @@ mod tests {
         assert_eq!(parse_region("EU2"), Some(Region::EU2));
         assert_eq!(parse_region(""), Some(Region::Global));
         assert_eq!(parse_region("unknown"), None);
+        assert!(valid_api_version("4.16.0"));
+        assert!(!valid_api_version("4.16.0\r\npassword:secret"));
+        assert!(!valid_api_version("latest"));
+        let old_settings: Settings =
+            serde_json::from_str(r#"{"target_low":70,"target_high":180,"patient_name":null}"#)
+                .unwrap();
+        assert_eq!(old_settings.api_version, "4.16.0");
     }
 
     #[test]
@@ -311,5 +527,36 @@ mod tests {
         assert_eq!(unique_match(&names, |name| *name == "Sam"), None);
         assert_eq!(unique_match(&names, |name| *name == "Pat"), None);
         assert_eq!(unique_match(&names, |_| true), None);
+    }
+
+    #[test]
+    fn parses_only_status_from_client_error_prefix() {
+        assert_eq!(
+            http_status_from_invalid(
+                "request to '/llu/connections' failed - HTTP 429 Too Many Requests: private body"
+            ),
+            Some(429)
+        );
+        assert_eq!(
+            http_status_from_invalid("Login failed - HTTP 430: private body"),
+            Some(430)
+        );
+        assert_eq!(http_status_from_invalid("private body says HTTP 429"), None);
+        assert_eq!(
+            http_status_from_invalid("Login failed - HTTP xxx: body"),
+            None
+        );
+    }
+
+    #[test]
+    fn lockouts_and_throttling_map_to_safe_errors() {
+        let locked = classify_fetch_error(LibreLinkUpError::AccountLocked(125));
+        assert_eq!(locked.code, "rate_limited");
+        assert_eq!(locked.retry_after_seconds, Some(125));
+        let throttled = classify_fetch_error(LibreLinkUpError::InvalidResponse(
+            "request to '/llu/connections' failed - HTTP 429: synthetic body".to_owned(),
+        ));
+        assert_eq!(throttled.code, "rate_limited");
+        assert!(!throttled.message.contains("synthetic body"));
     }
 }

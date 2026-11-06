@@ -1,11 +1,11 @@
 # Roadmap to a reliable release
 
-The current server proves connectivity and MCP interoperability. It exposes the eight original tool names but is not yet feature complete: `hours`, `days`, and `period` filter offset-aware graph points, but the returned graph may cover a shorter, unknown window. Offset-free graphs stay unfiltered and the tool responses say so. This document defines the release gates for claiming parity.
+The current server proves connectivity and MCP interoperability. It exposes the eight original tool names but is not yet feature complete. `hours`, `days`, and `period` filter graph points with offset-aware or conservatively inferred UTC times. A short graph yields coverage diagnostics or `insufficient_data`; no API completeness claim is made. This document defines the remaining release gates for claiming parity.
 
 ## 1. Establish a trustworthy time and data contract
 
 - Keep source timestamp text, fetch time, unit, trend code, sensor identifiers, and provenance separate in a typed reading model.
-- Determine the relationship between `FactoryTimestamp` and `Timestamp` with synthetic fixtures and local checks across time zones and daylight-saving transitions. Do not convert an offset-free timestamp to UTC without evidence.
+- Continue validating the `FactoryTimestamp` UTC interpretation across accounts, regions, time zones, and daylight-saving transitions. Keep the inferred basis explicit and reject inconsistent clock pairs.
 - Mark value state (`observed`, `missing`, `estimated`) and freshness (`recent`, `stale`, `unknown`, `missing`) independently. Never replace a bad timestamp with fetch time.
 - Reject impossible values, deduplicate overlapping graph responses, and retain gaps explicitly.
 
@@ -30,15 +30,17 @@ The LibreLinkUp graph endpoint does not accept a requested date range, so it can
 
 - Keep the eight tool names. `configure_credentials` must continue to reject secret arguments. Test the serialized MCP schemas and real stdio calls.
 - Replace first-person selection by a local, stable-ID chooser that refuses ambiguous or changed connections. Never expose patient IDs through setup prompts or logs unless the user explicitly requests local display.
-- Wrap the unofficial API client behind an adapter. Add synthetic HTTP fixtures for redirects, expired tokens, account actions, lockouts, 429s, missing fields, changed trend codes, and sensor metadata conflicts. Contribute upstream fixes when practical.
+- Replace the unofficial API client behind a `DataSource` adapter so the first 429/430 response cannot trigger a blind login retry. Use a configurable test base URL, bound session refreshes, and keep credentials out of long-lived duplicate strings. Add synthetic HTTP fixtures for redirects, expired tokens, 401s, account actions, lockouts, 429/430s, 403/920 minimum-version responses, account-ID mismatches, missing fields, changed trend codes, and sensor metadata conflicts.
+- Distinguish `client_version_rejected` and `api_retired` from generic upstream failures when the owned adapter can inspect structured response status safely. Keep the API version configurable through the local CLI.
 - Audit error paths, panic paths, traces, and debug output for passwords, tokens, account identifiers, and personal readings. Keep telemetry off by default.
 
 **Gate:** no secrets in MCP inputs, stdout logs, test fixtures, or repository history; errors are actionable without echoing upstream response bodies.
 
 ## 5. Ship and maintain it across platforms
 
-- Use typed structured MCP results and documented error codes; cap or paginate large history responses.
+- Add MCP tool annotations, typed output schemas, server instructions for freshness, and a current-reading resource. Cap or paginate large history responses.
 - Keep Linux, macOS, and Windows CI green for formatting, Clippy, tests, and a stdio handshake/tool-list smoke test.
+- Keep the declared Rust 1.89 minimum version green in CI and add a dependency advisory/license gate. Publish binaries and a Claude Desktop bundle only after the correctness and privacy gates pass.
 - Add installation, keyring troubleshooting, data deletion, privacy, and compatibility docs. Publish versioned binaries and a changelog only after the release gates pass.
 - Validate manually on multiple account/region/sensor combinations without collecting anyone's private responses in issues or fixtures.
 

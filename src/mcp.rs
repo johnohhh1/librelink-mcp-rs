@@ -1,6 +1,6 @@
 use crate::{
-    fetch_raw, load_settings, save_settings,
-    time::{STALE_AFTER_MINUTES, TimeAssessment, assess_time},
+    FetchError, fetch_raw, load_settings, save_settings,
+    time::{STALE_AFTER_MINUTES, TimeAssessment, assess_time, assess_time_at},
 };
 use chrono::{DateTime, Duration, Utc};
 use libre_link_up_api_client::GlucoseItem;
@@ -67,10 +67,176 @@ struct Reading {
     #[serde(flatten)]
     time: TimeAssessment,
     trend: Option<&'static str>,
+    cache_hit: bool,
+}
+
+#[derive(Serialize)]
+struct GraphGap {
+    from_utc: DateTime<Utc>,
+    to_utc: DateTime<Utc>,
+    duration_minutes: f64,
+}
+
+#[derive(Serialize)]
+struct GraphCoverage {
+    source: &'static str,
+    requested_hours: i64,
+    first_observed_at_utc: Option<DateTime<Utc>>,
+    last_observed_at_utc: Option<DateTime<Utc>>,
+    observed_span_hours: Option<f64>,
+    actual_points_in_window: Option<usize>,
+    estimated_cadence_minutes: Option<f64>,
+    expected_points_estimate: Option<i64>,
+    start_gap_minutes: Option<f64>,
+    end_gap_minutes: Option<f64>,
+    interior_gap_count: usize,
+    interior_gaps: Vec<GraphGap>,
+    period_span_sufficient: bool,
+    reason: &'static str,
+}
+
+#[derive(Serialize)]
+struct RateSummary {
+    pair_count: usize,
+    minimum_mg_dl_per_minute: Option<f64>,
+    maximum_mg_dl_per_minute: Option<f64>,
+    average_mg_dl_per_minute: Option<f64>,
+    maximum_pair_gap_minutes: u8,
+}
+
+fn observed_rates(items: &[&GlucoseItem], now: DateTime<Utc>) -> RateSummary {
+    let mut points: Vec<_> = items
+        .iter()
+        .filter_map(|item| {
+            let time = assess_time(Some(&item.timestamp), Some(&item.factory_timestamp), now)
+                .observed_at_utc?;
+            (item.value_in_mg_per_dl.is_finite() && item.value_in_mg_per_dl > 0.0 && time <= now)
+                .then_some((time, item.value_in_mg_per_dl))
+        })
+        .collect();
+    points.sort_unstable_by_key(|(time, _)| *time);
+    points.dedup_by_key(|(time, _)| *time);
+    let rates: Vec<f64> = points
+        .windows(2)
+        .filter_map(|pair| {
+            let minutes = pair[1].0.signed_duration_since(pair[0].0).num_seconds() as f64 / 60.0;
+            (1.0..=30.0)
+                .contains(&minutes)
+                .then_some((pair[1].1 - pair[0].1) / minutes)
+        })
+        .collect();
+    RateSummary {
+        pair_count: rates.len(),
+        minimum_mg_dl_per_minute: rates.iter().copied().reduce(f64::min),
+        maximum_mg_dl_per_minute: rates.iter().copied().reduce(f64::max),
+        average_mg_dl_per_minute: (!rates.is_empty())
+            .then(|| rates.iter().sum::<f64>() / rates.len() as f64),
+        maximum_pair_gap_minutes: 30,
+    }
+}
+
+fn graph_coverage(items: &[GlucoseItem], hours: i64, now: DateTime<Utc>) -> GraphCoverage {
+    let cutoff = now - Duration::hours(hours);
+    let assessed: Vec<_> = items
+        .iter()
+        .map(|item| assess_time(Some(&item.timestamp), Some(&item.factory_timestamp), now))
+        .collect();
+    let usable = !assessed.is_empty()
+        && assessed
+            .iter()
+            .all(|time| time.observed_at_utc.is_some_and(|observed| observed <= now));
+    if !usable {
+        return GraphCoverage {
+            source: "librelinkup_graph",
+            requested_hours: hours,
+            first_observed_at_utc: None,
+            last_observed_at_utc: None,
+            observed_span_hours: None,
+            actual_points_in_window: None,
+            estimated_cadence_minutes: None,
+            expected_points_estimate: None,
+            start_gap_minutes: None,
+            end_gap_minutes: None,
+            interior_gap_count: 0,
+            interior_gaps: vec![],
+            period_span_sufficient: false,
+            reason: "One or more graph timestamps lack a usable UTC time basis.",
+        };
+    }
+    let mut times: Vec<_> = assessed
+        .into_iter()
+        .filter_map(|time| time.observed_at_utc)
+        .collect();
+    times.sort_unstable();
+    times.dedup();
+    let first = times[0];
+    let last = *times.last().unwrap();
+    let actual_points_in_window = times
+        .iter()
+        .filter(|time| **time >= cutoff && **time <= now)
+        .count();
+    let mut intervals: Vec<i64> = times
+        .windows(2)
+        .map(|pair| pair[1].signed_duration_since(pair[0]).num_seconds())
+        .filter(|seconds| *seconds >= 60 && *seconds <= 3600)
+        .collect();
+    intervals.sort_unstable();
+    let cadence_seconds = (intervals.len() >= 2).then(|| intervals[intervals.len() / 2]);
+    let mut interior_gaps = Vec::new();
+    let mut interior_gap_count = 0;
+    if let Some(cadence) = cadence_seconds {
+        for pair in times.windows(2) {
+            let seconds = pair[1].signed_duration_since(pair[0]).num_seconds();
+            if pair[1] >= cutoff && seconds >= cadence * 2 {
+                interior_gap_count += 1;
+                if interior_gaps.len() < 20 {
+                    interior_gaps.push(GraphGap {
+                        from_utc: pair[0],
+                        to_utc: pair[1],
+                        duration_minutes: seconds as f64 / 60.0,
+                    });
+                }
+            }
+        }
+    }
+    let start_gap_seconds = first.signed_duration_since(cutoff).num_seconds().max(0);
+    let end_gap_seconds = now.signed_duration_since(last).num_seconds().max(0);
+    let period_span_sufficient = cadence_seconds.is_some_and(|cadence| {
+        first <= cutoff + Duration::seconds(cadence)
+            && end_gap_seconds <= 15 * 60
+            && interior_gap_count == 0
+    });
+    GraphCoverage {
+        source: "librelinkup_graph",
+        requested_hours: hours,
+        first_observed_at_utc: Some(first),
+        last_observed_at_utc: Some(last),
+        observed_span_hours: Some(last.signed_duration_since(first).num_seconds() as f64 / 3600.0),
+        actual_points_in_window: Some(actual_points_in_window),
+        estimated_cadence_minutes: cadence_seconds.map(|seconds| seconds as f64 / 60.0),
+        expected_points_estimate: cadence_seconds.map(|seconds| hours * 3600 / seconds + 1),
+        start_gap_minutes: Some(start_gap_seconds as f64 / 60.0),
+        end_gap_minutes: Some(end_gap_seconds as f64 / 60.0),
+        interior_gap_count,
+        interior_gaps,
+        period_span_sufficient,
+        reason: "Cadence and expected points are estimates from returned graph intervals; API completeness remains unverified.",
+    }
 }
 
 fn nonempty(value: &str) -> Option<String> {
     (!value.trim().is_empty()).then(|| value.to_owned())
+}
+
+fn sensor_activation_time(epoch_seconds: i32, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    // Sensor a is an epoch-seconds field in observed LibreLinkUp payloads.
+    // Reject a days-since-start value or a clock that has not happened yet.
+    const FIRST_PLAUSIBLE_ACTIVATION: i64 = 1_388_534_400; // 2014-01-01 UTC
+    let seconds = i64::from(epoch_seconds);
+    (seconds >= FIRST_PLAUSIBLE_ACTIVATION)
+        .then(|| DateTime::<Utc>::from_timestamp(seconds, 0))
+        .flatten()
+        .filter(|time| *time <= now)
 }
 
 fn value(value: f64) -> (Option<f64>, ValueQuality) {
@@ -92,13 +258,24 @@ fn trend(arrow: Option<i32>) -> Option<&'static str> {
     }
 }
 
-fn history_reading(item: &GlucoseItem, now: DateTime<Utc>) -> Reading {
+fn history_reading(
+    item: &GlucoseItem,
+    retrieved_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+    cache_hit: bool,
+) -> Reading {
     let (glucose_mg_dl, value_quality) = value(item.value_in_mg_per_dl);
     Reading {
         glucose_mg_dl,
         value_quality,
-        time: assess_time(Some(&item.timestamp), Some(&item.factory_timestamp), now),
+        time: assess_time_at(
+            Some(&item.timestamp),
+            Some(&item.factory_timestamp),
+            retrieved_at,
+            now,
+        ),
         trend: trend(item.trend_arrow),
+        cache_hit,
     }
 }
 
@@ -155,6 +332,22 @@ fn failure_code(code: &str, message: &str) -> CallToolResult {
     }))
 }
 
+fn failure_fetch(error: FetchError) -> CallToolResult {
+    CallToolResult::structured_error(serde_json::json!({
+        "error_code": error.code,
+        "message": error.message,
+        "retry_after_seconds": error.retry_after_seconds,
+    }))
+}
+
+fn insufficient_coverage(coverage: GraphCoverage) -> CallToolResult {
+    CallToolResult::structured_error(serde_json::json!({
+        "error_code": "insufficient_data",
+        "message": "The returned graph does not support the requested time window.",
+        "coverage": coverage,
+    }))
+}
+
 fn invalid_window(value: u32, max: u32) -> bool {
     value == 0 || value > max
 }
@@ -170,24 +363,26 @@ impl LibreMcp {
     ) -> CallToolResult {
         let raw = match fetch_raw().await {
             Ok(raw) => raw,
-            Err(message) => return failure(message),
+            Err(error) => return failure_fetch(error),
         };
         let item = &raw.connection.glucose_measurement;
         let (glucose_mg_dl, value_quality) = value(item.value_in_mg_per_dl);
         success(Reading {
             glucose_mg_dl,
             value_quality,
-            time: assess_time(
+            time: assess_time_at(
                 Some(&item.timestamp),
                 Some(&item.factory_timestamp),
+                raw.retrieved_at_utc,
                 Utc::now(),
             ),
             trend: trend(Some(item.trend_arrow)),
+            cache_hit: raw.cache_hit,
         })
     }
 
     #[tool(
-        description = "Return graph readings within requested hours only when each reading has an offset-aware timestamp. Otherwise show the returned graph and mark the window unverified."
+        description = "Return graph readings within requested hours when each reading has an offset-aware or validated inferred UTC time. Report whether filtering applied and that coverage is unverified."
     )]
     async fn get_glucose_history(
         &self,
@@ -199,23 +394,26 @@ impl LibreMcp {
         }
         let raw = match fetch_raw().await {
             Ok(raw) => raw,
-            Err(message) => return failure(message),
+            Err(error) => return failure_fetch(error),
         };
         let now = Utc::now();
+        let coverage = graph_coverage(&raw.graph_data, i64::from(hours), now);
         let (items, window_filter_applied) =
             select_graph_window(&raw.graph_data, i64::from(hours), now);
         let readings: Vec<Reading> = items
             .into_iter()
-            .map(|item| history_reading(item, now))
+            .map(|item| history_reading(item, raw.retrieved_at_utc, now, raw.cache_hit))
             .collect();
         success(serde_json::json!({
             "requested_hours": hours,
             "window_verified": false,
             "window_filter_applied": window_filter_applied,
+            "cache_hit": raw.cache_hit,
+            "coverage": coverage,
             "reason": if window_filter_applied {
-                "Readings were filtered by offset-aware timestamps, but API graph coverage may be shorter than requested."
+                "Readings were filtered by offset-aware or inferred factory UTC timestamps, but API graph coverage may be shorter than requested."
             } else {
-                "The API graph may be shorter than requested and its timestamps have no trusted offset. All returned graph points are shown."
+                "The API graph may be shorter than requested and some timestamps lack a usable time basis. All returned graph points are shown."
             },
             "total_readings": readings.len(),
             "readings": readings,
@@ -223,7 +421,7 @@ impl LibreMcp {
     }
 
     #[tool(
-        description = "Calculate descriptive statistics for returned graph points. Filter requested days only when all timestamps have trusted offsets; coverage and true time in range remain unverified."
+        description = "Calculate descriptive statistics for graph points. Filter requested days only when each timestamp has an offset-aware or validated inferred UTC time; coverage remains unverified."
     )]
     async fn get_glucose_stats(&self, Parameters(args): Parameters<StatsArgs>) -> CallToolResult {
         let days = args.days.unwrap_or(7);
@@ -232,14 +430,19 @@ impl LibreMcp {
         }
         let raw = match fetch_raw().await {
             Ok(raw) => raw,
-            Err(message) => return failure(message),
+            Err(error) => return failure_fetch(error),
         };
         let settings = match load_settings() {
             Ok(settings) => settings,
             Err(message) => return failure(message),
         };
+        let now = Utc::now();
+        let coverage = graph_coverage(&raw.graph_data, i64::from(days) * 24, now);
+        if !coverage.period_span_sufficient {
+            return insufficient_coverage(coverage);
+        }
         let (items, window_filter_applied) =
-            select_graph_window(&raw.graph_data, i64::from(days) * 24, Utc::now());
+            select_graph_window(&raw.graph_data, i64::from(days) * 24, now);
         let values: Vec<f64> = items
             .iter()
             .map(|item| item.value_in_mg_per_dl)
@@ -264,6 +467,8 @@ impl LibreMcp {
             "requested_days": days,
             "window_verified": false,
             "window_filter_applied": window_filter_applied,
+            "cache_hit": raw.cache_hit,
+            "coverage": coverage,
             "sample_count": count,
             "average_glucose_mg_dl": average,
             "standard_deviation_mg_dl": standard_deviation,
@@ -281,7 +486,7 @@ impl LibreMcp {
     }
 
     #[tool(
-        description = "Summarize observed graph values and trend arrows without inferring meals, diagnoses, or treatment changes."
+        description = "Summarize observed graph values and adjacent-point rates. Partial periods are labeled; no meal, diagnosis, or treatment inference is made."
     )]
     async fn get_glucose_trends(&self, Parameters(args): Parameters<TrendsArgs>) -> CallToolResult {
         let (period, hours) = match args.period.unwrap_or(Period::Weekly) {
@@ -291,10 +496,12 @@ impl LibreMcp {
         };
         let raw = match fetch_raw().await {
             Ok(raw) => raw,
-            Err(message) => return failure(message),
+            Err(error) => return failure_fetch(error),
         };
-        let (items, window_filter_applied) =
-            select_graph_window(&raw.graph_data, hours, Utc::now());
+        let now = Utc::now();
+        let coverage = graph_coverage(&raw.graph_data, hours, now);
+        let (items, window_filter_applied) = select_graph_window(&raw.graph_data, hours, now);
+        let rates = observed_rates(&items, now);
         let values: Vec<f64> = items
             .iter()
             .map(|item| item.value_in_mg_per_dl)
@@ -318,37 +525,45 @@ impl LibreMcp {
             "requested_period": period,
             "window_verified": false,
             "window_filter_applied": window_filter_applied,
+            "cache_hit": raw.cache_hit,
+            "coverage": coverage,
+            "period_status": if coverage.period_span_sufficient { "sample_summary" } else { "partial" },
             "sample_count": values.len(),
             "observed_min_mg_dl": min,
             "observed_max_mg_dl": max,
             "trend_arrow_counts": {
                 "falling": falling, "stable": stable, "rising": rising, "unknown": unknown
             },
+            "adjacent_point_rates": rates,
             "dawn_phenomenon": null,
             "meal_response_average": null,
             "overnight_stability": null,
-            "reason": "The graph does not establish the requested period or contain meal and sleep context.",
+            "reason": "Rates are descriptive changes between returned graph points, not source trend arrows or treatment guidance. The graph does not contain meal and sleep context.",
         }))
     }
 
     #[tool(
-        description = "Return source-provided sensor details only; unknown type, activation date, and remaining life are omitted."
+        description = "Return source-provided sensor identifiers, activation epoch, warmup minutes, and product type code. Unknown details remain null."
     )]
     async fn get_sensor_info(&self, Parameters(_args): Parameters<EmptyArgs>) -> CallToolResult {
         let raw = match fetch_raw().await {
             Ok(raw) => raw,
-            Err(message) => return failure(message),
+            Err(error) => return failure_fetch(error),
         };
         let sensors: Vec<_> = raw
             .active_sensors
             .iter()
             .map(|active| {
+                let activation_time = sensor_activation_time(active.sensor.a, Utc::now());
                 serde_json::json!({
                     "device_id": nonempty(&active.sensor.device_id),
                     "serial_number": nonempty(&active.sensor.sn),
-                    "source_reported_age_days": (active.sensor.a >= 0).then_some(active.sensor.a),
+                    "source_activation_epoch_seconds": activation_time.map(|_| active.sensor.a),
+                    "activation_time": activation_time,
+                    "activation_time_basis": activation_time.map(|_| "source_epoch_seconds_interpreted"),
+                    "warmup_minutes": (active.sensor.w >= 0).then_some(active.sensor.w),
+                    "product_type_code": (active.sensor.pt >= 0).then_some(active.sensor.pt),
                     "device_type": null,
-                    "activation_time": null,
                     "remaining_life": null,
                 })
             })
@@ -356,6 +571,7 @@ impl LibreMcp {
         success(serde_json::json!({
             "sensor_count": sensors.len(),
             "active_sensors": sensors,
+            "cache_hit": raw.cache_hit,
         }))
     }
 
@@ -406,17 +622,19 @@ impl LibreMcp {
     ) -> CallToolResult {
         let raw = match fetch_raw().await {
             Ok(raw) => raw,
-            Err(message) => return failure(message),
+            Err(error) => return failure_fetch(error),
         };
         success(serde_json::json!({
             "connected": true,
             "graph_points_returned": raw.graph_data.len(),
             "active_sensors_returned": raw.active_sensors.len(),
-            "reading_time": assess_time(
+            "reading_time": assess_time_at(
                 Some(&raw.connection.glucose_measurement.timestamp),
                 Some(&raw.connection.glucose_measurement.factory_timestamp),
+                raw.retrieved_at_utc,
                 Utc::now(),
             ),
+            "cache_hit": raw.cache_hit,
             "stale_threshold_minutes": STALE_AFTER_MINUTES,
         }))
     }
@@ -473,6 +691,17 @@ mod tests {
         assert_eq!(trend(None), None);
         assert_eq!(trend(Some(42)), None);
         assert_eq!(trend(Some(3)), Some("stable"));
+        let now = DateTime::parse_from_rfc3339("2026-11-05T20:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            sensor_activation_time(1_652_400_270, now)
+                .unwrap()
+                .timestamp(),
+            1_652_400_270
+        );
+        assert!(sensor_activation_time(4, now).is_none());
+        assert!(sensor_activation_time(i32::MAX, now).is_none());
     }
 
     fn synthetic_item(timestamp: &str) -> GlucoseItem {
@@ -514,13 +743,88 @@ mod tests {
         let now = DateTime::parse_from_rfc3339("2026-11-05T20:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let graph = [
+        let mut graph = [
             synthetic_item("2026-11-05T18:00:00Z"),
             synthetic_item("11/05/2026 03:30:00 PM"),
         ];
+        graph[1].factory_timestamp.clear();
         let (selected, applied) = select_graph_window(&graph, 1, now);
         assert!(!applied);
         assert_eq!(selected.len(), graph.len());
+    }
+
+    #[test]
+    fn inferred_factory_utc_can_filter_graph_window() {
+        let now = DateTime::parse_from_rfc3339("2026-11-05T20:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut graph = [
+            synthetic_item("11/05/2026 01:50:00 PM"),
+            synthetic_item("11/05/2026 02:58:00 PM"),
+        ];
+        graph[0].factory_timestamp = "11/05/2026 06:50:00 PM".to_owned();
+        graph[1].factory_timestamp = "11/05/2026 07:58:00 PM".to_owned();
+        let (selected, applied) = select_graph_window(&graph, 1, now);
+        assert!(applied);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].timestamp, "11/05/2026 02:58:00 PM");
+    }
+
+    #[test]
+    fn short_graph_does_not_claim_a_week_of_statistics() {
+        let now = DateTime::parse_from_rfc3339("2026-11-05T20:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let graph = [
+            synthetic_item("2026-11-05T19:00:00Z"),
+            synthetic_item("2026-11-05T19:15:00Z"),
+            synthetic_item("2026-11-05T19:30:00Z"),
+        ];
+        let coverage = graph_coverage(&graph, 7 * 24, now);
+        assert!(!coverage.period_span_sufficient);
+        assert_eq!(coverage.actual_points_in_window, Some(3));
+        assert_eq!(coverage.expected_points_estimate, Some(673));
+        assert_eq!(coverage.observed_span_hours, Some(0.5));
+    }
+
+    #[test]
+    fn coverage_detects_interior_gaps_without_inventing_missing_values() {
+        let now = DateTime::parse_from_rfc3339("2026-11-05T20:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let graph = [
+            synthetic_item("2026-11-05T19:00:00Z"),
+            synthetic_item("2026-11-05T19:15:00Z"),
+            synthetic_item("2026-11-05T19:45:00Z"),
+            synthetic_item("2026-11-05T20:00:00Z"),
+        ];
+        let coverage = graph_coverage(&graph, 1, now);
+        assert!(!coverage.period_span_sufficient);
+        assert_eq!(coverage.interior_gap_count, 1);
+        assert_eq!(coverage.actual_points_in_window, Some(4));
+        assert_eq!(coverage.expected_points_estimate, Some(5));
+    }
+
+    #[test]
+    fn adjacent_rates_are_descriptive_and_skip_long_gaps() {
+        let now = DateTime::parse_from_rfc3339("2026-11-05T20:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut graph = [
+            synthetic_item("2026-11-05T19:00:00Z"),
+            synthetic_item("2026-11-05T19:15:00Z"),
+            synthetic_item("2026-11-05T19:30:00Z"),
+            synthetic_item("2026-11-05T20:15:00Z"),
+        ];
+        graph[0].value_in_mg_per_dl = 100.0;
+        graph[1].value_in_mg_per_dl = 115.0;
+        graph[2].value_in_mg_per_dl = 100.0;
+        let items: Vec<_> = graph.iter().collect();
+        let rates = observed_rates(&items, now);
+        assert_eq!(rates.pair_count, 2);
+        assert_eq!(rates.minimum_mg_dl_per_minute, Some(-1.0));
+        assert_eq!(rates.maximum_mg_dl_per_minute, Some(1.0));
+        assert_eq!(rates.average_mg_dl_per_minute, Some(0.0));
     }
 
     #[test]

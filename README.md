@@ -22,9 +22,9 @@ This independent port preserves the **eight MCP tool names** from [Amandeep Khur
 | **Transport** | Local MCP over stdio |
 | **Platforms** | Linux, macOS, and Windows CI builds and tests |
 | **Secrets** | OS credential store; no plaintext fallback or MCP password arguments |
-| **Readings** | Source timestamps retained; freshness marked `recent`, `stale`, `unknown`, or `missing` |
-| **History** | Graph points returned by LibreLinkUp; requested-window coverage remains unverified |
-| **Analytics** | Descriptive sample statistics; GMI and time-weighted time in range unavailable |
+| **Readings** | Source timestamps retained; factory UTC interpretation labeled as inferred |
+| **History** | Graph points, observed span, estimated cadence, and gaps; API completeness remains unverified |
+| **Analytics** | Short windows return `insufficient_data`; GMI and time-weighted time in range unavailable |
 
 ## Quick start
 
@@ -40,6 +40,8 @@ cargo run -- check
 `setup` prompts locally for the follower account email, a hidden password, and a region. It accepts `global` (the default), `us`, `eu`, `eu2`, `ae`, `ap`, `au`, `ca`, `de`, `fr`, `jp`, `la`, `ru`, and `cn`. If the account follows multiple people, run `cargo run -- select-patient` and enter the followed person's full name before `check`. An ambiguous account is rejected instead of silently choosing the first connection.
 
 `check` makes an authenticated `read_raw()` request and prints a small connectivity report. A local user check confirmed that the pinned Rust client connects and returns values matching their phone; other accounts, regions, and sensors still need validation. The [Rust client API and compatibility findings](docs/architecture.md) explain the dependency choice.
+
+`check` includes `display_minus_factory_minutes`, so you can inspect the clock relationship locally without sharing a response. The difference reflects the **sharer's** local clock, which may differ from your own timezone. To change the client version after an Abbott version requirement changes, run `cargo run -- set-api-version` locally and restart the MCP server.
 
 ### Connect an MCP client
 
@@ -68,25 +70,26 @@ The server reuses its authenticated API client. Restart it after changing creden
 | --- | --- |
 | `get_current_glucose` | Latest available reading, source time, and explicit freshness |
 | `get_glucose_history` | Graph readings and whether requested-hour filtering was applied |
-| `get_glucose_stats` | Descriptive statistics for returned valid samples, with coverage limits stated |
-| `get_glucose_trends` | Observed extrema and trend-arrow counts, without meal or dawn inference |
-| `get_sensor_info` | Source-provided sensor fields; unknown details are `null` |
+| `get_glucose_stats` | Descriptive statistics only when the graph spans the requested period without detected gaps |
+| `get_glucose_trends` | Partial-period status, extrema, source arrows, and descriptive adjacent-point rates |
+| `get_sensor_info` | Source identifiers, interpreted activation epoch, warmup minutes, and product type code |
 | `configure_credentials` | Local setup instructions; accepts **no credentials** |
 | `configure_ranges` | Validates and saves local target bounds in mg/dL |
 | `validate_connection` | Connection and data-availability status without glucose values or secrets |
 
-Tool replies contain MCP `structuredContent` plus a JSON text block for clients that only display text. Errors set `isError: true` and use `invalid_input`, `insufficient_data`, or `request_failed` codes. Upstream response bodies and tokens are never included in error messages.
+Tool replies contain MCP `structuredContent` plus a JSON text block for clients that only display text. Errors set `isError: true` and use safe codes including `invalid_input`, `insufficient_data`, `rate_limited`, `timeout`, `session_expired`, and `upstream_unavailable`. Rate-limit replies include `retry_after_seconds`. Upstream response bodies and tokens are never included in error messages.
 
 ## Data quality
 
-The API can return timestamps without timezone offsets. In that case, `observed_at_utc` is absent and freshness is `unknown`; retrieval time does **not** turn a reading into a real-time reading. The server keeps source and factory timestamp text, retrieval time, interpreted UTC time, and value quality separate.
+The API can return timestamps without timezone offsets. When both clock strings parse, their gap is quarter-hour aligned and within ±14 hours, and the factory clock is not in the future, the server interprets `FactoryTimestamp` as UTC and labels `time_basis: factory_utc_inferred`. This follows the [Rust client's UTC interpretation](https://github.com/ItsXrgon/libre-link-up-api-client/blob/main/src/utils.rs) and [public paired-clock examples](https://github.com/NightscoutFoundation/xDrip/discussions/2118), but the API does not attach an offset. A missing, inconsistent, or future factory time keeps freshness `unknown`. Retrieval time does **not** turn a reading into a real-time reading.
 
-When every graph point has a usable offset-aware timestamp, history, stats, and trends filter to the requested window. Otherwise they show the returned graph without claiming the filter was applied. `window_verified` remains false either way: the API graph cannot prove it covered the whole requested period. Sample percentages are not time-weighted time in range; GMI and clinical-pattern fields remain unavailable. See the [architecture and parity notes](docs/architecture.md) and [release roadmap](docs/roadmap.md).
+When every graph point has a usable offset-aware or inferred UTC time, history, stats, and trends filter to the requested window. Coverage reports the first and last observations, span, estimated cadence and expected point count, actual count, and detected gaps. These estimates come from returned intervals. Statistics return `insufficient_data` when the graph does not span the requested period. Trends can return a labeled partial summary. `window_verified` remains false: the API cannot prove complete coverage. Sample percentages are not time-weighted time in range; GMI and clinical-pattern fields remain unavailable. See the [architecture and parity notes](docs/architecture.md) and [release roadmap](docs/roadmap.md).
 
 ## Privacy and local data
 
 - Credentials live in the OS credential store. There is no plaintext file fallback, command-line password flag, or MCP secret input.
 - The server does not persist glucose history. SQLite is planned only as an opt-in feature and will never hold credentials.
+- Successful graph reads are cached in memory for 60 seconds. Detected rate limits and account lockouts trigger a cooldown; other upstream failures also pause calls for 60 seconds. Cached readings keep their original retrieval time. The upstream client can still retry within the first failed request, pending a replacement API adapter.
 - `cargo run -- clear-local-data` removes this project's credential and preference entries from the OS store. Stop the server first; run `setup` again to reconnect.
 - The `.gitignore` excludes local configuration, data exports, databases, logs, and key files. Tests use synthetic fixtures only.
 
