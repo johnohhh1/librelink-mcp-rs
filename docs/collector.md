@@ -65,7 +65,7 @@ Every data reply includes `data_source`. From the store:
 
 What the database stores:
 
-- Glucose readings: the source timestamp text, the factory timestamp, the interpreted UTC time and its basis, the mg/dL value, the trend arrow code, whether the reading came from the graph or the current measurement, and when it was first seen.
+- Glucose readings: the source timestamp text, the reading's deduplication key (the factory clock text for readings from LibreLinkUp), the interpreted UTC time and its basis, the mg/dL value, the trend arrow code, whether the reading came from the graph or the current measurement, and when it was first seen.
 - One row per poll attempt: its time, the outcome (`ok` or an error code), and how many readings it added. This lets later steps tell "collector not running" apart from "LibreLinkUp had no data".
 - The collector heartbeat: time, process ID, version, and the salted key of the patient being collected.
 - The latest snapshot's sensors, in the form tools show them: the last four characters of the serial number and device ID, the activation time, warmup minutes, and product type code.

@@ -63,7 +63,7 @@ Steps:
 
 **Status:** in progress. The design is fixed in [ADR 0003](adr/0003-time-weighted-metrics-and-csv-import.md).
 
-- Import a locally saved LibreView CSV export into the same database, with `source: libreview_csv` provenance and deduplication against collected rows. Import is offline and uploads nothing.
+- Import a locally saved LibreView CSV export into the same database, labeled with origin `libreview_csv_historic` or `libreview_csv_scan`, and deduplicated against collected rows. Import is offline and uploads nothing.
 - Time-weighted time in range, kept separate from sample percentages. Irregular samples are weighted by duration, gaps are excluded rather than counted as zero, and long gaps are not bridged.
 - GMI reported as an estimate only when the window has at least 14 days and at least 70% data coverage, following the [international CGM time-in-range consensus](https://pmc.ncbi.nlm.nih.gov/articles/PMC6973648/). Otherwise `gmi_percent` stays `null` with a reason. This is a data-quality gate, not a diagnosis.
 - Every summary includes sample count, coverage, data source, and the target bounds used. Meal, dawn, and overnight fields stay `null` unless validated context exists.
