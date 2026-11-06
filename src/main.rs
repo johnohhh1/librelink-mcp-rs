@@ -10,6 +10,7 @@ mod llu_client;
 mod mcp;
 mod region;
 mod source;
+mod store;
 mod time;
 
 use fetch::Fetcher;
