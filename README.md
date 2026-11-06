@@ -44,6 +44,8 @@ The server exposes the eight original tool names. `configure_credentials` accept
 
 The server reuses its authenticated API client across tool calls. Restart it after changing credentials or patient selection with the local CLI. Range changes take effect without a restart.
 
+Tool replies include both MCP `structuredContent` and a JSON text block for clients that only display text. Errors use `isError: true` and an `error_code`: `invalid_input` for rejected bounds, `insufficient_data` when a requested statistic has no valid samples, or `request_failed` for a local store or LibreLinkUp request failure. Error messages do not include upstream response bodies.
+
 `rmcp` and `tokio` handle stdio. SQLite remains optional future work and will not store credentials. Tests use synthetic data and no account secrets.
 
 CI checks formatting, Clippy, and tests on Linux, macOS, and Windows. Only Linux has been compiled locally so far.

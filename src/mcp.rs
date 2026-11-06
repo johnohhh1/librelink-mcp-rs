@@ -5,10 +5,7 @@ use crate::{
 use chrono::{DateTime, Duration, Utc};
 use libre_link_up_api_client::GlucoseItem;
 use rmcp::{
-    ServiceExt,
-    handler::server::wrapper::Parameters,
-    model::{CallToolResult, ContentBlock},
-    tool, tool_router,
+    ServiceExt, handler::server::wrapper::Parameters, model::CallToolResult, tool, tool_router,
     transport::stdio,
 };
 use schemars::JsonSchema;
@@ -141,14 +138,21 @@ fn select_graph_window(
 }
 
 fn success<T: Serialize>(body: T) -> CallToolResult {
-    match serde_json::to_string(&body) {
-        Ok(json) => CallToolResult::success(vec![ContentBlock::text(json)]),
+    match serde_json::to_value(body) {
+        Ok(value) => CallToolResult::structured(value),
         Err(_) => failure("Unable to encode tool result."),
     }
 }
 
 fn failure(message: &str) -> CallToolResult {
-    CallToolResult::error(vec![ContentBlock::text(message.to_owned())])
+    failure_code("request_failed", message)
+}
+
+fn failure_code(code: &str, message: &str) -> CallToolResult {
+    CallToolResult::structured_error(serde_json::json!({
+        "error_code": code,
+        "message": message,
+    }))
 }
 
 fn invalid_window(value: u32, max: u32) -> bool {
@@ -191,7 +195,7 @@ impl LibreMcp {
     ) -> CallToolResult {
         let hours = args.hours.unwrap_or(24);
         if invalid_window(u32::from(hours), 720) {
-            return failure("hours must be between 1 and 720.");
+            return failure_code("invalid_input", "hours must be between 1 and 720.");
         }
         let raw = match fetch_raw().await {
             Ok(raw) => raw,
@@ -224,7 +228,7 @@ impl LibreMcp {
     async fn get_glucose_stats(&self, Parameters(args): Parameters<StatsArgs>) -> CallToolResult {
         let days = args.days.unwrap_or(7);
         if invalid_window(u32::from(days), 90) {
-            return failure("days must be between 1 and 90.");
+            return failure_code("invalid_input", "days must be between 1 and 90.");
         }
         let raw = match fetch_raw().await {
             Ok(raw) => raw,
@@ -242,7 +246,10 @@ impl LibreMcp {
             .filter(|value| value.is_finite() && *value > 0.0)
             .collect();
         if values.is_empty() {
-            return failure("No valid historical glucose values were returned.");
+            return failure_code(
+                "insufficient_data",
+                "No valid historical glucose values were returned.",
+            );
         }
         let count = values.len();
         let average = values.iter().sum::<f64>() / count as f64;
@@ -355,8 +362,12 @@ impl LibreMcp {
     #[tool(
         description = "Explain how to set LibreLinkUp credentials in the local terminal. This tool accepts no passwords, tokens, or other secrets."
     )]
-    fn configure_credentials(&self, Parameters(_args): Parameters<EmptyArgs>) -> String {
-        "Run `cargo run -- setup` in the project directory, or `librelink-mcp-rs setup` if installed. Credentials cannot be entered through MCP.".to_owned()
+    fn configure_credentials(&self, Parameters(_args): Parameters<EmptyArgs>) -> CallToolResult {
+        success(serde_json::json!({
+            "credential_input_supported": false,
+            "setup_command": "librelink-mcp-rs setup",
+            "message": "Run `cargo run -- setup` in the project directory, or `librelink-mcp-rs setup` if installed. Credentials cannot be entered through MCP."
+        }))
     }
 
     #[tool(
@@ -364,7 +375,10 @@ impl LibreMcp {
     )]
     fn configure_ranges(&self, Parameters(args): Parameters<RangesArgs>) -> CallToolResult {
         if args.target_low == 0 || args.target_low >= args.target_high || args.target_high > 1000 {
-            return failure("Require 0 < target_low < target_high <= 1000 mg/dL.");
+            return failure_code(
+                "invalid_input",
+                "Require 0 < target_low < target_high <= 1000 mg/dL.",
+            );
         }
         let mut settings = match load_settings() {
             Ok(settings) => settings,
@@ -507,5 +521,22 @@ mod tests {
         let (selected, applied) = select_graph_window(&graph, 1, now);
         assert!(!applied);
         assert_eq!(selected.len(), graph.len());
+    }
+
+    #[test]
+    fn tool_result_has_structured_and_text_forms() {
+        let result = success(serde_json::json!({ "sample_count": 2 }));
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["sample_count"],
+            2
+        );
+        assert_eq!(result.is_error, Some(false));
+        let error = failure("Synthetic request failed.");
+        assert_eq!(
+            error.structured_content.as_ref().unwrap()["error_code"],
+            "request_failed"
+        );
+        assert_eq!(error.is_error, Some(true));
+        assert_eq!(error.content.len(), 1);
     }
 }
