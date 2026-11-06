@@ -1,35 +1,53 @@
-# LibreLink MCP RS
+# LibreLink MCP RS 🦀
 
-An independent Rust implementation of a local MCP server for LibreLinkUp sharing data. The first stdio MCP server exposes the eight original tool names. Several analytics fields remain unavailable until source time coverage can be established; see [architecture and parity status](docs/architecture.md) and the [release roadmap](docs/roadmap.md).
+**A local, privacy-conscious Rust MCP server for LibreLinkUp sharing data.**
 
-This project was inspired by [Amandeep Khurana's LibreLink MCP Server](https://github.com/amansk/librelink-mcp-server). The original project defines the tool names and initial behavior. Its TypeScript code is not included here. Thank you to Amandeep Khurana and the original contributors.
+[![CI](https://github.com/johnohhh1/librelink-mcp-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/johnohhh1/librelink-mcp-rs/actions/workflows/ci.yml)
+[![Rust 1.89+](https://img.shields.io/badge/Rust-1.89%2B-DEA584?logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![MCP stdio](https://img.shields.io/badge/MCP-stdio-7053C1)](https://modelcontextprotocol.io/)
+[![MIT license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Status: early prototype](https://img.shields.io/badge/status-early%20prototype-orange)](docs/roadmap.md)
 
-## Compatibility before use
+[Quick start](#quick-start) · [Eight tools](#the-eight-tools) · [Data quality](#data-quality) · [Privacy](#privacy-and-local-data) · [Roadmap](docs/roadmap.md)
 
-This server uses [`libre_link_up_api_client` 0.3.3](https://github.com/ItsXrgon/libre-link-up-api-client). That crate authenticates a **LibreLinkUp follower account** and fetches a graph response. The [Node client used by the original server](https://github.com/DRFR0ST/libre-link-unofficial-api) also calls for a LibreLinkUp follower account, although the original server's README calls it a LibreLink account. A sensor owner's primary LibreLink login may not work unless the same credentials also belong to a LibreLinkUp follower account. A local user check confirmed this crate can connect and return values matching their phone. Other accounts and regions remain untested. Do not enter credentials into chat or an MCP tool.
+This independent port preserves the **eight MCP tool names** from [Amandeep Khurana's original LibreLink MCP Server](https://github.com/amansk/librelink-mcp-server). It uses Rust, `rmcp`, and a local OS credential store. Thank you to Amandeep and the original contributors for the project and tool design. Their TypeScript code is not included here.
 
-The crate supports global routing plus US, EU, EU2, AE, AP, AU, CA, DE, FR, JP, LA, RU, and CN endpoints. `setup` accepts an explicit region, defaulting to global auto-redirect. An unknown region is rejected. If the account follows multiple people, run `select-patient` locally with the followed person's full name. Without a selection, data tools refuse an ambiguous account instead of choosing the first connection.
+> [!IMPORTANT]
+> Use a **LibreLinkUp follower account**. Enter credentials only in the local `setup` prompt, never in chat or an MCP tool. This project is unofficial, is not affiliated with Abbott, and does not provide medical treatment advice.
 
-## Local setup and connectivity check
+## Project snapshot
 
-Requires Rust 1.89 or newer and an available OS credential store (macOS Keychain, Windows Credential Manager, or a Linux Secret Service session). Building on Debian or Ubuntu also needs `libdbus-1-dev` and `pkg-config` for the keyring backend. There is no plaintext fallback.
-If `cargo` is not on your shell path after installing Rust, run `. "$HOME/.cargo/env"` first.
+| | Current state |
+| --- | --- |
+| **Transport** | Local MCP over stdio |
+| **Platforms** | Linux, macOS, and Windows CI builds and tests |
+| **Secrets** | OS credential store; no plaintext fallback or MCP password arguments |
+| **Readings** | Source timestamps retained; freshness marked `recent`, `stale`, `unknown`, or `missing` |
+| **History** | Graph points returned by LibreLinkUp; requested-window coverage remains unverified |
+| **Analytics** | Descriptive sample statistics; GMI and time-weighted time in range unavailable |
+
+## Quick start
+
+You need **Rust 1.89 or newer** and an available OS credential store: macOS Keychain, Windows Credential Manager, or a Linux Secret Service session. On Debian or Ubuntu, install `libdbus-1-dev` and `pkg-config` to build the keyring backend. If `cargo` is not on your shell path after installing Rust, run `. "$HOME/.cargo/env"`.
 
 ```sh
+git clone https://github.com/johnohhh1/librelink-mcp-rs.git
+cd librelink-mcp-rs
 cargo run -- setup
-cargo run -- select-patient  # only if following multiple people
 cargo run -- check
 ```
 
-`setup` prompts locally for the follower account email, hides password input, and saves a single credential record in the OS credential store. The password is never accepted as a command-line or MCP argument. `check` performs an authenticated `read_raw()` call and prints only a small, typed JSON connectivity report. API error bodies and tokens are not printed. The report keeps source and factory timestamp text, retrieval time, and an interpreted UTC observation time separate. If source timestamps have no timezone, `observed_at_utc` is absent and freshness is `unknown`; the report does not call that reading real-time. No treatment recommendations are produced.
+`setup` prompts locally for the follower account email, a hidden password, and a region. It accepts `global` (the default), `us`, `eu`, `eu2`, `ae`, `ap`, `au`, `ca`, `de`, `fr`, `jp`, `la`, `ru`, and `cn`. If the account follows multiple people, run `cargo run -- select-patient` and enter the followed person's full name before `check`. An ambiguous account is rejected instead of silently choosing the first connection.
 
-On headless Linux systems without Secret Service, `setup` fails. That is intentional until another secure store is designed and tested. If you previously used the original server, its `~/.librelink-mcp/config.json` may contain a plaintext password; this prototype does not read or migrate that file.
+`check` makes an authenticated `read_raw()` request and prints a small connectivity report. A local user check confirmed that the pinned Rust client connects and returns values matching their phone; other accounts, regions, and sensors still need validation. The [Rust client API and compatibility findings](docs/architecture.md) explain the dependency choice.
 
-To remove this server's saved credentials and preferences, stop any running server and run `cargo run -- clear-local-data` (or `librelink-mcp-rs clear-local-data` if installed). This command deletes only this project's two OS credential-store entries. It does not touch the original server's files. Run `setup` again to reconnect.
+### Connect an MCP client
 
-## MCP server
+Build the binary and point your MCP client at it:
 
-Run `cargo run -- serve` for a local stdio server. MCP clients must launch the binary directly; for example, after `cargo build --release`:
+```sh
+cargo build --release
+```
 
 ```json
 {
@@ -42,18 +60,48 @@ Run `cargo run -- serve` for a local stdio server. MCP clients must launch the b
 }
 ```
 
-The server exposes the eight original tool names. `configure_credentials` accepts no arguments and directs you to the local setup command. `configure_ranges` persists non-secret bounds in the OS credential store. The reading tools report source timestamps and avoid fabricated sensor details. An offset-aware graph is filtered to requested hours, days, or trend period; a graph with any offset-free or conflicting timestamp remains unfiltered. Every summary states whether filtering applied. `window_verified` remains false because the graph endpoint cannot prove complete coverage of the requested interval. Statistics describe observed samples only; true time in range and GMI remain unavailable. `get_glucose_trends` reports observed values and trend-arrow counts without meal or dawn inference. These are deliberate limits, not full behavioral parity.
+The server reuses its authenticated API client. Restart it after changing credentials or patient selection. Range changes take effect without a restart.
 
-The server reuses its authenticated API client across tool calls. Restart it after changing credentials or patient selection with the local CLI. Range changes take effect without a restart.
+## The eight tools
 
-Tool replies include both MCP `structuredContent` and a JSON text block for clients that only display text. Errors use `isError: true` and an `error_code`: `invalid_input` for rejected bounds, `insufficient_data` when a requested statistic has no valid samples, or `request_failed` for a local store or LibreLinkUp request failure. Error messages do not include upstream response bodies.
+| Tool | What it currently returns |
+| --- | --- |
+| `get_current_glucose` | Latest available reading, source time, and explicit freshness |
+| `get_glucose_history` | Graph readings and whether requested-hour filtering was applied |
+| `get_glucose_stats` | Descriptive statistics for returned valid samples, with coverage limits stated |
+| `get_glucose_trends` | Observed extrema and trend-arrow counts, without meal or dawn inference |
+| `get_sensor_info` | Source-provided sensor fields; unknown details remain absent |
+| `configure_credentials` | Local setup instructions; accepts **no credentials** |
+| `configure_ranges` | Validates and saves local target bounds in mg/dL |
+| `validate_connection` | Connection and data-availability status without glucose values or secrets |
 
-`rmcp` and `tokio` handle stdio. SQLite remains optional future work and will not store credentials. Tests use synthetic data and no account secrets.
+Tool replies contain MCP `structuredContent` plus a JSON text block for clients that only display text. Errors set `isError: true` and use `invalid_input`, `insufficient_data`, or `request_failed` codes. Upstream response bodies and tokens are never included in error messages.
 
-CI checks formatting, Clippy, and tests on Linux, macOS, and Windows. The synthetic stdio test initializes the server, lists the eight tools, checks structured output, and verifies that a password argument is rejected without echoing its value. Only Linux has been compiled locally so far.
+## Data quality
 
-This is an unofficial project and is not affiliated with Abbott. It is for inspecting shared data, not making medical decisions.
+The API can return timestamps without timezone offsets. In that case, `observed_at_utc` is absent and freshness is `unknown`; retrieval time does **not** turn a reading into a real-time reading. The server keeps source and factory timestamp text, retrieval time, interpreted UTC time, and value quality separate.
+
+When every graph point has a usable offset-aware timestamp, history, stats, and trends filter to the requested window. Otherwise they show the returned graph without claiming the filter was applied. `window_verified` remains false either way: the API graph cannot prove it covered the whole requested period. Sample percentages are not time-weighted time in range; GMI and clinical-pattern fields remain unavailable. See the [architecture and parity notes](docs/architecture.md) and [release roadmap](docs/roadmap.md).
+
+## Privacy and local data
+
+- Credentials live in the OS credential store. There is no plaintext file fallback, command-line password flag, or MCP secret input.
+- The server does not persist glucose history. SQLite is planned only as an opt-in feature and will never hold credentials.
+- `cargo run -- clear-local-data` removes this project's credential and preference entries from the OS store. Stop the server first; run `setup` again to reconnect.
+- The `.gitignore` excludes local configuration, data exports, databases, logs, and key files. Tests use synthetic fixtures only.
+
+On headless Linux systems without Secret Service, `setup` fails closed. If you used the original server, its `~/.librelink-mcp/config.json` may contain a plaintext password; this port does not read, migrate, or delete that file.
+
+## Build and contribute
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
+```
+
+CI runs those checks on Linux, macOS, and Windows. A synthetic stdio test initializes the server, lists all eight tools, checks structured output, and confirms that a password argument is rejected without echoing it. Please keep real account responses, glucose readings, credentials, and tokens out of issues and test fixtures. Start with the [roadmap](docs/roadmap.md) and [architecture notes](docs/architecture.md).
 
 ## License
 
-MIT; see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).
