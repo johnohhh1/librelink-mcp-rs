@@ -2,6 +2,7 @@
 //! owned client in v0.2; see docs/adr/0001-owned-api-client.md.
 
 use crate::fetch::FetchError;
+use crate::llu_client::unique_match;
 use crate::source::{DataSource, GlucoseSample, ReadFuture, SensorRecord, Snapshot};
 use crate::{load_credentials, load_settings, valid_api_version};
 use libre_link_up_api_client::models::{GlucoseMeasurement, Sensor};
@@ -127,12 +128,6 @@ fn client_error(error: LibreLinkUpError) -> &'static str {
     }
 }
 
-fn unique_match<T>(items: &[T], predicate: impl Fn(&T) -> bool) -> Option<&T> {
-    let mut matches = items.iter().filter(|item| predicate(item));
-    let selected = matches.next()?;
-    matches.next().is_none().then_some(selected)
-}
-
 fn build_client() -> Result<LibreLinkUpClient, &'static str> {
     let credentials = load_credentials()?;
     let settings = load_settings()?;
@@ -253,15 +248,6 @@ mod tests {
             serde_json::from_str(r#"{"target_low":70,"target_high":180,"patient_name":null}"#)
                 .unwrap();
         assert_eq!(old_settings.api_version, "4.16.0");
-    }
-
-    #[test]
-    fn patient_selection_requires_one_match() {
-        let names = ["Alex", "Sam", "Sam"];
-        assert_eq!(unique_match(&names, |name| *name == "Alex"), Some(&"Alex"));
-        assert_eq!(unique_match(&names, |name| *name == "Sam"), None);
-        assert_eq!(unique_match(&names, |name| *name == "Pat"), None);
-        assert_eq!(unique_match(&names, |_| true), None);
     }
 
     #[test]

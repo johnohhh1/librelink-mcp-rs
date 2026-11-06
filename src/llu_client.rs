@@ -1,0 +1,907 @@
+//! Owned LibreLinkUp client. See docs/adr/0001-owned-api-client.md.
+//!
+//! Login happens only when there is no token, the token has expired, or a
+//! request returns HTTP 401, and at most one 401 re-login per `read()`.
+//! Throttling, server errors, and parse errors never trigger a login.
+
+// Not wired into `serve` or `check` until v0.2 step 3, which removes this.
+#![allow(dead_code)]
+
+use crate::fetch::FetchError;
+use crate::source::{DataSource, GlucoseSample, ReadFuture, SensorRecord, Snapshot};
+use chrono::Utc;
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::{Client, StatusCode, redirect};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tokio::sync::Mutex;
+use zeroize::Zeroizing;
+
+const LOGIN_PATH: &str = "/llu/auth/login";
+const CONNECTIONS_PATH: &str = "/llu/connections";
+const PRODUCT: &str = "llu.android";
+
+/// Production base URL for a stored region, matching the borrowed client.
+pub(crate) fn region_base_url(region: &str) -> Option<&'static str> {
+    Some(match region {
+        "global" => "https://api.libreview.io",
+        "ae" => "https://api-ae.libreview.io",
+        "ap" => "https://api-ap.libreview.io",
+        "au" => "https://api-au.libreview.io",
+        "ca" => "https://api-ca.libreview.io",
+        "de" => "https://api-de.libreview.io",
+        "eu" => "https://api-eu.libreview.io",
+        "eu2" => "https://api-eu2.libreview.io",
+        "fr" => "https://api-fr.libreview.io",
+        "jp" => "https://api-jp.libreview.io",
+        "us" => "https://api-us.libreview.io",
+        "la" => "https://api-la.libreview.io",
+        "ru" => "https://api.libreview.ru",
+        "cn" => "https://api-cn.myfreestyle.cn",
+        _ => return None,
+    })
+}
+
+fn redirect_base_url(region: &str) -> String {
+    format!("https://api-{region}.libreview.io")
+}
+
+/// A login redirect region is used in a host name, so accept only short
+/// lowercase alphanumerics.
+fn valid_redirect_region(region: &str) -> bool {
+    (2..=4).contains(&region.len())
+        && region
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+}
+
+/// The patient ID goes into a URL path.
+fn valid_patient_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+pub(crate) fn unique_match<T>(items: &[T], predicate: impl Fn(&T) -> bool) -> Option<&T> {
+    let mut matches = items.iter().filter(|item| predicate(item));
+    let selected = matches.next()?;
+    matches.next().is_none().then_some(selected)
+}
+
+/// Everything the client needs. No `Clone` or `Debug`: the password exists
+/// once, in zeroizing storage.
+pub(crate) struct LluConfig {
+    pub email: String,
+    pub password: Zeroizing<String>,
+    pub api_version: String,
+    pub patient_name: Option<String>,
+    pub base_url: String,
+}
+
+struct Token {
+    value: Zeroizing<String>,
+    /// Epoch seconds from `authTicket.expires`; `None` if not sent, in which
+    /// case the token is used until a 401.
+    expires_at: Option<i64>,
+}
+
+struct Session {
+    base_url: String,
+    token: Option<Token>,
+    account_id_hash: Option<String>,
+    patient_id: Option<String>,
+}
+
+impl Session {
+    fn needs_login(&self, now: i64) -> bool {
+        self.token
+            .as_ref()
+            .is_none_or(|token| token.expires_at.is_some_and(|expires| now >= expires))
+    }
+}
+
+type RegionResolver = Box<dyn Fn(&str) -> String + Send + Sync>;
+
+pub(crate) struct LluClient {
+    http: Client,
+    email: String,
+    password: Zeroizing<String>,
+    patient_name: Option<String>,
+    redirect_base: RegionResolver,
+    session: Mutex<Session>,
+}
+
+const fn error(code: &'static str, message: &'static str) -> FetchError {
+    FetchError {
+        code,
+        message,
+        retry_after_seconds: Some(60),
+    }
+}
+
+const UNAVAILABLE: FetchError = error(
+    "upstream_unavailable",
+    "LibreLinkUp request failed; retry later.",
+);
+const RATE_LIMITED: FetchError = error(
+    "rate_limited",
+    "LibreLinkUp is rate limiting requests; retry later.",
+);
+const SESSION_EXPIRED: FetchError = error(
+    "session_expired",
+    "LibreLinkUp rejected the current session; retry later.",
+);
+const BAD_CREDENTIALS: FetchError = FetchError {
+    code: "authentication_failed",
+    message: "LibreLinkUp rejected the account credentials. No further logins will be attempted; run `setup` locally, then restart the server.",
+    retry_after_seconds: None,
+};
+const NO_CONNECTION: FetchError = error(
+    "no_connection",
+    "Account authenticated but follows no patients in LibreLinkUp.",
+);
+const SELECTION_REQUIRED: FetchError = error(
+    "patient_selection_required",
+    "No unique followed person was selected. Run `select-patient` locally.",
+);
+
+fn classify_status(status: StatusCode) -> FetchError {
+    match status.as_u16() {
+        401 => SESSION_EXPIRED,
+        429 | 430 => RATE_LIMITED,
+        _ => UNAVAILABLE,
+    }
+}
+
+#[derive(Serialize)]
+struct LoginBody<'a> {
+    email: &'a str,
+    password: &'a str,
+}
+
+#[derive(Deserialize)]
+struct LoginEnvelope {
+    status: i32,
+    #[serde(default)]
+    data: Option<LoginData>,
+}
+
+#[derive(Deserialize)]
+struct LoginData {
+    #[serde(default)]
+    redirect: bool,
+    #[serde(default)]
+    region: Option<String>,
+    #[serde(default)]
+    user: Option<UserRef>,
+    #[serde(default, rename = "authTicket")]
+    auth_ticket: Option<AuthTicket>,
+}
+
+#[derive(Deserialize)]
+struct UserRef {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct AuthTicket {
+    token: String,
+    #[serde(default)]
+    expires: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct ConnectionsEnvelope {
+    #[serde(default)]
+    data: Vec<ConnectionSummary>,
+}
+
+#[derive(Deserialize)]
+struct ConnectionSummary {
+    #[serde(rename = "patientId")]
+    patient_id: String,
+    #[serde(default, rename = "firstName")]
+    first_name: String,
+    #[serde(default, rename = "lastName")]
+    last_name: String,
+}
+
+#[derive(Deserialize)]
+struct GraphEnvelope {
+    data: GraphData,
+}
+
+#[derive(Deserialize)]
+struct GraphData {
+    connection: GraphConnection,
+    #[serde(default, rename = "activeSensors")]
+    active_sensors: Vec<ActiveSensorWire>,
+    #[serde(default, rename = "graphData")]
+    graph_data: Vec<GlucoseWire>,
+}
+
+#[derive(Deserialize)]
+struct GraphConnection {
+    #[serde(default, rename = "glucoseMeasurement")]
+    glucose_measurement: GlucoseWire,
+}
+
+/// Missing fields become empty or zero, which the tools report as missing;
+/// nothing is invented.
+#[derive(Default, Deserialize)]
+struct GlucoseWire {
+    #[serde(default, rename = "Timestamp")]
+    timestamp: String,
+    #[serde(default, rename = "FactoryTimestamp")]
+    factory_timestamp: String,
+    #[serde(default, rename = "ValueInMgPerDl")]
+    value_in_mg_per_dl: f64,
+    #[serde(default, rename = "TrendArrow")]
+    trend_arrow: Option<i32>,
+}
+
+impl From<GlucoseWire> for GlucoseSample {
+    fn from(wire: GlucoseWire) -> Self {
+        Self {
+            timestamp: wire.timestamp,
+            factory_timestamp: wire.factory_timestamp,
+            value_in_mg_per_dl: wire.value_in_mg_per_dl,
+            trend_arrow: wire.trend_arrow,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ActiveSensorWire {
+    sensor: SensorWire,
+}
+
+const fn unknown_code() -> i32 {
+    -1
+}
+
+#[derive(Deserialize)]
+struct SensorWire {
+    #[serde(default, rename = "deviceId")]
+    device_id: String,
+    #[serde(default)]
+    sn: String,
+    #[serde(default)]
+    a: i32,
+    #[serde(default = "unknown_code")]
+    w: i32,
+    #[serde(default = "unknown_code")]
+    pt: i32,
+}
+
+impl From<SensorWire> for SensorRecord {
+    fn from(wire: SensorWire) -> Self {
+        Self {
+            device_id: wire.device_id,
+            serial_number: wire.sn,
+            activation_epoch_seconds: wire.a,
+            warmup_minutes: wire.w,
+            product_type_code: wire.pt,
+        }
+    }
+}
+
+fn parse<T: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<T, FetchError> {
+    serde_json::from_slice(body).map_err(|_| UNAVAILABLE)
+}
+
+fn account_id_hash(user_id: &str) -> String {
+    format!("{:x}", Sha256::digest(user_id.as_bytes()))
+}
+
+impl LluClient {
+    pub(crate) fn new(config: LluConfig) -> Result<Self, &'static str> {
+        let mut headers = HeaderMap::new();
+        headers.insert("product", HeaderValue::from_static(PRODUCT));
+        headers.insert(
+            "version",
+            HeaderValue::from_str(&config.api_version).map_err(|_| "Invalid API version.")?,
+        );
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let http = Client::builder()
+            .default_headers(headers)
+            // Region changes come only from the login body, never HTTP 3xx.
+            .redirect(redirect::Policy::none())
+            .build()
+            .map_err(|_| "Unable to start the HTTP client.")?;
+        Ok(Self {
+            http,
+            email: config.email,
+            password: config.password,
+            patient_name: config.patient_name.map(|name| name.to_lowercase()),
+            redirect_base: Box::new(redirect_base_url),
+            session: Mutex::new(Session {
+                base_url: config.base_url,
+                token: None,
+                account_id_hash: None,
+                patient_id: None,
+            }),
+        })
+    }
+
+    /// Tests point login redirects at a second mock server.
+    #[cfg(test)]
+    fn with_redirect_base(
+        mut self,
+        resolve: impl Fn(&str) -> String + Send + Sync + 'static,
+    ) -> Self {
+        self.redirect_base = Box::new(resolve);
+        self
+    }
+
+    /// Logs in, following at most one region redirect.
+    async fn login(&self, session: &mut Session) -> Result<(), FetchError> {
+        session.token = None;
+        let body = Zeroizing::new(
+            serde_json::to_vec(&LoginBody {
+                email: &self.email,
+                password: &self.password,
+            })
+            .map_err(|_| UNAVAILABLE)?,
+        );
+        let mut base_url = session.base_url.clone();
+        for attempt in 0..2 {
+            let response = self
+                .http
+                .post(format!("{base_url}{LOGIN_PATH}"))
+                .body(body.to_vec())
+                .send()
+                .await
+                .map_err(|_| UNAVAILABLE)?;
+            if !response.status().is_success() {
+                return Err(classify_status(response.status()));
+            }
+            let bytes = response.bytes().await.map_err(|_| UNAVAILABLE)?;
+            let envelope: LoginEnvelope = parse(&bytes)?;
+            match envelope.status {
+                0 => {}
+                2 => return Err(BAD_CREDENTIALS),
+                // Remaining login statuses are mapped in v0.2 step 2b.
+                _ => return Err(UNAVAILABLE),
+            }
+            let data = envelope.data.ok_or(UNAVAILABLE)?;
+            if data.redirect {
+                let region = data.region.as_deref().unwrap_or_default();
+                if attempt > 0 || !valid_redirect_region(region) {
+                    return Err(UNAVAILABLE);
+                }
+                base_url = (self.redirect_base)(region);
+                continue;
+            }
+            let (Some(user), Some(ticket)) = (data.user, data.auth_ticket) else {
+                return Err(UNAVAILABLE);
+            };
+            let token = Zeroizing::new(ticket.token);
+            if token.is_empty() || user.id.is_empty() {
+                return Err(UNAVAILABLE);
+            }
+            session.base_url = base_url;
+            session.account_id_hash = Some(account_id_hash(&user.id));
+            session.token = Some(Token {
+                value: token,
+                expires_at: ticket.expires.filter(|expires| *expires > 0),
+            });
+            return Ok(());
+        }
+        Err(UNAVAILABLE)
+    }
+
+    /// One authenticated GET. A 401 triggers one re-login per `read()`,
+    /// tracked by `relogged`; every other failure is returned as is.
+    async fn get(
+        &self,
+        session: &mut Session,
+        path: &str,
+        relogged: &mut bool,
+    ) -> Result<Vec<u8>, FetchError> {
+        loop {
+            let (Some(token), Some(account_id)) =
+                (session.token.as_ref(), session.account_id_hash.as_ref())
+            else {
+                return Err(UNAVAILABLE);
+            };
+            let bearer = Zeroizing::new(format!("Bearer {}", token.value.as_str()));
+            let mut authorization = HeaderValue::from_str(&bearer).map_err(|_| UNAVAILABLE)?;
+            authorization.set_sensitive(true);
+            let response = self
+                .http
+                .get(format!("{}{path}", session.base_url))
+                .header(AUTHORIZATION, authorization)
+                .header("account-id", account_id.as_str())
+                .send()
+                .await
+                .map_err(|_| UNAVAILABLE)?;
+            let status = response.status();
+            if status == StatusCode::UNAUTHORIZED {
+                session.token = None;
+                if *relogged {
+                    return Err(SESSION_EXPIRED);
+                }
+                *relogged = true;
+                self.login(session).await?;
+                continue;
+            }
+            if !status.is_success() {
+                return Err(classify_status(status));
+            }
+            return Ok(response.bytes().await.map_err(|_| UNAVAILABLE)?.to_vec());
+        }
+    }
+
+    async fn patient_id(
+        &self,
+        session: &mut Session,
+        relogged: &mut bool,
+    ) -> Result<String, FetchError> {
+        if let Some(id) = &session.patient_id {
+            return Ok(id.clone());
+        }
+        let body = self.get(session, CONNECTIONS_PATH, relogged).await?;
+        let connections: ConnectionsEnvelope = parse(&body)?;
+        if connections.data.is_empty() {
+            return Err(NO_CONNECTION);
+        }
+        let selected = unique_match(&connections.data, |connection| {
+            self.patient_name.as_ref().is_none_or(|name| {
+                format!("{} {}", connection.first_name, connection.last_name).to_lowercase()
+                    == *name
+            })
+        })
+        .ok_or(SELECTION_REQUIRED)?;
+        if !valid_patient_id(&selected.patient_id) {
+            return Err(UNAVAILABLE);
+        }
+        session.patient_id = Some(selected.patient_id.clone());
+        Ok(selected.patient_id.clone())
+    }
+
+    async fn read_snapshot(&self) -> Result<Snapshot, FetchError> {
+        let mut session = self.session.lock().await;
+        if session.needs_login(Utc::now().timestamp()) {
+            self.login(&mut session).await?;
+        }
+        let mut relogged = false;
+        let patient_id = self.patient_id(&mut session, &mut relogged).await?;
+        let path = format!("{CONNECTIONS_PATH}/{patient_id}/graph");
+        let body = self.get(&mut session, &path, &mut relogged).await?;
+        let graph: GraphEnvelope = parse(&body)?;
+        Ok(Snapshot {
+            current: graph.data.connection.glucose_measurement.into(),
+            graph: graph.data.graph_data.into_iter().map(Into::into).collect(),
+            active_sensors: graph
+                .data
+                .active_sensors
+                .into_iter()
+                .map(|active| active.sensor.into())
+                .collect(),
+        })
+    }
+}
+
+impl DataSource for LluClient {
+    fn read(&self) -> ReadFuture<'_> {
+        Box::pin(self.read_snapshot())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use wiremock::matchers::{body_json, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // All values are synthetic.
+    const USER_ID: &str = "synthetic-user-0001";
+    /// `printf 'synthetic-user-0001' | sha256sum`, computed independently.
+    const USER_ID_SHA256: &str = "7f988ea024f585ed713d5c9643770393e4350878457cea3401d0c38b263e5b0c";
+    const TOKEN: &str = "synthetic-token";
+    const PATIENT_ID: &str = "synthetic-patient-0001";
+    const EMAIL: &str = "follower@example.invalid";
+    const PASSWORD: &str = "synthetic-password";
+    const GRAPH_PATH: &str = "/llu/connections/synthetic-patient-0001/graph";
+
+    fn config(base_url: &str) -> LluConfig {
+        LluConfig {
+            email: EMAIL.to_owned(),
+            password: Zeroizing::new(PASSWORD.to_owned()),
+            api_version: "4.16.0".to_owned(),
+            patient_name: None,
+            base_url: base_url.to_owned(),
+        }
+    }
+
+    fn client(server: &MockServer) -> LluClient {
+        LluClient::new(config(&server.uri())).unwrap()
+    }
+
+    fn login_ok(expires: i64) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "status": 0,
+            "data": {
+                "user": { "id": USER_ID, "country": "XX", "unusedField": true },
+                "authTicket": { "token": TOKEN, "expires": expires, "duration": 3_600_000 },
+            },
+        }))
+    }
+
+    fn redirect_to(region: &str) -> ResponseTemplate {
+        ResponseTemplate::new(200)
+            .set_body_json(json!({ "status": 0, "data": { "redirect": true, "region": region } }))
+    }
+
+    fn in_one_hour() -> i64 {
+        Utc::now().timestamp() + 3600
+    }
+
+    fn connections(people: &[(&str, &str, &str)]) -> ResponseTemplate {
+        let data: Vec<Value> = people
+            .iter()
+            .map(|(id, first, last)| {
+                json!({ "patientId": id, "firstName": first, "lastName": last, "status": 2 })
+            })
+            .collect();
+        ResponseTemplate::new(200).set_body_json(json!({ "status": 0, "data": data }))
+    }
+
+    fn graph_ok() -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "status": 0,
+            "data": {
+                "connection": {
+                    "glucoseMeasurement": {
+                        "Timestamp": "11/05/2026 02:58:00 PM",
+                        "FactoryTimestamp": "11/05/2026 07:58:00 PM",
+                        "ValueInMgPerDl": 123,
+                        "TrendArrow": 4,
+                        "MeasurementColor": 1,
+                    },
+                    // A different reading the client must not use as current.
+                    "glucoseItem": {
+                        "Timestamp": "11/05/2026 02:57:00 PM",
+                        "FactoryTimestamp": "11/05/2026 07:57:00 PM",
+                        "ValueInMgPerDl": 999,
+                    },
+                    "unusedConnectionField": {},
+                },
+                "activeSensors": [{
+                    "sensor": { "deviceId": "synthetic-device-0042", "sn": "SYNTH0001", "a": 1_652_400_270, "w": 60, "pt": 4 },
+                    "device": { "unused": true },
+                }],
+                "graphData": [
+                    {
+                        "Timestamp": "11/05/2026 02:43:00 PM",
+                        "FactoryTimestamp": "11/05/2026 07:43:00 PM",
+                        "ValueInMgPerDl": 118,
+                        "TrendArrow": null,
+                    },
+                    { "FactoryTimestamp": "11/05/2026 07:28:00 PM" },
+                ],
+            },
+            "ticket": { "token": "unused" },
+        }))
+    }
+
+    async fn mount(server: &MockServer, verb: &str, route: &str, response: ResponseTemplate) {
+        Mock::given(method(verb))
+            .and(path(route))
+            .respond_with(response)
+            .mount(server)
+            .await;
+    }
+
+    /// Mounts a full working session: login, one connection, and a graph.
+    async fn mount_session(server: &MockServer, expires: i64) {
+        mount(server, "POST", LOGIN_PATH, login_ok(expires)).await;
+        mount(
+            server,
+            "GET",
+            CONNECTIONS_PATH,
+            connections(&[(PATIENT_ID, "Sam", "Synthetic")]),
+        )
+        .await;
+    }
+
+    async fn hits(server: &MockServer, verb: &str, route: &str) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.method.as_str() == verb && request.url.path() == route)
+            .count()
+    }
+
+    async fn logins(server: &MockServer) -> usize {
+        hits(server, "POST", LOGIN_PATH).await
+    }
+
+    #[tokio::test]
+    async fn happy_path_maps_the_graph_into_a_snapshot() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(LOGIN_PATH))
+            .and(body_json(json!({ "email": EMAIL, "password": PASSWORD })))
+            .respond_with(login_ok(in_one_hour()))
+            .mount(&server)
+            .await;
+        mount(
+            &server,
+            "GET",
+            CONNECTIONS_PATH,
+            connections(&[(PATIENT_ID, "Sam", "Synthetic")]),
+        )
+        .await;
+        mount(&server, "GET", GRAPH_PATH, graph_ok()).await;
+
+        let snapshot = client(&server).read().await.unwrap();
+        assert_eq!(
+            snapshot.current,
+            GlucoseSample {
+                timestamp: "11/05/2026 02:58:00 PM".to_owned(),
+                factory_timestamp: "11/05/2026 07:58:00 PM".to_owned(),
+                value_in_mg_per_dl: 123.0,
+                trend_arrow: Some(4),
+            }
+        );
+        assert_eq!(snapshot.graph.len(), 2);
+        assert_eq!(snapshot.graph[0].value_in_mg_per_dl, 118.0);
+        assert_eq!(snapshot.graph[0].trend_arrow, None);
+        // Missing fields stay missing rather than being invented.
+        assert_eq!(snapshot.graph[1].timestamp, "");
+        assert_eq!(snapshot.graph[1].value_in_mg_per_dl, 0.0);
+        assert_eq!(
+            snapshot.active_sensors,
+            [SensorRecord {
+                device_id: "synthetic-device-0042".to_owned(),
+                serial_number: "SYNTH0001".to_owned(),
+                activation_epoch_seconds: 1_652_400_270,
+                warmup_minutes: 60,
+                product_type_code: 4,
+            }]
+        );
+        assert_eq!(logins(&server).await, 1);
+    }
+
+    #[tokio::test]
+    async fn requests_carry_hashed_account_id_and_version_headers() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(LOGIN_PATH))
+            .and(header("product", "llu.android"))
+            .and(header("version", "4.16.0"))
+            .and(header("content-type", "application/json"))
+            .respond_with(login_ok(in_one_hour()))
+            .mount(&server)
+            .await;
+        for (route, response) in [
+            (
+                CONNECTIONS_PATH,
+                connections(&[(PATIENT_ID, "Sam", "Synthetic")]),
+            ),
+            (GRAPH_PATH, graph_ok()),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .and(header("product", "llu.android"))
+                .and(header("version", "4.16.0"))
+                .and(header("content-type", "application/json"))
+                .and(header("authorization", "Bearer synthetic-token"))
+                .and(header("account-id", USER_ID_SHA256))
+                .respond_with(response)
+                .mount(&server)
+                .await;
+        }
+
+        client(&server).read().await.unwrap();
+        for request in server.received_requests().await.unwrap() {
+            for (_, value) in request.headers.iter() {
+                assert!(
+                    !value.to_str().unwrap_or_default().contains(USER_ID),
+                    "raw user id sent in a header"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn region_redirect_is_followed_once() {
+        let first = MockServer::start().await;
+        let regional = MockServer::start().await;
+        mount(&first, "POST", LOGIN_PATH, redirect_to("eu")).await;
+        mount_session(&regional, in_one_hour()).await;
+        mount(&regional, "GET", GRAPH_PATH, graph_ok()).await;
+        let regional_uri = regional.uri();
+        let client = client(&first).with_redirect_base(move |region| {
+            assert_eq!(region, "eu");
+            regional_uri.clone()
+        });
+
+        client.read().await.unwrap();
+        client.read().await.unwrap();
+        assert_eq!(logins(&first).await, 1);
+        assert_eq!(logins(&regional).await, 1);
+        assert_eq!(hits(&first, "GET", GRAPH_PATH).await, 0);
+        assert_eq!(hits(&regional, "GET", GRAPH_PATH).await, 2);
+    }
+
+    #[tokio::test]
+    async fn a_second_redirect_is_refused() {
+        let first = MockServer::start().await;
+        let regional = MockServer::start().await;
+        mount(&first, "POST", LOGIN_PATH, redirect_to("eu")).await;
+        mount(&regional, "POST", LOGIN_PATH, redirect_to("us")).await;
+        let regional_uri = regional.uri();
+        let client = client(&first).with_redirect_base(move |_| regional_uri.clone());
+
+        let error = client.read().await.unwrap_err();
+        assert_eq!(error.code, "upstream_unavailable");
+        assert_eq!(logins(&first).await, 1);
+        assert_eq!(logins(&regional).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_an_invalid_region_is_refused() {
+        let server = MockServer::start().await;
+        mount(&server, "POST", LOGIN_PATH, redirect_to("evil.example/")).await;
+        let resolved = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&resolved);
+        let client = client(&server).with_redirect_base(move |_| {
+            flag.store(true, Ordering::SeqCst);
+            String::new()
+        });
+
+        assert_eq!(
+            client.read().await.unwrap_err().code,
+            "upstream_unavailable"
+        );
+        assert!(!resolved.load(Ordering::SeqCst));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert!(valid_redirect_region("eu2"));
+        assert!(!valid_redirect_region("EU"));
+        assert!(!valid_redirect_region("e"));
+        assert!(!valid_redirect_region("abcde"));
+    }
+
+    #[tokio::test]
+    async fn token_is_reused_across_reads() {
+        let server = MockServer::start().await;
+        mount_session(&server, in_one_hour()).await;
+        mount(&server, "GET", GRAPH_PATH, graph_ok()).await;
+        let client = client(&server);
+
+        client.read().await.unwrap();
+        client.read().await.unwrap();
+        assert_eq!(logins(&server).await, 1);
+        assert_eq!(hits(&server, "GET", CONNECTIONS_PATH).await, 1);
+        assert_eq!(hits(&server, "GET", GRAPH_PATH).await, 2);
+    }
+
+    #[tokio::test]
+    async fn an_expired_token_logs_in_again() {
+        let server = MockServer::start().await;
+        mount_session(&server, Utc::now().timestamp() - 10).await;
+        mount(&server, "GET", GRAPH_PATH, graph_ok()).await;
+        let client = client(&server);
+
+        client.read().await.unwrap();
+        client.read().await.unwrap();
+        assert_eq!(logins(&server).await, 2);
+    }
+
+    #[tokio::test]
+    async fn one_401_relogs_in_once_and_succeeds() {
+        let server = MockServer::start().await;
+        mount_session(&server, in_one_hour()).await;
+        Mock::given(method("GET"))
+            .and(path(GRAPH_PATH))
+            .respond_with(ResponseTemplate::new(401))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        mount(&server, "GET", GRAPH_PATH, graph_ok()).await;
+
+        client(&server).read().await.unwrap();
+        assert_eq!(logins(&server).await, 2);
+        assert_eq!(hits(&server, "GET", GRAPH_PATH).await, 2);
+    }
+
+    #[tokio::test]
+    async fn repeated_401_is_session_expired_after_two_logins() {
+        let server = MockServer::start().await;
+        mount_session(&server, in_one_hour()).await;
+        mount(&server, "GET", GRAPH_PATH, ResponseTemplate::new(401)).await;
+
+        let error = client(&server).read().await.unwrap_err();
+        assert_eq!(error.code, "session_expired");
+        assert_eq!(logins(&server).await, 2);
+    }
+
+    /// The borrowed crate logs in again after any error, including throttling.
+    #[tokio::test]
+    async fn throttling_never_triggers_a_login() {
+        let server = MockServer::start().await;
+        mount_session(&server, in_one_hour()).await;
+        mount(&server, "GET", GRAPH_PATH, ResponseTemplate::new(429)).await;
+        let client = client(&server);
+
+        for _ in 0..2 {
+            assert_eq!(client.read().await.unwrap_err().code, "rate_limited");
+        }
+        assert_eq!(logins(&server).await, 1);
+    }
+
+    #[tokio::test]
+    async fn server_errors_and_bad_bodies_never_trigger_a_login() {
+        for response in [
+            ResponseTemplate::new(500),
+            ResponseTemplate::new(430),
+            ResponseTemplate::new(200).set_body_string("not json"),
+        ] {
+            let server = MockServer::start().await;
+            mount_session(&server, in_one_hour()).await;
+            mount(&server, "GET", GRAPH_PATH, response).await;
+
+            assert!(client(&server).read().await.is_err());
+            assert_eq!(logins(&server).await, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn patient_selection_requires_a_unique_name_match() {
+        let server = MockServer::start().await;
+        mount(&server, "POST", LOGIN_PATH, login_ok(in_one_hour())).await;
+        mount(
+            &server,
+            "GET",
+            CONNECTIONS_PATH,
+            connections(&[
+                ("synthetic-patient-0001", "Sam", "Synthetic"),
+                ("synthetic-patient-0002", "Pat", "Synthetic"),
+            ]),
+        )
+        .await;
+        mount(
+            &server,
+            "GET",
+            "/llu/connections/synthetic-patient-0002/graph",
+            graph_ok(),
+        )
+        .await;
+
+        let error = client(&server).read().await.unwrap_err();
+        assert_eq!(error.code, "patient_selection_required");
+
+        let mut named = config(&server.uri());
+        named.patient_name = Some("PAT synthetic".to_owned());
+        LluClient::new(named).unwrap().read().await.unwrap();
+    }
+
+    #[test]
+    fn patient_selection_requires_one_match() {
+        let names = ["Alex", "Sam", "Sam"];
+        assert_eq!(unique_match(&names, |name| *name == "Alex"), Some(&"Alex"));
+        assert_eq!(unique_match(&names, |name| *name == "Sam"), None);
+        assert_eq!(unique_match(&names, |name| *name == "Pat"), None);
+        assert_eq!(unique_match(&names, |_| true), None);
+    }
+
+    #[test]
+    fn production_base_urls_match_regions() {
+        assert_eq!(region_base_url("global"), Some("https://api.libreview.io"));
+        assert_eq!(region_base_url("eu2"), Some("https://api-eu2.libreview.io"));
+        assert_eq!(region_base_url("unknown"), None);
+        assert_eq!(redirect_base_url("de"), "https://api-de.libreview.io");
+        assert!(valid_patient_id(PATIENT_ID));
+        assert!(!valid_patient_id("../escape"));
+    }
+}

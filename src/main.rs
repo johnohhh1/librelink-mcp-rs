@@ -6,6 +6,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 mod borrowed_client;
 mod fetch;
+mod llu_client;
 mod mcp;
 mod source;
 mod time;
