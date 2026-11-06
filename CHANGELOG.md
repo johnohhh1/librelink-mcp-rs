@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.0 — unreleased (draft)
+## 0.4.0 — 2026-11-06
 
 ### Added
 - `import-csv <file> --timezone <IANA zone> [--date-format mdy|dmy] [--db <path>] [--dry-run]` imports a locally saved LibreView CSV export into the collector's database, offline. It reads only the device timestamp, record type, and historic and scan glucose columns. It stores record types 0 and 1 as `libreview_csv_historic` and `libreview_csv_scan`, with `time_basis: csv_local_declared_timezone`. DST-ambiguous and nonexistent local times, rows outside the collector's retention, future rows, and bad values are skipped and counted. Output is counts only. See [Importing a LibreView CSV export](docs/csv-import.md).
@@ -15,6 +15,7 @@
 - `time_in_range_percent` is now the time-weighted share of covered time in 70–180 mg/dL. It was always `null` before.
 - `gmi_percent` is now an estimate (3.31 + 0.02392 × time-weighted mean) when the requested window is at least 14 days and at least 70% covered. Otherwise it stays `null`, with `gmi_unavailable_reason` `window_too_short` or `coverage_too_low`. With the live graph alone it is never available.
 - A CSV row within 90 seconds of a collected reading is left out of every store-backed reply.
+- `period_status: partial` now means only that the observed span does not cover the requested window: the first reading is more than 15 minutes after the window start, or the last is more than 15 minutes before its end. Interior gaps no longer make a period partial; they stay in `coverage.interior_gaps` and in `coverage_percent`. This applies to stats and trends on both data paths.
 - Gap causes are decided in this order: `no_data_from_api`, `no_data_in_export`, `before_collection`, `collector_not_running`. Before, a gap before the first poll was `before_collection` even when the collector had polled inside it.
 - `serve` opens the database read-only and never creates, migrates, or writes it. A database from a newer version makes `serve` use the live API.
 - `collect` records its retention in the database, and `clear-local-data` refuses while an import holds `<db>.import.lock`.

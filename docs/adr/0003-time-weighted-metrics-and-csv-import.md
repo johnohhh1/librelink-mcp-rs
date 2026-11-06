@@ -1,6 +1,6 @@
 # ADR 0003: Time-weighted metrics and LibreView CSV import
 
-- **Status:** accepted
+- **Status:** implemented and live-validated 2026-11-06 (released in 0.4.0)
 - **Date:** 2026-11-06 (open questions settled the same day)
 - **Milestone:** v0.4 (see [roadmap](../roadmap.md#v04-libreview-csv-import-and-defensible-analytics))
 

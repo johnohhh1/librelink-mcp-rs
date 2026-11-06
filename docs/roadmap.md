@@ -61,7 +61,7 @@ Steps:
 
 ## v0.4: LibreView CSV import and defensible analytics
 
-**Status:** in progress. The design is fixed in [ADR 0003](adr/0003-time-weighted-metrics-and-csv-import.md).
+**Status:** done; released as 0.4.0 and live-validated 2026-11-06. The design is fixed in [ADR 0003](adr/0003-time-weighted-metrics-and-csv-import.md).
 
 - Import a locally saved LibreView CSV export into the same database, labeled with origin `libreview_csv_historic` or `libreview_csv_scan`, and deduplicated against collected rows. Import is offline and uploads nothing.
 - Time-weighted time in range, kept separate from sample percentages. Irregular samples are weighted by duration, gaps are excluded rather than counted as zero, and long gaps are not bridged.
@@ -73,12 +73,22 @@ Steps:
 0. **Design record. Done.** Write ADR 0003.
 1. **Metrics module, wired into stats. Done.** Duration-weighted samples capped at 15 minutes, `coverage_percent`, the fixed consensus bands and the configured target range, time-weighted mean, SD, and CV next to the sample statistics, and GMI gated on 14 days and 70% coverage. One implementation for the live and store paths.
 2. **CSV parser and `import-csv`. Done.** See [Importing a LibreView CSV export](csv-import.md). `import-csv <file> --timezone <IANA> [--date-format mdy|dmy] [--db <path>]` reads only the timestamp, record type, and glucose columns. DST-ambiguous or nonexistent times are skipped and counted. Rows attach to the collector's patient key, and the output is counts only. Tested on synthetic fixtures.
-3. **Overlap, docs, release, and live check. Done except the PM live check.**
+3. **Overlap, docs, and release. Done.**
    - A CSV row within ±90 seconds of a collected reading is dropped from every store read, in either import order.
    - Gaps inside the imported span with no polls are labeled `no_data_in_export`.
    - `serve` opens the database read-only and never migrates it.
-   - The docs include an upgrade note, and the CHANGELOG entry is drafted.
-   - Remaining: the version bump, and a PM check with a real export. Only the PM inspects its header row, and the real file never enters the repo.
+   - The docs include an upgrade note.
+   - `period_status: partial` means only that the observed span does not reach both ends of the window; interior gaps are reported in coverage instead.
+4. **Live validation. Done 2026-11-06.** A manual check on the PM's real setup, with no values or account details recorded, and the real export kept out of the repo.
+   - **Upgrade:** the procedure ran as documented: stop the collector, back up, install, `import-csv`, start the collector. The import migrated the database to schema 3, and the collector polled normally on it afterward.
+   - **Import:** the counts matched the dry run and an independent check. A re-import was all duplicates.
+   - **`serve`:** it opened no network connections and answered every tool from `local_store`.
+   - **14-day stats against the vendor's AGP report for the same data:**
+     - within 1 percentage point on every consensus band;
+     - within 1 mg/dL on the mean;
+     - within 0.1 on CV;
+     - within 0.5 percentage point on coverage.
+   - **GMI:** it differed by 0.07, traced to a 0.6 mg/dL difference in the vendor's mean. An independent recomputation matched this project's value.
 
 **Gate:** no metric treats missing values as zero, irregular samples as equal durations, or a short window as the full requested period. Tests cover the 14-day and 70% boundaries.
 
