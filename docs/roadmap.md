@@ -61,10 +61,19 @@ Steps:
 
 ## v0.4: LibreView CSV import and defensible analytics
 
+**Status:** in progress. The design is fixed in [ADR 0003](adr/0003-time-weighted-metrics-and-csv-import.md).
+
 - Import a locally saved LibreView CSV export into the same database, with `source: libreview_csv` provenance and deduplication against collected rows. Import is offline and uploads nothing.
 - Time-weighted time in range, kept separate from sample percentages. Irregular samples are weighted by duration, gaps are excluded rather than counted as zero, and long gaps are not bridged.
 - GMI reported as an estimate only when the window has at least 14 days and at least 70% data coverage, following the [international CGM time-in-range consensus](https://pmc.ncbi.nlm.nih.gov/articles/PMC6973648/). Otherwise `gmi_percent` stays `null` with a reason. This is a data-quality gate, not a diagnosis.
 - Every summary includes sample count, coverage, data source, and the target bounds used. Meal, dawn, and overnight fields stay `null` unless validated context exists.
+
+Steps:
+
+0. **Design record. Done.** Write ADR 0003.
+1. **Metrics module, wired into stats.** Duration-weighted samples capped at 15 minutes, `coverage_percent`, the fixed consensus bands and the configured target range, time-weighted mean, SD, and CV next to the sample statistics, and GMI gated on 14 days and 70% coverage. One implementation for the live and store paths.
+2. **CSV parser and `import-csv`.** `import-csv <file> --timezone <IANA> [--date-format mdy|dmy] [--db <path>]` reads only the timestamp, record type, and glucose columns. DST-ambiguous or nonexistent times are skipped and counted. Rows attach to the collector's patient key, and the output is counts only. Tested on synthetic fixtures.
+3. **Overlap, docs, release, and live check.** A CSV row within ±90 seconds of a collected reading is dropped at read time. Then the docs and the release, followed by a PM check with a real export. Only the PM inspects its header row, and the real file never enters the repo.
 
 **Gate:** no metric treats missing values as zero, irregular samples as equal durations, or a short window as the full requested period. Tests cover the 14-day and 70% boundaries.
 
