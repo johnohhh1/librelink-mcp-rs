@@ -105,7 +105,7 @@ fn classify_fetch_error(error: LibreLinkUpError) -> FetchError {
     };
     FetchError {
         code,
-        message,
+        message: message.into(),
         retry_after_seconds,
     }
 }
@@ -218,7 +218,7 @@ impl DataSource for BorrowedClientSource {
                 .await
                 .map_err(|message| FetchError {
                     code: "configuration_error",
-                    message,
+                    message: message.into(),
                     retry_after_seconds: None,
                 })?;
             // read_raw preserves the source timestamp. The client's processed

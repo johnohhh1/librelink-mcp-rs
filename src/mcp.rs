@@ -1156,7 +1156,7 @@ mod tests {
     async fn cooldown_applies_to_any_source() {
         let throttled = FetchError {
             code: "rate_limited",
-            message: "Synthetic throttle.",
+            message: "Synthetic throttle.".into(),
             retry_after_seconds: Some(60),
         };
         let (server, reads) = fake_server(Err(throttled));
@@ -1172,7 +1172,7 @@ mod tests {
     async fn configuration_errors_do_not_start_a_cooldown() {
         let unconfigured = FetchError {
             code: "configuration_error",
-            message: "Synthetic missing setup.",
+            message: "Synthetic missing setup.".into(),
             retry_after_seconds: None,
         };
         let (server, reads) = fake_server(Err(unconfigured));

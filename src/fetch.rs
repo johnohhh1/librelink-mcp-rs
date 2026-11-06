@@ -2,6 +2,7 @@
 
 use crate::source::{DataSource, Snapshot};
 use chrono::{DateTime, Utc};
+use std::borrow::Cow;
 use std::ops::Deref;
 use std::time::{Duration as StdDuration, Instant};
 use tokio::sync::Mutex;
@@ -10,10 +11,11 @@ pub(crate) const CACHE_TTL: StdDuration = StdDuration::from_secs(60);
 pub(crate) const FAILURE_COOLDOWN: StdDuration = StdDuration::from_secs(60);
 const READ_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FetchError {
     pub code: &'static str,
-    pub message: &'static str,
+    /// Fixed text, or fixed text plus a validated detail. Never upstream bodies.
+    pub message: Cow<'static, str>,
     pub retry_after_seconds: Option<u64>,
 }
 
@@ -113,7 +115,7 @@ impl Fetcher {
             .as_ref()
             .filter(|entry| cooldown_active(entry, now))
         {
-            let mut error = cooldown.error;
+            let mut error = cooldown.error.clone();
             error.retry_after_seconds = cooldown
                 .until
                 .map(|until| until.duration_since(now).as_secs().max(1));
@@ -125,7 +127,7 @@ impl Fetcher {
                 if starts_cooldown(&error) {
                     state.cooldown = Some(Cooldown {
                         until: cooldown_until(&error, Instant::now()),
-                        error,
+                        error: error.clone(),
                     });
                 }
                 return Err(error);
@@ -133,12 +135,12 @@ impl Fetcher {
             Err(_) => {
                 let error = FetchError {
                     code: "timeout",
-                    message: "LibreLinkUp request timed out; retry later.",
+                    message: Cow::Borrowed("LibreLinkUp request timed out; retry later."),
                     retry_after_seconds: Some(FAILURE_COOLDOWN.as_secs()),
                 };
                 state.cooldown = Some(Cooldown {
                     until: Some(Instant::now() + FAILURE_COOLDOWN),
-                    error,
+                    error: error.clone(),
                 });
                 return Err(error);
             }

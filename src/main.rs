@@ -1,6 +1,7 @@
 use chrono::Utc;
 use keyring::{Entry, Error as KeyringError};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::io::{self, Write};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -204,7 +205,7 @@ fn load_credentials() -> Result<Credentials, &'static str> {
     serde_json::from_str(&stored).map_err(|_| "Stored credentials have an unsupported format.")
 }
 
-async fn check() -> Result<(), &'static str> {
+async fn check() -> Result<(), Cow<'static, str>> {
     let raw = live_fetcher()
         .fetch()
         .await
@@ -236,7 +237,8 @@ async fn check() -> Result<(), &'static str> {
         active_sensors_returned: raw.active_sensors.len(),
         cache_hit: raw.cache_hit,
     };
-    let output = serde_json::to_string_pretty(&report).map_err(|_| "Unable to format result.")?;
+    let output =
+        serde_json::to_string_pretty(&report).map_err(|_| Cow::from("Unable to format result."))?;
     println!("{output}");
     Ok(())
 }
@@ -300,16 +302,16 @@ fn main() {
 
 async fn run() {
     let args: Vec<String> = std::env::args().collect();
-    let result = match args.as_slice() {
-        [_, command] if command == "setup" => setup(),
+    let result: Result<(), Cow<'static, str>> = match args.as_slice() {
+        [_, command] if command == "setup" => setup().map_err(Cow::from),
         [_, command] if command == "check" => check().await,
-        [_, command] if command == "select-patient" => select_patient(),
-        [_, command] if command == "set-api-version" => set_api_version(),
-        [_, command] if command == "clear-local-data" => clear_local_data(),
-        [_, command] if command == "serve" => mcp::serve(live_fetcher()).await,
-        _ => Err(
+        [_, command] if command == "select-patient" => select_patient().map_err(Cow::from),
+        [_, command] if command == "set-api-version" => set_api_version().map_err(Cow::from),
+        [_, command] if command == "clear-local-data" => clear_local_data().map_err(Cow::from),
+        [_, command] if command == "serve" => mcp::serve(live_fetcher()).await.map_err(Cow::from),
+        _ => Err(Cow::from(
             "Usage: librelink-mcp-rs <setup|select-patient|set-api-version|check|clear-local-data|serve>",
-        ),
+        )),
     };
     if let Err(message) = result {
         eprintln!("{message}");

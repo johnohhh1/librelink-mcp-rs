@@ -2,7 +2,11 @@
 //!
 //! Login happens only when there is no token, the token has expired, or a
 //! request returns HTTP 401, and at most one 401 re-login per `read()`.
-//! Throttling, server errors, and parse errors never trigger a login.
+//! Throttling, server errors, parse errors, and rejected requests never
+//! trigger a login.
+//!
+//! Errors carry fixed messages. Response bodies are read only to classify
+//! the failure and are never logged or returned.
 
 // Not wired into `serve` or `check` until v0.2 step 3, which removes this.
 #![allow(dead_code)]
@@ -12,11 +16,13 @@ use crate::source::{DataSource, GlucoseSample, ReadFuture, SensorRecord, Snapsho
 use chrono::Utc;
 use reqwest::header::{
     ACCEPT, ACCEPT_LANGUAGE, AUTHORIZATION, CACHE_CONTROL, CONNECTION, CONTENT_TYPE, HeaderMap,
-    HeaderValue, USER_AGENT,
+    HeaderValue, RETRY_AFTER, USER_AGENT,
 };
-use reqwest::{Client, StatusCode, redirect};
+use reqwest::{Client, Response, StatusCode, redirect};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
@@ -117,11 +123,25 @@ pub(crate) struct LluClient {
     session: Mutex<Session>,
 }
 
+const DEFAULT_RETRY_SECONDS: u64 = 60;
+const MAX_RETRY_SECONDS: u64 = 900;
+/// Graph responses are tens of kilobytes; anything far larger is refused.
+const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+
 const fn error(code: &'static str, message: &'static str) -> FetchError {
     FetchError {
         code,
-        message,
-        retry_after_seconds: Some(60),
+        message: Cow::Borrowed(message),
+        retry_after_seconds: Some(DEFAULT_RETRY_SECONDS),
+    }
+}
+
+/// An error that retrying will not fix: no retry is suggested to the caller.
+const fn final_error(code: &'static str, message: &'static str) -> FetchError {
+    FetchError {
+        code,
+        message: Cow::Borrowed(message),
+        retry_after_seconds: None,
     }
 }
 
@@ -129,19 +149,27 @@ const UNAVAILABLE: FetchError = error(
     "upstream_unavailable",
     "LibreLinkUp request failed; retry later.",
 );
-const RATE_LIMITED: FetchError = error(
-    "rate_limited",
-    "LibreLinkUp is rate limiting requests; retry later.",
-);
 const SESSION_EXPIRED: FetchError = error(
     "session_expired",
     "LibreLinkUp rejected the current session; retry later.",
 );
-const BAD_CREDENTIALS: FetchError = FetchError {
-    code: "authentication_failed",
-    message: "LibreLinkUp rejected the account credentials. No further logins will be attempted; run `setup` locally, then restart the server.",
-    retry_after_seconds: None,
-};
+const BAD_CREDENTIALS: FetchError = final_error(
+    "authentication_failed",
+    "LibreLinkUp rejected the account credentials. No further logins will be attempted; run `setup` locally, then restart the server.",
+);
+const ACTION_REQUIRED: FetchError = error(
+    "account_action_required",
+    "LibreLinkUp requires an action in its app before API access.",
+);
+const REQUEST_REJECTED: FetchError = final_error(
+    "request_rejected",
+    "LibreLinkUp rejected this client's request headers. This needs a client update; retrying will not help.",
+);
+/// A candidate retirement signal, not proof that the API was retired.
+const API_CHANGED: FetchError = error(
+    "api_changed",
+    "LibreLinkUp returned a successful response that is not JSON. The API may have changed or been retired.",
+);
 const NO_CONNECTION: FetchError = error(
     "no_connection",
     "Account authenticated but follows no patients in LibreLinkUp.",
@@ -151,10 +179,105 @@ const SELECTION_REQUIRED: FetchError = error(
     "No unique followed person was selected. Run `select-patient` locally.",
 );
 
-fn classify_status(status: StatusCode) -> FetchError {
-    match status.as_u16() {
+fn rate_limited(seconds: Option<u64>) -> FetchError {
+    FetchError {
+        code: "rate_limited",
+        message: Cow::Borrowed("LibreLinkUp is rate limiting requests; retry later."),
+        retry_after_seconds: Some(
+            seconds
+                .unwrap_or(DEFAULT_RETRY_SECONDS)
+                .clamp(DEFAULT_RETRY_SECONDS, MAX_RETRY_SECONDS),
+        ),
+    }
+}
+
+/// `minimumVersion` reaches the message only if it is plain digits and dots.
+fn plain_version(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() <= 20
+        && text.bytes().any(|byte| byte.is_ascii_digit())
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+}
+
+fn version_rejected(minimum: Option<&str>) -> FetchError {
+    let message = match minimum.filter(|version| plain_version(version)) {
+        Some(version) => Cow::Owned(format!(
+            "LibreLinkUp requires a newer client version (minimum {version}). Run `set-api-version` locally, then restart the server."
+        )),
+        None => Cow::Borrowed(
+            "LibreLinkUp requires a newer client version. Run `set-api-version` locally, then restart the server.",
+        ),
+    };
+    FetchError {
+        code: "client_version_rejected",
+        message,
+        retry_after_seconds: None,
+    }
+}
+
+/// A response read in full, within `MAX_BODY_BYTES`.
+struct Reply {
+    status: StatusCode,
+    retry_after_seconds: Option<u64>,
+    body: Vec<u8>,
+}
+
+async fn receive(mut response: Response) -> Result<Reply, FetchError> {
+    let status = response.status();
+    // Only the delay-seconds form; an HTTP date falls back to the default.
+    let retry_after_seconds = response
+        .headers()
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse().ok());
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| UNAVAILABLE)? {
+        if body.len() + chunk.len() > MAX_BODY_BYTES {
+            return Err(UNAVAILABLE);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Reply {
+        status,
+        retry_after_seconds,
+        body,
+    })
+}
+
+/// LibreLinkUp names header problems in a `message` field. These mean the
+/// request itself is wrong, so neither a retry nor a new login can help.
+fn rejects_request(body: &[u8]) -> bool {
+    const REJECTIONS: [&str; 2] = ["AccountIdMismatch", "RequiredHeaderMissing"];
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    [
+        value.get("message"),
+        value.get("error").and_then(|error| error.get("message")),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(Value::as_str)
+    .any(|message| REJECTIONS.contains(&message))
+}
+
+/// Maps a non-success reply that is not a rejection or a retriable 401.
+fn failure(reply: &Reply) -> FetchError {
+    match reply.status.as_u16() {
         401 => SESSION_EXPIRED,
-        429 | 430 => RATE_LIMITED,
+        429 | 430 => rate_limited(reply.retry_after_seconds),
+        403 => match serde_json::from_slice::<Value>(&reply.body) {
+            Ok(body) if body.get("status").and_then(Value::as_i64) == Some(920) => {
+                version_rejected(
+                    body.get("data")
+                        .and_then(|data| data.get("minimumVersion"))
+                        .and_then(Value::as_str),
+                )
+            }
+            _ => UNAVAILABLE,
+        },
         _ => UNAVAILABLE,
     }
 }
@@ -182,6 +305,27 @@ struct LoginData {
     user: Option<UserRef>,
     #[serde(default, rename = "authTicket")]
     auth_ticket: Option<AuthTicket>,
+    /// Lockout seconds, sent as `data.data.lockout` or `data.lockout`.
+    #[serde(default)]
+    lockout: Option<i64>,
+    #[serde(default)]
+    data: Option<LockoutInfo>,
+}
+
+impl LoginData {
+    fn lockout_seconds(&self) -> Option<u64> {
+        self.data
+            .as_ref()
+            .and_then(|info| info.lockout)
+            .or(self.lockout)
+            .and_then(|seconds| u64::try_from(seconds).ok())
+    }
+}
+
+#[derive(Deserialize)]
+struct LockoutInfo {
+    #[serde(default)]
+    lockout: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -292,8 +436,16 @@ impl From<SensorWire> for SensorRecord {
     }
 }
 
+/// A body that is not JSON at all is `api_changed`; JSON of the wrong shape
+/// is `upstream_unavailable`.
 fn parse<T: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<T, FetchError> {
-    serde_json::from_slice(body).map_err(|_| UNAVAILABLE)
+    serde_json::from_slice(body).map_err(|error| {
+        if error.is_data() {
+            UNAVAILABLE
+        } else {
+            API_CHANGED
+        }
+    })
 }
 
 fn account_id_hash(user_id: &str) -> String {
@@ -369,15 +521,22 @@ impl LluClient {
                 .send()
                 .await
                 .map_err(|_| UNAVAILABLE)?;
-            if !response.status().is_success() {
-                return Err(classify_status(response.status()));
+            let reply = receive(response).await?;
+            if rejects_request(&reply.body) {
+                return Err(REQUEST_REJECTED);
             }
-            let bytes = response.bytes().await.map_err(|_| UNAVAILABLE)?;
-            let envelope: LoginEnvelope = parse(&bytes)?;
+            if !reply.status.is_success() {
+                return Err(failure(&reply));
+            }
+            let envelope: LoginEnvelope = parse(&reply.body)?;
             match envelope.status {
                 0 => {}
                 2 => return Err(BAD_CREDENTIALS),
-                // Remaining login statuses are mapped in v0.2 step 2b.
+                4 => return Err(ACTION_REQUIRED),
+                429 => {
+                    let seconds = envelope.data.as_ref().and_then(LoginData::lockout_seconds);
+                    return Err(rate_limited(seconds));
+                }
                 _ => return Err(UNAVAILABLE),
             }
             let data = envelope.data.ok_or(UNAVAILABLE)?;
@@ -408,8 +567,8 @@ impl LluClient {
         Err(UNAVAILABLE)
     }
 
-    /// One authenticated GET. A 401 triggers one re-login per `read()`,
-    /// tracked by `relogged`; every other failure is returned as is.
+    /// One authenticated GET. A plain 401 triggers one re-login per `read()`,
+    /// tracked by `relogged`; every other failure is returned without one.
     async fn get(
         &self,
         session: &mut Session,
@@ -433,8 +592,12 @@ impl LluClient {
                 .send()
                 .await
                 .map_err(|_| UNAVAILABLE)?;
-            let status = response.status();
-            if status == StatusCode::UNAUTHORIZED {
+            let reply = receive(response).await?;
+            // Checked before 401: a rejected header is not a stale session.
+            if rejects_request(&reply.body) {
+                return Err(REQUEST_REJECTED);
+            }
+            if reply.status == StatusCode::UNAUTHORIZED {
                 session.token = None;
                 if *relogged {
                     return Err(SESSION_EXPIRED);
@@ -443,10 +606,10 @@ impl LluClient {
                 self.login(session).await?;
                 continue;
             }
-            if !status.is_success() {
-                return Err(classify_status(status));
+            if !reply.status.is_success() {
+                return Err(failure(&reply));
             }
-            return Ok(response.bytes().await.map_err(|_| UNAVAILABLE)?.to_vec());
+            return Ok(reply.body);
         }
     }
 
@@ -980,6 +1143,220 @@ mod tests {
         let mut named = config(&server.uri());
         named.patient_name = Some("PAT synthetic".to_owned());
         LluClient::new(named).unwrap().read().await.unwrap();
+    }
+
+    /// Runs one read where login answers with `response`.
+    async fn login_failure(response: ResponseTemplate) -> (FetchError, usize) {
+        let server = MockServer::start().await;
+        mount(&server, "POST", LOGIN_PATH, response).await;
+        let error = client(&server).read().await.unwrap_err();
+        (error, logins(&server).await)
+    }
+
+    /// Runs one read with a working login where the graph answers with
+    /// `response`.
+    async fn graph_failure(response: ResponseTemplate) -> (FetchError, usize) {
+        let server = MockServer::start().await;
+        mount_session(&server, in_one_hour()).await;
+        mount(&server, "GET", GRAPH_PATH, response).await;
+        let error = client(&server).read().await.unwrap_err();
+        (error, logins(&server).await)
+    }
+
+    fn json_reply(status: u16, body: Value) -> ResponseTemplate {
+        ResponseTemplate::new(status).set_body_json(body)
+    }
+
+    #[tokio::test]
+    async fn login_status_2_is_authentication_failed() {
+        let (error, logins) = login_failure(json_reply(200, json!({ "status": 2 }))).await;
+        assert_eq!(error.code, "authentication_failed");
+        assert_eq!(error.retry_after_seconds, None);
+        assert_eq!(logins, 1);
+    }
+
+    #[tokio::test]
+    async fn login_status_4_is_account_action_required() {
+        let body = json!({
+            "status": 4,
+            "data": { "step": { "type": "verifyEmail", "componentName": "synthetic" } },
+        });
+        let (error, logins) = login_failure(json_reply(200, body)).await;
+        assert_eq!(error.code, "account_action_required");
+        assert_eq!(logins, 1);
+    }
+
+    #[tokio::test]
+    async fn lockout_body_is_rate_limited_with_its_retry_time() {
+        for body in [
+            json!({ "status": 429, "data": { "code": 60, "data": { "failures": 3, "interval": 60, "lockout": 300 }, "message": "synthetic" } }),
+            json!({ "status": 429, "data": { "lockout": 300 } }),
+        ] {
+            let (error, logins) = login_failure(json_reply(200, body)).await;
+            assert_eq!(error.code, "rate_limited");
+            assert_eq!(error.retry_after_seconds, Some(300));
+            assert_eq!(logins, 1);
+        }
+        // No lockout time: default cooldown.
+        let (error, logins) =
+            login_failure(json_reply(200, json!({ "status": 429, "data": {} }))).await;
+        assert_eq!(error.retry_after_seconds, Some(60));
+        assert_eq!(logins, 1);
+    }
+
+    #[tokio::test]
+    async fn http_throttling_uses_numeric_retry_after_or_the_default() {
+        for (response, expected) in [
+            (
+                ResponseTemplate::new(429).insert_header("retry-after", "120"),
+                120,
+            ),
+            (
+                ResponseTemplate::new(430).insert_header("retry-after", "240"),
+                240,
+            ),
+            (ResponseTemplate::new(430), 60),
+            (
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "Wed, 21 Oct 2026 07:28:00 GMT"),
+                60,
+            ),
+            (
+                ResponseTemplate::new(429).insert_header("retry-after", "86400"),
+                900,
+            ),
+        ] {
+            let (error, logins) = graph_failure(response).await;
+            assert_eq!(error.code, "rate_limited");
+            assert_eq!(error.retry_after_seconds, Some(expected));
+            assert_eq!(logins, 1);
+        }
+        // Throttling at login is mapped the same way.
+        let (error, logins) =
+            login_failure(ResponseTemplate::new(429).insert_header("retry-after", "120")).await;
+        assert_eq!(error.code, "rate_limited");
+        assert_eq!(error.retry_after_seconds, Some(120));
+        assert_eq!(logins, 1);
+    }
+
+    #[tokio::test]
+    async fn status_920_is_client_version_rejected() {
+        let rejected = |minimum: &str| {
+            json_reply(
+                403,
+                json!({ "status": 920, "data": { "minimumVersion": minimum } }),
+            )
+        };
+        let (error, logins) = login_failure(rejected("4.17.0")).await;
+        assert_eq!(error.code, "client_version_rejected");
+        assert_eq!(error.retry_after_seconds, None);
+        assert!(error.message.contains("minimum 4.17.0"));
+        assert_eq!(logins, 1);
+
+        for unsafe_version in [
+            "4.17.0; see https://example.invalid",
+            "",
+            "...",
+            "4.17.0-beta",
+        ] {
+            let (error, logins) = login_failure(rejected(unsafe_version)).await;
+            assert_eq!(error.code, "client_version_rejected");
+            assert!(!error.message.contains("minimum"), "{unsafe_version}");
+            assert!(!error.message.contains("example"));
+            assert_eq!(logins, 1);
+        }
+
+        let (error, logins) = graph_failure(rejected("4.17.0")).await;
+        assert_eq!(error.code, "client_version_rejected");
+        assert_eq!(logins, 1);
+
+        // A 403 without status 920 is not a version problem.
+        let (error, logins) = graph_failure(json_reply(403, json!({ "status": 1 }))).await;
+        assert_eq!(error.code, "upstream_unavailable");
+        assert_eq!(logins, 1);
+    }
+
+    #[tokio::test]
+    async fn header_rejections_are_request_rejected_without_relogin() {
+        for (status, body) in [
+            (401, json!({ "message": "AccountIdMismatch" })),
+            (400, json!({ "message": "RequiredHeaderMissing" })),
+            (
+                401,
+                json!({ "status": 911, "error": { "message": "AccountIdMismatch" } }),
+            ),
+        ] {
+            let (error, logins) = graph_failure(json_reply(status, body)).await;
+            assert_eq!(error.code, "request_rejected");
+            assert_eq!(error.retry_after_seconds, None);
+            assert_eq!(logins, 1);
+        }
+        let (error, logins) = login_failure(json_reply(
+            400,
+            json!({ "message": "RequiredHeaderMissing" }),
+        ))
+        .await;
+        assert_eq!(error.code, "request_rejected");
+        assert_eq!(logins, 1);
+    }
+
+    #[tokio::test]
+    async fn server_errors_are_upstream_unavailable() {
+        for status in [500, 502, 503] {
+            let (error, logins) = graph_failure(ResponseTemplate::new(status)).await;
+            assert_eq!(error.code, "upstream_unavailable");
+            assert_eq!(error.retry_after_seconds, Some(60));
+            assert_eq!(logins, 1);
+        }
+        let (error, logins) = login_failure(ResponseTemplate::new(503)).await;
+        assert_eq!(error.code, "upstream_unavailable");
+        assert_eq!(logins, 1);
+    }
+
+    #[tokio::test]
+    async fn successful_non_json_bodies_are_api_changed() {
+        for body in ["<html>synthetic</html>", "", "\u{1}\u{2}binary"] {
+            let (error, logins) =
+                graph_failure(ResponseTemplate::new(200).set_body_string(body)).await;
+            assert_eq!(error.code, "api_changed");
+            assert_eq!(logins, 1);
+        }
+        let (error, logins) =
+            login_failure(ResponseTemplate::new(200).set_body_string("synthetic text")).await;
+        assert_eq!(error.code, "api_changed");
+        assert_eq!(logins, 1);
+
+        // Valid JSON of the wrong shape is not a retirement signal.
+        let (error, logins) = graph_failure(json_reply(200, json!({ "status": 0 }))).await;
+        assert_eq!(error.code, "upstream_unavailable");
+        assert_eq!(logins, 1);
+    }
+
+    #[tokio::test]
+    async fn oversized_bodies_are_refused() {
+        let (error, logins) =
+            graph_failure(
+                ResponseTemplate::new(200).set_body_bytes(vec![b' '; MAX_BODY_BYTES + 1]),
+            )
+            .await;
+        assert_eq!(error.code, "upstream_unavailable");
+        assert_eq!(logins, 1);
+    }
+
+    #[tokio::test]
+    async fn error_messages_never_contain_response_bodies() {
+        let marker = "synthetic-private-marker";
+        for response in [
+            json_reply(500, json!({ "message": marker })),
+            json_reply(
+                403,
+                json!({ "status": 920, "data": { "minimumVersion": marker } }),
+            ),
+            ResponseTemplate::new(200).set_body_string(marker),
+        ] {
+            let (error, _) = graph_failure(response).await;
+            assert!(!error.message.contains(marker));
+        }
     }
 
     #[test]
