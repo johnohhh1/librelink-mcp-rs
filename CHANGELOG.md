@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.0.0 — 2026-11-06
+
+The configuration validated for this release is listed in [compatibility](https://github.com/johnohhh1/librelink-mcp-rs/blob/v1.0.0/docs/compatibility.md). Other accounts, regions, sensors, hosts, and clients are unvalidated.
+
+### Added
+- `select-patient` lists the people the account follows in an interactive terminal and stores the chosen patient ID in the OS credential store. The ID is never printed or written to the settings file.
+- MCP tool annotations on all eight tools. The data tools are read-only, idempotent, and open-world; `configure_ranges` is not read-only.
+- An `outputSchema` for every tool, with typed replies that match it. Error replies match it too.
+- The resource `glucose://current`, with the same reply and source selection as `get_current_glucose`.
+- History paging in `get_glucose_history`:
+  - `limit` (default 500, at most 5000) and `before` (RFC 3339);
+  - replies have `truncated`, `next_before`, and `readings_in_window`;
+  - readings in the same second are never split across pages, and coverage always describes the whole window.
+- Release archives for x86_64 and ARM64 Linux, Apple silicon and Intel macOS, and x86_64 Windows, each with README, LICENSE, and CHANGELOG, plus `SHA256SUMS`.
+- A Claude Desktop bundle (`.mcpb`) for macOS and Windows. It runs `serve` and collects no configuration; credentials still come only from `setup`.
+- Documentation: [install](https://github.com/johnohhh1/librelink-mcp-rs/blob/v1.0.0/docs/install.md), [troubleshooting](https://github.com/johnohhh1/librelink-mcp-rs/blob/v1.0.0/docs/troubleshooting.md), [privacy](https://github.com/johnohhh1/librelink-mcp-rs/blob/v1.0.0/docs/privacy.md), and [compatibility](https://github.com/johnohhh1/librelink-mcp-rs/blob/v1.0.0/docs/compatibility.md), including a validation guide.
+- `cargo deny` in CI for advisories, licenses, bans, and sources.
+
+### Changed
+- Patient selection uses the stored patient ID:
+  - With none stored, a single connection is used, and several give `patient_selection_required`.
+  - A stored ID that is no longer among the connections gives the new code `patient_selection_changed`, and nothing is read. It latches until restart, so `collect` exits with status 78; it never switches to someone else.
+  - A full-name selection saved by an earlier version is converted to the ID the first time it matches exactly one connection.
+- `clear-local-data` also removes the stored patient ID.
+- `get_glucose_history` accepts up to 2160 hours (90 days) from the local store.
+- Error replies leave out `retry_after_seconds` when there is no retry time, instead of sending `null`.
+- A panic prints a fixed message with no details unless `LIBRELINK_MCP_DEBUG=1` is set. Release builds abort on panic and strip symbols.
+
 ## 0.4.0 — 2026-11-06
 
 ### Added

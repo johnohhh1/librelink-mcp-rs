@@ -1,6 +1,6 @@
 # Roadmap
 
-The server connects to a LibreLinkUp follower account, exposes the eight original tool names over MCP stdio, and labels what it cannot know. It is not yet at parity: the LibreLinkUp graph covers about 12 hours, so multi-day history and standardized analytics need local data. This document records what is done and the versioned milestones that remain.
+The server connects to a LibreLinkUp follower account, exposes the eight original tool names over MCP stdio, and labels what it cannot know. The LibreLinkUp graph covers about 12 hours, so multi-day history and standardized analytics come from the optional local collector and LibreView CSV import. This document records what was done in each milestone and what remains.
 
 Each milestone has a gate. A milestone is not done until its gate passes on Linux, macOS, and Windows CI.
 
@@ -94,15 +94,27 @@ Steps:
 
 ## v1.0: release
 
-- Replace name-based patient selection with a local, stable-ID chooser that refuses ambiguous or changed connections without exposing patient IDs. **Done** (step 1): `select-patient` stores the chosen ID in the OS credential store; `patient_selection_required` and `patient_selection_changed` never pick someone silently.
-- MCP tool annotations and typed output schemas for all eight tools. A current-reading resource. Cap or paginate large history responses. **Done** (step 2): annotations, `outputSchema` checked against real replies in tests, `glucose://current`, and history paging (`limit`, `before`, `next_before`).
-- Error paths, panics, traces, and debug output audited for passwords, tokens, account identifiers, and readings. Telemetry stays off.
-- Dependency advisory and license gate in CI.
-- Versioned release binaries, a changelog, and a Claude Desktop bundle.
-- Installation, keyring troubleshooting, data deletion, privacy, and compatibility docs.
-- Manual validation on multiple account, region, and sensor combinations, including factory-UTC inference outside the US, without recording anyone's responses in issues or fixtures.
+**Status:** done, pending the PM's live check. Version 1.0.0 is a release candidate until it is tagged. Its steps:
 
-**Release bar:** all eight tools have honest parameter semantics or explicit unavailable results, every gate above passes, and the public docs state the remaining API limitations.
+1. **Stable patient selection. Done.** `select-patient` lists the account's connections in a terminal and stores the chosen patient ID in the OS credential store, never printed. With no ID stored, a single connection is used and several give `patient_selection_required`. A stored ID that is gone gives `patient_selection_changed`, which latches and never falls back to someone else. A legacy name selection is converted once.
+2. **MCP surface. Done.**
+   - Annotations on all eight tools, and typed replies with a published `outputSchema` that tests check against real replies on both data paths.
+   - The resource `glucose://current`.
+   - History paging (`limit`, `before`, `truncated`, `next_before`), with coverage over the whole window and store windows up to 90 days.
+3. **Leak and panic audit. Done.**
+   - A panic prints a fixed message unless `LIBRELINK_MCP_DEBUG=1`, and release builds abort on panic and strip symbols.
+   - Marker tests drive the command-line error paths, the client's failure responses, the collector's logs, and the import.
+   - The only network destinations are LibreLinkUp's API hosts. There is no telemetry.
+4. **Supply-chain gate. Done.** `cargo deny` in CI, with `deny.toml` covering advisories, licenses, bans, and sources. Its one license exception and two duplicate skips are justified there.
+5. **Release automation. Done.** Tagged releases build five targets with checksums and CHANGELOG notes. macOS and Windows also get a Claude Desktop bundle (`.mcpb`, manifest 0.3), which collects no configuration. Pull requests build everything without publishing.
+6. **Documentation. Done.** [Install](install.md), [troubleshooting](troubleshooting.md), [privacy](privacy.md), and [compatibility](compatibility.md).
+7. **Release candidate and live check.** Version 1.0.0. Remaining: the PM's live check on the real setup before tagging.
+
+**Release bar (PM decision):** v1.0 is validated on the configuration in [compatibility](compatibility.md): one US follower account, a FreeStyle Libre 3, and the America/Detroit time zone, on 2026-11-05 and 2026-11-06. Other accounts, regions, sensors, hosts, and clients are documented as unvalidated rather than claimed. All eight tools have honest parameter semantics or explicit unavailable results, every gate above passes, and the public docs state the remaining API limitations.
+
+After 1.0:
+- validate other accounts, regions, and sensors through the [validation guide](compatibility.md#validating-another-configuration), including factory-UTC inference outside the US, without recording anyone's responses;
+- confirm the exact trigger for `api_retired`.
 
 ## API retirement risk
 

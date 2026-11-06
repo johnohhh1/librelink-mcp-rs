@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "librelink-mcp-rs",
   "display_name": "LibreLinkUp (unofficial)",
-  "version": "0.4.0",
+  "version": "1.0.0",
   "description": "Read-only access to a LibreLinkUp follower account's glucose data, with honest freshness and coverage labels.",
   "long_description": "An unofficial, local MCP server for the LibreLinkUp follower API. Credentials are never entered here: run `librelink-mcp-rs setup` in a terminal first, which stores them in the OS credential store. Results are descriptive only, with no diagnosis or treatment advice. Validated on one configuration; see the compatibility notes.",
   "author": {
