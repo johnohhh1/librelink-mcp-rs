@@ -630,6 +630,7 @@ impl LluClient {
         let body = self.get(&mut session, &path, &mut relogged).await?;
         let graph: GraphEnvelope = parse(&body)?;
         Ok(Snapshot {
+            patient_id,
             current: graph.data.connection.glucose_measurement.into(),
             graph: graph.data.graph_data.into_iter().map(Into::into).collect(),
             active_sensors: graph
@@ -855,6 +856,7 @@ mod tests {
         mount(&server, "GET", GRAPH_PATH, graph_ok()).await;
 
         let snapshot = client(&server).read().await.unwrap();
+        assert_eq!(snapshot.patient_id, PATIENT_ID);
         assert_eq!(
             snapshot.current,
             GlucoseSample {
@@ -1396,7 +1398,8 @@ mod tests {
     #[test]
     fn unfixable_rejections_latch_until_restart() {
         use crate::fetch::{Cooldown, cooldown_active, cooldown_until, latches_until_restart};
-        use std::time::{Duration as StdDuration, Instant};
+        use std::time::Duration as StdDuration;
+        use tokio::time::Instant;
         let now = Instant::now();
         for error in [
             BAD_CREDENTIALS,

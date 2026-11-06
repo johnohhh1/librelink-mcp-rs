@@ -21,13 +21,27 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub(crate) struct LibreMcp {
     fetcher: Arc<Fetcher>,
+    /// Tests use fixed target bounds instead of reading the OS keyring.
+    #[cfg(test)]
+    fixed_ranges: Option<(u16, u16)>,
 }
 
 impl LibreMcp {
     pub(crate) fn new(fetcher: Fetcher) -> Self {
         Self {
             fetcher: Arc::new(fetcher),
+            #[cfg(test)]
+            fixed_ranges: None,
         }
+    }
+
+    /// Local target bounds in mg/dL.
+    fn target_range(&self) -> Result<(u16, u16), &'static str> {
+        #[cfg(test)]
+        if let Some(ranges) = self.fixed_ranges {
+            return Ok(ranges);
+        }
+        load_settings().map(|settings| (settings.target_low, settings.target_high))
     }
 }
 
@@ -570,18 +584,12 @@ impl LibreMcp {
             Ok(raw) => raw,
             Err(error) => return failure_fetch(error),
         };
-        let settings = match load_settings() {
-            Ok(settings) => settings,
+        let (target_low, target_high) = match self.target_range() {
+            Ok(range) => range,
             Err(message) => return failure(message),
         };
         let (points, _) = points_with_current(&raw.graph, &raw.current);
-        match summarize_stats(
-            &points,
-            days,
-            settings.target_low,
-            settings.target_high,
-            Utc::now(),
-        ) {
+        match summarize_stats(&points, days, target_low, target_high, Utc::now()) {
             Ok(mut body) => {
                 body["cache_hit"] = serde_json::Value::Bool(raw.cache_hit);
                 success(body)
@@ -1096,6 +1104,7 @@ mod tests {
 
     fn empty_snapshot() -> Snapshot {
         Snapshot {
+            patient_id: "synthetic-patient-empty".to_owned(),
             current: synthetic_item(""),
             graph: vec![],
             active_sensors: vec![],
@@ -1112,6 +1121,7 @@ mod tests {
         current.value_in_mg_per_dl = 142.0;
         current.trend_arrow = Some(4);
         Snapshot {
+            patient_id: "synthetic-patient-live".to_owned(),
             current,
             graph: [30, 25, 20, 15]
                 .into_iter()
@@ -1129,6 +1139,38 @@ mod tests {
 
     fn body(result: &CallToolResult) -> &serde_json::Value {
         result.structured_content.as_ref().unwrap()
+    }
+
+    /// The patient ID exists only for the local store; every data tool must
+    /// keep it out of both the structured and the text output.
+    #[tokio::test]
+    async fn no_data_tool_reveals_the_patient_id() {
+        const PATIENT_ID: &str = "SYNTHETIC-PID-zq81-do-not-leak";
+        let mut snapshot = live_snapshot();
+        snapshot.patient_id = PATIENT_ID.to_owned();
+        let (mut server, _) = fake_server(Ok(snapshot));
+        server.fixed_ranges = Some((70, 180));
+        let results = [
+            server.get_current_glucose(Parameters(EmptyArgs {})).await,
+            server
+                .get_glucose_history(Parameters(HistoryArgs { hours: Some(24) }))
+                .await,
+            server
+                .get_glucose_stats(Parameters(StatsArgs { days: Some(1) }))
+                .await,
+            server
+                .get_glucose_trends(Parameters(TrendsArgs { period: None }))
+                .await,
+            server.get_sensor_info(Parameters(EmptyArgs {})).await,
+            server.validate_connection(Parameters(EmptyArgs {})).await,
+        ];
+        for result in results {
+            assert_eq!(result.is_error, Some(false));
+            let serialized = serde_json::to_string(&result).unwrap();
+            assert!(serialized.contains("cache_hit"));
+            assert!(!serialized.contains(PATIENT_ID));
+            assert!(!serialized.contains("zq81"));
+        }
     }
 
     #[tokio::test]

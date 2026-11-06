@@ -33,6 +33,9 @@ pub(crate) struct SensorRecord {
 /// One read from a data source.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Snapshot {
+    /// The selected patient's source ID. Used only to key the local store;
+    /// no tool output includes it.
+    pub patient_id: String,
     /// The single current reading every tool uses.
     pub current: GlucoseSample,
     pub graph: Vec<GlucoseSample>,

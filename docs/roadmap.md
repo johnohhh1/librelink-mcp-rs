@@ -49,9 +49,9 @@ The design is fixed in [ADR 0002](adr/0002-local-store-and-collector.md). In sho
 
 Steps:
 
-0. **CI fix and design record.** Bump `actions/checkout`; write ADR 0002.
-1. **Store module.** Schema and migrations, permissions, deduplicating inserts, poll records, heartbeat, retention, and deletion, all tested with synthetic data.
-2. **`collect` command.** Poll loop with floor and jitter, cooldowns, a heartbeat at least every 30 seconds, exit status 78 for latched errors, the lock file, clean shutdown, and a systemd user unit example.
+0. **CI fix and design record. Done.** Bump `actions/checkout`; write ADR 0002.
+1. **Store module. Done.** Schema and migrations, permissions, deduplicating inserts, poll records, heartbeat, retention, and deletion, all tested with synthetic data.
+2. **`collect` command. Done.** See the [collector guide](collector.md). Poll loop with floor and jitter, cooldowns, a heartbeat at least every 30 seconds, exit status 78 for latched errors, the lock file, clean shutdown, and a systemd user unit example.
 3. **`serve` source selection and tool reads.** The `data_source` field and store-backed history, stats, and trends, followed by a live check by the PM.
 
 **Gate:** `get_glucose_history(hours)` returns stored readings for the requested window with source labels, real first and last observations, expected and observed samples, and gaps. A window the database does not cover returns `partial` coverage, never a claim of completeness. Statistics over a short window stay labeled `partial`; `insufficient_data` still means no valid values.

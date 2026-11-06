@@ -85,12 +85,22 @@ The API can return timestamps without timezone offsets. When both clock strings 
 
 When every graph point has a usable offset-aware or inferred UTC time, history, stats, and trends filter to the requested window. Coverage reports the first and last observations, span, estimated cadence and expected point count, actual count, and detected gaps. These estimates come from returned intervals. Because the LibreLinkUp graph covers about 12 hours, statistics and trends for a requested day or longer return `period_status: partial` with the observed span in `coverage`; they describe the returned graph, not the requested days. Statistics return `insufficient_data` only when no valid values were returned. `window_verified` remains false: the API cannot prove complete coverage. Sample percentages are not time-weighted time in range; GMI and clinical-pattern fields remain unavailable. See the [architecture and parity notes](docs/architecture.md) and [release roadmap](docs/roadmap.md).
 
+## Keeping longer history (optional)
+
+The LibreLinkUp graph covers only about 12 hours. The opt-in `collect` command polls about once a minute (never more often than every 60 seconds) and keeps readings in a local SQLite database for 90 days by default:
+
+```sh
+cargo run -- collect
+```
+
+It runs in the foreground until Ctrl+C, allows one collector per database, and stops with exit status 78 on errors a retry cannot fix. `serve` does not read the database yet; that arrives later in v0.3. See the [collector guide](docs/collector.md) for options, what is and isn't stored, and a systemd user service example.
+
 ## Privacy and local data
 
 - Credentials live in the OS credential store. There is no plaintext file fallback, command-line password flag, or MCP secret input.
-- The server does not persist glucose history. SQLite is planned only as an opt-in feature and will never hold credentials.
+- `serve` does not persist glucose history. The opt-in `collect` command stores readings in a local SQLite database: values and timestamps keyed by a salted patient pseudonym, with no credentials, tokens, names, or raw patient IDs. Nothing is uploaded. See [what the collector stores](docs/collector.md#privacy).
 - Successful graph reads are cached in memory for 60 seconds. Detected rate limits and account lockouts trigger a cooldown, using the server's retry time within 60 to 900 seconds; other upstream failures also pause calls for 60 seconds. Cached readings keep their original retrieval time.
-- `cargo run -- clear-local-data` removes this project's credential and preference entries from the OS store. Stop the server first; run `setup` again to reconnect.
+- `cargo run -- clear-local-data` removes this project's credential and preference entries from the OS store, and the collector's default database. It refuses while a collector is running. Stop the server first; run `setup` again to reconnect.
 - The `.gitignore` excludes local configuration, data exports, databases, logs, and key files. Tests use synthetic fixtures only.
 
 On headless Linux systems without Secret Service, `setup` fails closed. If you used the original server, its `~/.librelink-mcp/config.json` may contain a plaintext password; this port does not read, migrate, or delete that file.

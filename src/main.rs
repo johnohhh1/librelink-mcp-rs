@@ -5,6 +5,7 @@ use std::borrow::Cow;
 use std::io::{self, Write};
 use zeroize::{Zeroize, Zeroizing};
 
+mod collect;
 mod fetch;
 mod llu_client;
 mod mcp;
@@ -188,11 +189,21 @@ fn delete_entry_if_present(entry: Entry) -> Result<(), &'static str> {
 }
 
 fn clear_local_data() -> Result<(), &'static str> {
+    let db = store::default_db_path();
+    // Check before deleting anything, so a refusal leaves everything intact.
+    if let Some(db) = &db
+        && store::database_locked(db)?
+    {
+        return Err(
+            "A collector is running for the local database. Stop it, then run clear-local-data again.",
+        );
+    }
     delete_entry_if_present(keyring_entry()?)?;
     delete_entry_if_present(settings_entry()?)?;
-    println!(
-        "This server's credentials and local preferences were removed from the OS credential store."
-    );
+    if let Some(db) = &db {
+        store::delete_database_files(db)?;
+    }
+    println!("This server's credentials, local preferences, and local database were removed.");
     Ok(())
 }
 
@@ -306,6 +317,10 @@ fn main() {
 
 async fn run() {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("collect") {
+        let code = collect::run_cli(&args[2..], live_fetcher()).await;
+        std::process::exit(code);
+    }
     let result: Result<(), Cow<'static, str>> = match args.as_slice() {
         [_, command] if command == "setup" => setup().map_err(Cow::from),
         [_, command] if command == "check" => check().await,
@@ -314,7 +329,7 @@ async fn run() {
         [_, command] if command == "clear-local-data" => clear_local_data().map_err(Cow::from),
         [_, command] if command == "serve" => mcp::serve(live_fetcher()).await.map_err(Cow::from),
         _ => Err(Cow::from(
-            "Usage: librelink-mcp-rs <setup|select-patient|set-api-version|check|clear-local-data|serve>",
+            "Usage: librelink-mcp-rs <setup|select-patient|set-api-version|check|collect|clear-local-data|serve>",
         )),
     };
     if let Err(message) = result {

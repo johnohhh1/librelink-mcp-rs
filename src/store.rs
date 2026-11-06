@@ -4,9 +4,6 @@
 //! database holds values, timestamps, and a salted patient key, never
 //! credentials, tokens, or raw patient IDs.
 
-// Wired into `collect` in v0.3 step 2, which removes this.
-#![allow(dead_code)]
-
 use crate::source::{GlucoseSample, Snapshot};
 use crate::time::assess_time;
 use chrono::{DateTime, Duration, Utc};
@@ -78,6 +75,7 @@ impl Origin {
         }
     }
 
+    #[allow(dead_code)] // Read by `serve` in v0.3 step 3, which removes this.
     fn parse(text: &str) -> Option<Self> {
         match text {
             "graph" => Some(Self::Graph),
@@ -88,6 +86,7 @@ impl Origin {
 }
 
 /// A reading as the tools use it, plus where it came from.
+#[allow(dead_code)] // Read by `serve` in v0.3 step 3, which removes this.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct StoredReading {
     pub sample: GlucoseSample,
@@ -122,6 +121,48 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 /// The advisory lock file that allows one collector per database.
 pub(crate) fn lock_path(db: &Path) -> PathBuf {
     with_suffix(db, ".lock")
+}
+
+/// Why the collector lock could not be taken.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LockError {
+    /// Another process holds it.
+    Held,
+    /// The lock file could not be opened or locked.
+    Unavailable,
+}
+
+/// Takes the exclusive advisory lock that allows one collector per
+/// database. The lock lasts as long as the returned file is open, and the
+/// OS releases it if the process dies.
+pub(crate) fn lock_database(db: &Path) -> Result<fs::File, LockError> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(lock_path(db))
+        .map_err(|_| LockError::Unavailable)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(fs::TryLockError::WouldBlock) => Err(LockError::Held),
+        Err(fs::TryLockError::Error(_)) => Err(LockError::Unavailable),
+    }
+}
+
+/// Whether a collector currently holds the database lock.
+pub(crate) fn database_locked(db: &Path) -> StoreResult<bool> {
+    if !lock_path(db).exists() {
+        return Ok(false);
+    }
+    match lock_database(db) {
+        Ok(_released_on_drop) => Ok(false),
+        Err(LockError::Held) => Ok(true),
+        Err(LockError::Unavailable) => Err("Unable to check the local database lock."),
+    }
 }
 
 /// Removes the database, its WAL and shared-memory files, and its lock
@@ -251,6 +292,11 @@ impl Store {
         Ok(Self { conn, salt })
     }
 
+    #[cfg(test)]
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.conn
+    }
+
     /// Lowercase hex SHA-256 of `salt || patient_id`.
     fn patient_key(&self, patient_id: &str) -> String {
         let mut hasher = Sha256::new();
@@ -314,6 +360,7 @@ impl Store {
         Ok(())
     }
 
+    #[allow(dead_code)] // Read by `serve` in v0.3 step 3, which removes this.
     pub(crate) fn read_heartbeat(&self) -> StoreResult<Option<Heartbeat>> {
         let row = self
             .conn
@@ -338,6 +385,7 @@ impl Store {
     /// Readings with `from <= observed_at_utc <= to`, oldest first. Readings
     /// without a usable UTC time cannot be placed in a window and are left
     /// out.
+    #[allow(dead_code)] // Read by `serve` in v0.3 step 3, which removes this.
     pub(crate) fn readings_in_window(
         &self,
         patient_id: &str,
@@ -457,6 +505,7 @@ mod tests {
 
     fn snapshot(graph: &[&str], current: &str) -> Snapshot {
         Snapshot {
+            patient_id: PATIENT.to_owned(),
             current: sample(current, 120.0),
             graph: graph.iter().map(|time| sample(time, 110.0)).collect(),
             active_sensors: vec![],
@@ -711,6 +760,7 @@ mod tests {
         let old = now - Duration::days(100);
         let recent = now - Duration::days(10);
         let bad_time = |factory: &str| Snapshot {
+            patient_id: PATIENT.to_owned(),
             current: GlucoseSample {
                 timestamp: "not a date".to_owned(),
                 factory_timestamp: factory.to_owned(),

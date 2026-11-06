@@ -4,8 +4,11 @@ use crate::source::{DataSource, Snapshot};
 use chrono::{DateTime, Utc};
 use std::borrow::Cow;
 use std::ops::Deref;
-use std::time::{Duration as StdDuration, Instant};
+use std::time::Duration as StdDuration;
+// Tokio's clock equals the system monotonic clock at runtime and follows a
+// paused test clock, so cache and cooldown timing are testable.
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 
 pub(crate) const CACHE_TTL: StdDuration = StdDuration::from_secs(60);
 pub(crate) const FAILURE_COOLDOWN: StdDuration = StdDuration::from_secs(60);
