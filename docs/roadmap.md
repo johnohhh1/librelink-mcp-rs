@@ -38,6 +38,8 @@ The borrowed `libre_link_up_api_client` crate retries login after any request er
 
 ## v0.3: opt-in `collect` command and SQLite
 
+**Status:** done; released as 0.3.0 and live-validated 2026-11-06.
+
 The graph endpoint takes no date range, so it cannot supply 7-, 30-, or 90-day history on its own. See [Nightscout Connect's LibreLinkUp notes](https://github.com/nightscout/nightscout-connect/blob/main/README.md).
 
 The design is fixed in [ADR 0002](adr/0002-local-store-and-collector.md). In short:
@@ -52,7 +54,8 @@ Steps:
 0. **CI fix and design record. Done.** Bump `actions/checkout`; write ADR 0002.
 1. **Store module. Done.** Schema and migrations, permissions, deduplicating inserts, poll records, heartbeat, retention, and deletion, all tested with synthetic data.
 2. **`collect` command. Done.** See the [collector guide](collector.md). Poll loop with floor and jitter, cooldowns, a heartbeat at least every 30 seconds, exit status 78 for latched errors, the lock file, clean shutdown, and a systemd user unit example.
-3. **`serve` source selection and tool reads. Done except the PM live check.** `serve [--db]` uses the store while the collector heartbeat is under 3 minutes old, with no upstream requests, and the live API otherwise. Every data reply states `data_source`. Store-backed history, stats, and trends cover the requested window and label interior gaps `collector_not_running` or `no_data_from_api`; sensors are stored masked. A live check by the PM is pending.
+3. **`serve` source selection and tool reads. Done.** `serve [--db]` uses the store while the collector heartbeat is under 3 minutes old, with no upstream requests, and the live API otherwise. Every data reply states `data_source`. Store-backed history, stats, and trends cover the requested window and label interior gaps `before_collection`, `collector_not_running`, or `no_data_from_api`; sensors are stored masked.
+4. **Live validation. Done 2026-11-06.** A manual check with a temporary database and one US follower account, with no values or account details recorded. It checked that `collect` polled about 60 seconds apart and deduplicated (one backfill, then one new reading per poll); that the database, WAL, shared-memory, and lock files were all mode `0600`; that all six data tools reported `local_store`; that `serve` opened no network connections (traced) and caused no extra collector polls; and that SIGTERM stopped the collector cleanly and released the lock.
 
 **Gate:** `get_glucose_history(hours)` returns stored readings for the requested window with source labels, real first and last observations, expected and observed samples, and gaps. A window the database does not cover returns `partial` coverage, never a claim of completeness. Statistics over a short window stay labeled `partial`; `insufficient_data` still means no valid values.
 

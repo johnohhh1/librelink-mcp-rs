@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.0 — 2026-11-06
+
+### Added
+- An opt-in local store: a SQLite database (bundled, WAL mode) holding readings, poll attempts, the collector heartbeat, and the latest sensors in masked form. It holds no credentials, tokens, names, or raw patient or sensor IDs; patients are keyed by a salted SHA-256 with a per-database salt. On Unix the data directory is `0700` and the files are `0600`. See [ADR 0002](docs/adr/0002-local-store-and-collector.md) and the [collector guide](docs/collector.md).
+- `collect [--db <path>] [--retention-days <1-3650>]`. It polls at least 60 seconds apart with 0–5 seconds of jitter and honors the server's retry times. It writes a heartbeat at least every 30 seconds, including during cooldowns, and keeps 90 days by default. A lock file allows one collector per database. Latched errors exit with status 78, and Ctrl+C or SIGTERM stops it cleanly. The guide includes a systemd user unit example.
+- `serve [--db <path>]` reads every data tool from the store while the collector heartbeat is under 3 minutes old, making no LibreLinkUp requests, and from the live API otherwise.
+- A `data_source` field (`local_store` or `live_api`) on every data tool reply.
+- From the store, history, stats, and trends cover the requested window up to each tool's maximum, and `period_status` is `sample_summary` when coverage is sufficient. Interior gaps carry a `cause`: `before_collection`, `collector_not_running`, or `no_data_from_api`.
+- `clear-local-data --db <path>`. `clear-local-data` also deletes the database with its WAL, shared-memory, and lock files, and refuses while a collector holds the lock.
+- Error code `local_store_unavailable`, for when the collector's database cannot be read during a call.
+
+### Changed
+- Server instructions explain `data_source`, and that stored data is only as fresh as the collector.
+- Live-validated on 2026-11-06 with a temporary database and one US follower account.
+
 ## 0.2.0 — 2026-11-05
 
 ### Changed

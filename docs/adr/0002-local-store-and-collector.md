@@ -1,6 +1,6 @@
 # ADR 0002: Local store and collector
 
-- **Status:** accepted
+- **Status:** implemented and live-validated 2026-11-06 (released in 0.3.0)
 - **Date:** 2026-11-05 (implementation details settled the same day)
 - **Milestone:** v0.3 (see [roadmap](../roadmap.md#v03-opt-in-collect-command-and-sqlite))
 
