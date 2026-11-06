@@ -39,7 +39,7 @@ cargo run -- check
 
 `setup` prompts locally for the follower account email, a hidden password, and a region. It accepts `global` (the default), `us`, `eu`, `eu2`, `ae`, `ap`, `au`, `ca`, `de`, `fr`, `jp`, `la`, `ru`, and `cn`. If the account follows multiple people, run `cargo run -- select-patient` and enter the followed person's full name before `check`. An ambiguous account is rejected instead of silently choosing the first connection.
 
-`check` makes an authenticated `read_raw()` request and prints a small connectivity report. A local user check confirmed that the pinned Rust client connects and returns values matching their phone; other accounts, regions, and sensors still need validation. The [Rust client API and compatibility findings](docs/architecture.md) explain the dependency choice.
+`check` logs in, reads the followed person's graph, and prints a small connectivity report. Since v0.2 the server uses its own LibreLinkUp client instead of the `libre_link_up_api_client` crate; [ADR 0001](docs/adr/0001-owned-api-client.md) explains why. An earlier local check confirmed that the crate returned values matching the user's phone. The owned client sends the same request headers but has not yet been checked against a live account, and other accounts, regions, and sensors still need validation.
 
 `check` includes `display_minus_factory_minutes`, so you can inspect the clock relationship locally without sharing a response. The difference reflects the **sharer's** local clock, which may differ from your own timezone. To change the client version after an Abbott version requirement changes, run `cargo run -- set-api-version` locally and restart the MCP server.
 
@@ -77,7 +77,7 @@ The server reuses its authenticated API client. Restart it after changing creden
 | `configure_ranges` | Validates and saves local target bounds in mg/dL |
 | `validate_connection` | Connection and data-availability status without glucose values or secrets |
 
-Tool replies contain MCP `structuredContent` plus a JSON text block for clients that only display text. Errors set `isError: true` and use safe codes including `invalid_input`, `insufficient_data`, `rate_limited`, `timeout`, `session_expired`, `authentication_failed`, `account_action_required`, and `upstream_unavailable`. The owned API client being added in v0.2 also reports `client_version_rejected` when Abbott requires a newer client version (run `set-api-version`), `request_rejected` when the API refuses this client's request headers, and `api_changed` when a successful response is not JSON. `api_changed` may mean the API changed or was retired, but it is not proof of either. After `authentication_failed`, the server makes no further login attempts until it is restarted, so a wrong password cannot drive the account into an Abbott lockout. Rate-limit replies include `retry_after_seconds`. Upstream response bodies and tokens are never included in error messages.
+Tool replies contain MCP `structuredContent` plus a JSON text block for clients that only display text. Errors set `isError: true` and use safe codes including `invalid_input`, `insufficient_data`, `rate_limited`, `timeout`, `session_expired`, `authentication_failed`, `account_action_required`, `client_version_rejected` (Abbott requires a newer client version; run `set-api-version`), `request_rejected` (the API refused this client's request headers; please report it as a bug), `api_changed`, and `upstream_unavailable`. `api_changed` means a successful response was not JSON: the API may have changed or been retired, but it is not proof of either. After `authentication_failed`, `client_version_rejected`, or `request_rejected`, the server makes no further LibreLinkUp requests until it is restarted, so a wrong password cannot drive the account into an Abbott lockout. The client logs in only when it has no valid session or after a 401, and never because of throttling or other errors. Rate-limit replies include `retry_after_seconds`. Upstream response bodies and tokens are never included in error messages.
 
 ## Data quality
 
@@ -89,7 +89,7 @@ When every graph point has a usable offset-aware or inferred UTC time, history, 
 
 - Credentials live in the OS credential store. There is no plaintext file fallback, command-line password flag, or MCP secret input.
 - The server does not persist glucose history. SQLite is planned only as an opt-in feature and will never hold credentials.
-- Successful graph reads are cached in memory for 60 seconds. Detected rate limits and account lockouts trigger a cooldown; other upstream failures also pause calls for 60 seconds. Cached readings keep their original retrieval time. The upstream client can still retry within the first failed request, pending a replacement API adapter.
+- Successful graph reads are cached in memory for 60 seconds. Detected rate limits and account lockouts trigger a cooldown, using the server's retry time within 60 to 900 seconds; other upstream failures also pause calls for 60 seconds. Cached readings keep their original retrieval time.
 - `cargo run -- clear-local-data` removes this project's credential and preference entries from the OS store. Stop the server first; run `setup` again to reconnect.
 - The `.gitignore` excludes local configuration, data exports, databases, logs, and key files. Tests use synthetic fixtures only.
 

@@ -23,14 +23,18 @@ Each milestone has a gate. A milestone is not done until its gate passes on Linu
 
 ## v0.2: owned API client behind a `DataSource` trait
 
+**Status:** done except live validation. The crate is removed; the owned client has not yet been run against a live account. The version stays 0.1.0 until a live smoke test passes.
+
 The borrowed `libre_link_up_api_client` crate retries login after any request error, including throttling. Its base URL is fixed, so it cannot be tested against a mock server. It keeps its own copy of the password, and its sensor model mislabels epoch fields. v0.2 replaces it. This is a prerequisite for any polling in v0.3.
 
-1. **Adapter seam.** Record the decision in `docs/adr/0001-owned-api-client.md`. Introduce a `DataSource` trait that returns one current reading, graph items, and active sensors. Move all crate use behind one implementation. Tools and the fetch cache and cooldown depend only on the trait. A fake `DataSource` test proves a tool runs without the network.
+1. **Adapter seam. Done.** Record the decision in `docs/adr/0001-owned-api-client.md`. Introduce a `DataSource` trait that returns one current reading, graph items, and active sensors. Move all crate use behind one implementation. Tools and the fetch cache and cooldown depend only on the trait. A fake `DataSource` test proves a tool runs without the network.
    - The trait defines exactly **one** current reading, taken from `connection.glucose_measurement`, the field `get_current_glucose` already uses. History, stats, and trends append that same reading. A test proves the point history appends equals what `get_current_glucose` reports. This is the only intended behavior change in this step.
-2. **Owned `reqwest` client.** Configurable base URL, region redirect handling, bounded session refresh, and no blind login retry after 429/430. Credentials are read once and not duplicated into long-lived strings. `wiremock` tests with synthetic bodies cover redirect, lockout, status 2 and 4 account actions, 401, 429/430, 403/920 minimum version, and account-ID mismatch, plus missing fields and unknown trend codes.
-3. **Switch over and remove the crate.** Map structured status to `client_version_rejected` and `api_retired` (see [API retirement risk](#api-retirement-risk)) as distinct from `upstream_unavailable`. Patient selection keeps its current name-based behavior.
+2. **Owned `reqwest` client. Done.** Configurable base URL, region redirect handling, bounded session refresh, and no blind login retry after 429/430. Credentials are read once and not duplicated into long-lived strings. `wiremock` tests with synthetic bodies cover redirect, lockout, status 2 and 4 account actions, 401, 429/430, 403/920 minimum version, and account-ID mismatch, plus missing fields and unknown trend codes.
+   - Done as two parts: session handling, then error mapping. Status 2 maps to `authentication_failed`, status 4 to `account_action_required`, a lockout body and HTTP 429/430 to `rate_limited` (retry time clamped to 60–900 seconds), 403 with status 920 to `client_version_rejected`, `AccountIdMismatch` / `RequiredHeaderMissing` to `request_rejected`, 5xx to `upstream_unavailable`, and a successful non-JSON body to `api_changed`. `authentication_failed`, `client_version_rejected`, and `request_rejected` latch until restart.
+3. **Switch over and remove the crate. Done.** `check` and `serve` use the owned client, with the same request headers the crate sent. `api_changed` is the candidate retirement signal; `api_retired` stays reserved for a confirmed retirement (see [API retirement risk](#api-retirement-risk)). Patient selection keeps its current name-based behavior.
+4. **Live validation. Pending.** A manual smoke test against a real follower account, with nothing recorded. The version becomes 0.2.0 only if it passes.
 
-**Gate:** no crate dependency remains; every upstream error path has a synthetic HTTP fixture; one failed request causes at most one login attempt; tool output is unchanged except for the single current reading and the new error codes.
+**Gate:** no crate dependency remains; every upstream error path has a synthetic HTTP fixture; no login is caused by throttling, server errors, or parse errors, and a 401 causes at most one re-login per read; tool output is unchanged except for the single current reading and the new error codes.
 
 ## v0.3: opt-in `collect` command and SQLite
 
@@ -68,6 +72,6 @@ The graph endpoint takes no date range, so it cannot supply 7-, 30-, or 90-day h
 
 Abbott's LibreLinkUp 5.x API encrypts its responses. The v4 plain-JSON endpoints this project uses may be shut off.
 
-- **Detect and report.** The owned client in v0.2 will recognize retirement signals and return `api_retired` instead of a generic upstream failure. The exact signals will be pinned with synthetic fixtures once observed; candidates are a minimum-version rejection that no v4 version satisfies and responses that are no longer plain JSON.
+- **Detect and report.** Since v0.2 the owned client reports `api_changed` when a successful response is not JSON, and `client_version_rejected` when Abbott requires a newer version. Both are candidate signals, not proof. `api_retired` is reserved for a confirmed retirement: for example, a minimum-version rejection that no v4 version satisfies, or responses that stay non-JSON across versions. Its exact trigger will be pinned with synthetic fixtures once real behavior is observed.
 - **No circumvention.** The project will not decrypt, emulate, or otherwise work around v5 encryption.
-- **Stay useful afterward.** Data already collected in SQLite (v0.3) and LibreView CSV import (v0.4) do not depend on the live API. After retirement, history, statistics, and trends keep working from local data, while live-only tools report `api_retired`.
+- **Stay useful afterward.** Data already collected in SQLite (v0.3) and LibreView CSV import (v0.4) do not depend on the live API. After retirement, history, statistics, and trends keep working from local data, while live-only tools report `api_retired` once retirement is confirmed.

@@ -1,6 +1,6 @@
 # ADR 0001: Replace the borrowed LibreLinkUp client with an owned one
 
-- **Status:** accepted
+- **Status:** implemented in v0.2 (accepted 2026-11-05); live validation pending
 - **Date:** 2026-11-05
 - **Milestone:** v0.2 (see [roadmap](../roadmap.md#v02-owned-api-client-behind-a-datasource-trait))
 
@@ -19,7 +19,7 @@ Its error type also turns HTTP failures into `InvalidResponse(String)` that cont
 
 Replace the crate with an owned client, in three steps. Each step is its own reviewable change.
 
-1. **Seam (this step).** Define a `DataSource` trait in `src/source.rs` that returns the project's own types:
+1. **Seam.** Define a `DataSource` trait in `src/source.rs` that returns the project's own types:
    - `Snapshot`: exactly one current reading, the graph samples, and the active sensors.
    - `GlucoseSample`: source and factory timestamp text, the mg/dL value, and the trend arrow code if present.
    - `SensorRecord`: device ID, serial number, activation epoch seconds, warmup minutes, and product type code, named for what they hold.
@@ -31,13 +31,15 @@ Replace the crate with an owned client, in three steps. Each step is its own rev
    - A configurable base URL, so `wiremock` tests can stand in for the server.
    - Region redirect handling and a bounded session refresh: at most one login per failed request, and none after 429/430, lockout, or rejected credentials.
    - Credentials read once from the OS store into zeroizing storage and not duplicated into long-lived strings.
-   - Typed status handling that maps upstream errors to public codes without ever holding a response body in an error. This includes `client_version_rejected` and `api_retired`.
+   - Typed status handling that maps upstream errors to public codes without ever holding a response body in an error. This includes `client_version_rejected`, `request_rejected`, and `api_changed`, the candidate retirement signal; `api_retired` is reserved for a confirmed retirement.
    - Synthetic fixtures for redirect, lockout, status 2 and 4 account actions, 401, 429/430, 403/920 minimum version, and account-ID mismatch.
 3. **Switch over.** Use the owned client in `serve` and `check`, delete `borrowed_client.rs`, and remove the crate from `Cargo.toml` and `Cargo.lock`.
 
 ## Consequences
 
-- Tool output does not change in step 1, with one exception: history, stats, and trends now append `glucose_measurement` rather than `glucose_item`.
-- The crate's internal login retry remains until step 3. The README's note that the upstream client can still retry within the first failed request stays true until then.
-- The project takes on maintenance of the HTTP protocol details: headers, version string, region routing, and response shapes. Abbott may change the unofficial API at any time. See [API retirement risk](../roadmap.md#api-retirement-risk). The owned client will report `api_retired` and will not try to get around v5 response encryption.
+- Tool output did not change in step 1, with one exception: history, stats, and trends now append `glucose_measurement` rather than `glucose_item`.
+- Step 2 also added `request_rejected` (`AccountIdMismatch` / `RequiredHeaderMissing`) and `api_changed` (a successful non-JSON response). `client_version_rejected`, `request_rejected`, and `authentication_failed` latch until restart.
+- The owned client sends the same request headers as the crate (`product: llu.ios` and its User-Agent), so the switch-over changed no request headers.
+- After step 3 the crate is no longer a dependency.
+- The project takes on maintenance of the HTTP protocol details: headers, version string, region routing, and response shapes. Abbott may change the unofficial API at any time. See [API retirement risk](../roadmap.md#api-retirement-risk). The owned client reports `api_changed` as a candidate signal; `api_retired` is reserved for a confirmed retirement. It will not try to get around v5 response encryption.
 - Every upstream error path becomes testable offline with synthetic data. No real account responses are ever used as fixtures.

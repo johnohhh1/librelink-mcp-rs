@@ -5,24 +5,25 @@ use std::borrow::Cow;
 use std::io::{self, Write};
 use zeroize::{Zeroize, Zeroizing};
 
-mod borrowed_client;
 mod fetch;
 mod llu_client;
 mod mcp;
+mod region;
 mod source;
 mod time;
 
-use borrowed_client::BorrowedClientSource;
 use fetch::Fetcher;
+use llu_client::LiveSource;
 use time::{TimeAssessment, assess_time_at};
 
 const KEYRING_SERVICE: &str = "org.librelink-mcp-rs";
 const KEYRING_USER: &str = "librelinkup-account";
 const SETTINGS_USER: &str = "local-settings";
 
-/// The production data path: the borrowed crate behind cache and cooldown.
+/// The production data path: the owned LibreLinkUp client behind the cache,
+/// cooldown, and latches.
 fn live_fetcher() -> Fetcher {
-    Fetcher::new(Box::new(BorrowedClientSource::new()))
+    Fetcher::new(Box::new(LiveSource::new()))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -138,7 +139,9 @@ fn setup() -> Result<(), &'static str> {
         return Err("Password is required.");
     }
     let region_input = prompt("Region [global/us/eu/...; default global]: ")?;
-    let region = borrowed_client::canonical_region(&region_input).ok_or("Unknown region.")?;
+    let region = region::canonical_region(&region_input)
+        .ok_or("Unknown region.")?
+        .to_owned();
 
     let credentials = Credentials {
         email,

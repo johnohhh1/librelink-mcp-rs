@@ -8,11 +8,10 @@
 //! Errors carry fixed messages. Response bodies are read only to classify
 //! the failure and are never logged or returned.
 
-// Not wired into `serve` or `check` until v0.2 step 3, which removes this.
-#![allow(dead_code)]
-
 use crate::fetch::FetchError;
+use crate::region::region_base_url;
 use crate::source::{DataSource, GlucoseSample, ReadFuture, SensorRecord, Snapshot};
+use crate::{load_credentials, load_settings, valid_api_version};
 use chrono::Utc;
 use reqwest::header::{
     ACCEPT, ACCEPT_LANGUAGE, AUTHORIZATION, CACHE_CONTROL, CONNECTION, CONTENT_TYPE, HeaderMap,
@@ -23,36 +22,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 use zeroize::Zeroizing;
 
 const LOGIN_PATH: &str = "/llu/auth/login";
 const CONNECTIONS_PATH: &str = "/llu/connections";
-// Headers match the borrowed crate exactly so the v0.2 switch-over is a pure
-// swap. Changing the product header is a separate, later experiment.
+// Headers match those of the previously used `libre_link_up_api_client`
+// 0.3.3 crate, so the switch-over changed no request headers. Changing the
+// product header is a separate, later experiment.
 const PRODUCT: &str = "llu.ios";
 const USER_AGENT_STRING: &str = "Mozilla/5.0 (iPhone; CPU OS 17_4.1 like Mac OS X) AppleWebKit/536.26 (KHTML, like Gecko) Version/17.4.1 Mobile/10A5355d Safari/8536.25";
-
-/// Production base URL for a stored region, matching the borrowed client.
-pub(crate) fn region_base_url(region: &str) -> Option<&'static str> {
-    Some(match region {
-        "global" => "https://api.libreview.io",
-        "ae" => "https://api-ae.libreview.io",
-        "ap" => "https://api-ap.libreview.io",
-        "au" => "https://api-au.libreview.io",
-        "ca" => "https://api-ca.libreview.io",
-        "de" => "https://api-de.libreview.io",
-        "eu" => "https://api-eu.libreview.io",
-        "eu2" => "https://api-eu2.libreview.io",
-        "fr" => "https://api-fr.libreview.io",
-        "jp" => "https://api-jp.libreview.io",
-        "us" => "https://api-us.libreview.io",
-        "la" => "https://api-la.libreview.io",
-        "ru" => "https://api.libreview.ru",
-        "cn" => "https://api-cn.myfreestyle.cn",
-        _ => return None,
-    })
-}
 
 /// First gate for a login redirect region: short lowercase alphanumerics.
 /// The region must also be in `region_base_url`'s table.
@@ -669,6 +648,60 @@ impl DataSource for LluClient {
     }
 }
 
+/// Builds the production client from the OS credential store and local
+/// settings. The password moves into the client's zeroizing storage; no
+/// other copy is kept.
+fn build_live_client() -> Result<LluClient, &'static str> {
+    let mut credentials = load_credentials()?;
+    let settings = load_settings()?;
+    let base_url = region_base_url(&credentials.region).ok_or("Stored region is invalid.")?;
+    if !valid_api_version(&settings.api_version) {
+        return Err("Stored API version is invalid. Run `set-api-version` locally.");
+    }
+    if credentials.email.trim().is_empty() || credentials.password.is_empty() {
+        return Err("Stored credentials are incomplete. Run `setup` locally.");
+    }
+    LluClient::new(LluConfig {
+        email: std::mem::take(&mut credentials.email),
+        password: Zeroizing::new(std::mem::take(&mut credentials.password)),
+        api_version: settings.api_version,
+        patient_name: settings.patient_name,
+        base_url: base_url.to_owned(),
+    })
+}
+
+/// The production `DataSource`. The client is built on first use, so a
+/// missing credential is reported per call (without a cooldown) rather than
+/// at startup.
+pub(crate) struct LiveSource {
+    client: OnceCell<LluClient>,
+}
+
+impl LiveSource {
+    pub(crate) fn new() -> Self {
+        Self {
+            client: OnceCell::new(),
+        }
+    }
+}
+
+impl DataSource for LiveSource {
+    fn read(&self) -> ReadFuture<'_> {
+        Box::pin(async move {
+            let client = self
+                .client
+                .get_or_try_init(|| async { build_live_client() })
+                .await
+                .map_err(|message| FetchError {
+                    code: "configuration_error",
+                    message: Cow::Borrowed(message),
+                    retry_after_seconds: None,
+                })?;
+            client.read_snapshot().await
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -951,7 +984,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn requests_send_the_borrowed_crate_product_and_user_agent() {
+    async fn requests_send_the_previous_client_product_and_user_agent() {
         let server = MockServer::start().await;
         let expected = [
             ("product", "llu.ios"),
@@ -1085,7 +1118,8 @@ mod tests {
         assert_eq!(logins(&server).await, 2);
     }
 
-    /// The borrowed crate logs in again after any error, including throttling.
+    /// The previously used crate logged in again after any error, including
+    /// throttling; this client must not.
     #[tokio::test]
     async fn throttling_never_triggers_a_login() {
         let server = MockServer::start().await;
@@ -1384,8 +1418,21 @@ mod tests {
         assert!(version_rejected(None).message.contains("set-api-version"));
         assert!(REQUEST_REJECTED.message.contains("report"));
         // Temporary failures still expire.
-        assert!(!latches_until_restart(&rate_limited(Some(120))));
         assert!(!latches_until_restart(&UNAVAILABLE));
+        let throttled = rate_limited(Some(120));
+        assert!(!latches_until_restart(&throttled));
+        let temporary = Cooldown {
+            until: cooldown_until(&throttled, now),
+            error: throttled,
+        };
+        assert!(cooldown_active(
+            &temporary,
+            now + StdDuration::from_secs(119)
+        ));
+        assert!(!cooldown_active(
+            &temporary,
+            now + StdDuration::from_secs(121)
+        ));
     }
 
     #[tokio::test]
@@ -1419,10 +1466,7 @@ mod tests {
     }
 
     #[test]
-    fn production_base_urls_match_regions() {
-        assert_eq!(region_base_url("global"), Some("https://api.libreview.io"));
-        assert_eq!(region_base_url("eu2"), Some("https://api-eu2.libreview.io"));
-        assert_eq!(region_base_url("unknown"), None);
+    fn patient_ids_are_path_safe() {
         assert!(valid_patient_id(PATIENT_ID));
         assert!(!valid_patient_id("../escape"));
     }
