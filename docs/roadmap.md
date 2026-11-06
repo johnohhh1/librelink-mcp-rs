@@ -25,17 +25,18 @@ Each milestone has a gate. A milestone is not done until its gate passes on Linu
 
 The borrowed `libre_link_up_api_client` crate retries login after any request error, including throttling. Its base URL is fixed, so it cannot be tested against a mock server. It keeps its own copy of the password, and its sensor model mislabels epoch fields. v0.2 replaces it. This is a prerequisite for any polling in v0.3.
 
-1. **Adapter seam, no behavior change.** Record the decision in `docs/adr/0001-owned-api-client.md`. Introduce a `DataSource` trait that returns the current item, graph items, and active sensors. Move all crate use behind one implementation. Tools and the fetch cache and cooldown depend only on the trait. A fake `DataSource` test proves a tool runs without the network.
+1. **Adapter seam.** Record the decision in `docs/adr/0001-owned-api-client.md`. Introduce a `DataSource` trait that returns one current reading, graph items, and active sensors. Move all crate use behind one implementation. Tools and the fetch cache and cooldown depend only on the trait. A fake `DataSource` test proves a tool runs without the network.
+   - The trait defines exactly **one** current reading, taken from `connection.glucose_measurement`, the field `get_current_glucose` already uses. History, stats, and trends append that same reading. A test proves the point history appends equals what `get_current_glucose` reports. This is the only intended behavior change in this step.
 2. **Owned `reqwest` client.** Configurable base URL, region redirect handling, bounded session refresh, and no blind login retry after 429/430. Credentials are read once and not duplicated into long-lived strings. `wiremock` tests with synthetic bodies cover redirect, lockout, status 2 and 4 account actions, 401, 429/430, 403/920 minimum version, and account-ID mismatch, plus missing fields and unknown trend codes.
-3. **Switch over and remove the crate.** Map structured status to `client_version_rejected` and `api_retired` (see [API retirement risk](#api-retirement-risk)) as distinct from `upstream_unavailable`. Replace name-based patient selection with a local, stable-ID chooser that refuses ambiguous or changed connections without exposing patient IDs.
+3. **Switch over and remove the crate.** Map structured status to `client_version_rejected` and `api_retired` (see [API retirement risk](#api-retirement-risk)) as distinct from `upstream_unavailable`. Patient selection keeps its current name-based behavior.
 
-**Gate:** no crate dependency remains; every upstream error path has a synthetic HTTP fixture; one failed request causes at most one login attempt; tool output is unchanged except for the new error codes.
+**Gate:** no crate dependency remains; every upstream error path has a synthetic HTTP fixture; one failed request causes at most one login attempt; tool output is unchanged except for the single current reading and the new error codes.
 
 ## v0.3: opt-in `collect` command and SQLite
 
 The graph endpoint takes no date range, so it cannot supply 7-, 30-, or 90-day history on its own. See [Nightscout Connect's LibreLinkUp notes](https://github.com/nightscout/nightscout-connect/blob/main/README.md).
 
-- A separate, explicitly started `collect` command polls through the v0.2 client on a conservative interval and writes to a local SQLite file. `serve` never polls on its own and reads history from the database when one exists.
+- A separate, explicitly started `collect` command polls through the v0.2 client and writes to a local SQLite file. The poll interval defaults to 60 seconds, and 60 seconds is a minimum enforced in code that configuration cannot lower. Each cycle adds a small random jitter of a few seconds. `serve` never polls on its own and reads history from the database when one exists.
 - No credentials or tokens in SQLite. Scope records to one selected patient. Restrictive file permissions. Deduplicate overlapping graph responses by source timestamp, keep source and time basis per row, and record collection gaps explicitly.
 - Retention controls; `clear-local-data` also removes the database.
 - Throttling and lockout handling come from the v0.2 client; the collector backs off and never causes login storms.
@@ -53,6 +54,7 @@ The graph endpoint takes no date range, so it cannot supply 7-, 30-, or 90-day h
 
 ## v1.0: release
 
+- Replace name-based patient selection with a local, stable-ID chooser that refuses ambiguous or changed connections without exposing patient IDs.
 - MCP tool annotations and typed output schemas for all eight tools. A current-reading resource. Cap or paginate large history responses.
 - Error paths, panics, traces, and debug output audited for passwords, tokens, account identifiers, and readings. Telemetry stays off.
 - Dependency advisory and license gate in CI.

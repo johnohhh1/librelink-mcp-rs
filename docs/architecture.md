@@ -39,7 +39,7 @@ The first `rmcp` stdio server exposes all eight original tool names. `configure_
 
 ## Test gates
 
-- Synthetic fixtures for stale, missing, timezone-free, ambiguous daylight-saving, conflicting, and future timestamps; unknown trend arrows; mixed-offset and boundary-crossing graph windows. Additional short or sparse history, missing sensor metadata, and invalid-range cases remain release gates.
+- Synthetic fixtures for stale, missing, timezone-free, ambiguous daylight-saving, conflicting, and future timestamps; unknown trend arrows; mixed-offset and boundary-crossing graph windows; short graphs that yield `partial` statistics; and graphs with no valid values that yield `insufficient_data`. Sparse history, missing sensor metadata, and invalid-range cases remain release gates.
 - MCP tool-list parity and stdio handshake tests for all eight names, structured output, and a schema and call test proving `configure_credentials` rejects password input without echoing it.
 - API adapter tests with synthetic responses and sanitized error mapping. A local manual account check is separate and never recorded as a fixture.
 - CI on Linux, macOS, and Windows: `cargo fmt --check`, clippy with warnings denied, and tests.
